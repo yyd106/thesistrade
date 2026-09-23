@@ -221,6 +221,24 @@ class SplitScheduleTests(unittest.TestCase):
             store.close()
 
 class LedgerVersionTests(unittest.TestCase):
+    def test_research_waits_for_background_ledger_sync_lock(self):
+        from ashare.workflow import task_lock
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        entered=Event();waiting=Event()
+        with tempfile.TemporaryDirectory() as root:
+            def research():
+                waiting.set()
+                with task_lock(Path(root),'cloud-sync',wait_seconds=2):entered.set()
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                with task_lock(Path(root),'cloud-sync'):
+                    future=pool.submit(research);self.assertTrue(waiting.wait(1))
+                    self.assertFalse(entered.wait(.05))
+                    with self.assertRaisesRegex(RuntimeError,'BUSY'):
+                        with task_lock(Path(root),'cloud-sync'):pass
+                future.result(timeout=2)
+                self.assertTrue(entered.is_set())
+
     def test_price_mark_refresh_does_not_discard_every_portfolio_inference(self):
         from ashare.finance import PaperLedger
         from ashare.portfolio_risk import state

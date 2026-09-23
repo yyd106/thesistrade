@@ -1,5 +1,6 @@
 from __future__ import annotations
 import fcntl
+import time
 from contextlib import contextmanager
 from .storage import Store,now
 from .finance import PaperLedger
@@ -11,11 +12,16 @@ import re
 
 
 @contextmanager
-def task_lock(root,name):
+def task_lock(root,name,wait_seconds=0):
     path=root/'locks';path.mkdir(exist_ok=True)
     with (path/(name+'.lock')).open('a+') as handle:
-        try:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:raise RuntimeError('BUSY: '+name)
+        deadline=time.monotonic()+wait_seconds
+        while True:
+            try:
+                fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+            except BlockingIOError:
+                if time.monotonic()>=deadline:raise RuntimeError('BUSY: '+name)
+                time.sleep(max(0,min(.1,deadline-time.monotonic())))
         try:yield
         finally:fcntl.flock(handle,fcntl.LOCK_UN)
 
@@ -30,7 +36,7 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
     try:
         if role(config)=='research' and command in ('portfolio_strategy','review'):
             from .cloud_sync import pull
-            with task_lock(store.root,'cloud-sync'):pull(store,config)
+            with task_lock(store.root,'cloud-sync',wait_seconds=50):pull(store,config)
         PaperLedger(store).initialize()
         from .investment_policy import enabled,seed
         if enabled(config):seed(store,now())
