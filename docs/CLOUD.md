@@ -24,8 +24,8 @@ POST `/api/sync/{bootstrap,strategy,ledger,reviews,invalidate,activate}` 要求�
 
 ## 部署
 
-1. 使用私有GitHub仓库，只提交源码、Dockerfile、railway.toml和无密钥配置。`.gitignore`排除本地config.json、数据、认证、私钥和部署工具目录。
-2. Railway使用Dockerfile、单副本、持续运行；挂载持久卷 `/data`。SQLite、回放防护、风险锁定和每日备份都在持久卷；不要启用按流量休眠。配置公开HTTPS域名和健康检查 `/health`。
+1. 使用私有GitHub仓库，只提交源码、Dockerfile和无密钥配置。`.gitignore`排除本地config.json、数据、认证、私钥和部署工具目录。
+2. Railway自动检测Dockerfile，使用单副本、持续运行；挂载持久卷 `/data`。SQLite、回放防护、风险锁定和小时备份都在持久卷；不要启用Serverless休眠。在服务设置保存公开HTTPS域名、健康检查 `/health` 和超时180秒。新服务不依赖已停止接受新用户的旧railway.toml配置方式。
 3. 云端变量：`THESISTRADE_ROLE=cloud`、`THESISTRADE_DATA_DIR=/data`、`THESISTRADE_PUBLIC_ORIGIN=https://实际域名`、`THESISTRADE_SYNC_KEY_ID`、`THESISTRADE_SYNC_PUBLIC_KEY`。`PORT`由Railway注入。云端没有大模型登录与私钥。
 4. 本地配置 `deployment_role=research`、`sync_cloud_url=https://实际域名`、`sync_key_file=私钥JSON的绝对路径`。通过 `python -m ashare.cloud_cli --config 本地配置 keys` 创建文件，权限0600；仅把输出公钥信息配置到云端。
 5. 备份并停止旧的本地交易服务，安装新代码与research角色配置。运行 `cloud_cli ... bootstrap` 一次迁移模拟账本及登录密码哈希（不迁移登录会话），云端此时仍禁止交易。重复初始化被拒绝。
