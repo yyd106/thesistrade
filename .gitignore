@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.env
+auth.json
+
+# Local credentials, account/feedback data and runtime output never belong in source control.
+.env.*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+ashare-data/
+data/
+backups/
+raw/
+workflow/
+secrets/
+
+# Host-local runtime and deployment credentials
+config.json
+.railway/
+.deploy/
+validation-data/
+preview-data/
+*.pem
+*private-key*.json

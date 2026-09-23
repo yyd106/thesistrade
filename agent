@@ -1,0 +1,12 @@
+#!/bin/zsh
+set -eu
+AGENT_PROJECT_DIR="${0:A:h}"
+cd "$AGENT_PROJECT_DIR"
+AGENT_BUNDLED_PYTHON="/Users/dean/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+if [[ -x "$AGENT_PROJECT_DIR/.venv/bin/python" ]]; then
+  exec "$AGENT_PROJECT_DIR/.venv/bin/python" -m ashare.cli "$@"
+elif [[ -x "$AGENT_BUNDLED_PYTHON" ]]; then
+  exec "$AGENT_BUNDLED_PYTHON" -m ashare.cli "$@"
+else
+  exec python3 -m ashare.cli "$@"
+fi
