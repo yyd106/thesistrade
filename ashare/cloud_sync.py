@@ -190,15 +190,22 @@ def sync_once(config):
     phase='pull'
     try:
         with task_lock(store.root,'cloud-sync'):
-            previous=value(store,'last_sync',{})
+            offline_since=value(store,'offline_since')
             packet=pull(store,config)
-            if previous.get('status')=='FAILED' and previous.get('phase')=='pull':
-                with store.db:put(store,'reconnect_pending',now())
+            recovered_at=now()
+            if offline_since:
+                # A brief deploy restart must not restart all 22 stocks' research.
+                with store.db:
+                    if (datetime.fromisoformat(recovered_at)-datetime.fromisoformat(offline_since)).total_seconds()>=120:
+                        put(store,'reconnect_pending',recovered_at)
+                    put(store,'offline_since',None)
             phase='publish';answer=flush(store,config)
             with store.db:put(store,'last_sync',{'at':now(),'status':'OK','ledger_version':packet['ledger_version']})
             return answer or {'status':'SYNCED'}
     except Exception as exc:
         if str(exc).startswith('BUSY:'):return {'status':'BUSY'}
-        with store.db:put(store,'last_sync',{'at':now(),'status':'FAILED','phase':phase,'error':str(exc)[:500]})
+        with store.db:
+            if phase=='pull' and not value(store,'offline_since'):put(store,'offline_since',now())
+            put(store,'last_sync',{'at':now(),'status':'FAILED','phase':phase,'error':str(exc)[:500]})
         raise
     finally:store.close()

@@ -221,6 +221,19 @@ class SplitScheduleTests(unittest.TestCase):
             store.close()
 
 class LedgerVersionTests(unittest.TestCase):
+    def test_brief_cloud_restart_does_not_restart_all_research(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg={'data_dir':root,'deployment_role':'research'}
+            def cycle(at,error=False):
+                with patch('ashare.cloud_sync.now',return_value=normalize_time(at)),patch('ashare.cloud_sync.pull',side_effect=RuntimeError('offline') if error else None,return_value={'ledger_version':'v1'}),patch('ashare.cloud_sync.flush',return_value=None):
+                    if error:
+                        with self.assertRaisesRegex(RuntimeError,'offline'):sync.sync_once(cfg)
+                    else:sync.sync_once(cfg)
+            cycle('2026-09-23T00:00:00Z',True);cycle('2026-09-23T00:00:59Z')
+            s=Store(root);self.assertIsNone(runtime.value(s,'reconnect_pending'));s.close()
+            cycle('2026-09-23T00:01:00Z',True);cycle('2026-09-23T00:03:01Z')
+            s=Store(root);self.assertEqual(runtime.value(s,'reconnect_pending'),normalize_time('2026-09-23T00:03:01Z'));s.close()
+
     def test_research_waits_for_background_ledger_sync_lock(self):
         from ashare.workflow import task_lock
         from concurrent.futures import ThreadPoolExecutor

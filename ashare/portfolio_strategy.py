@@ -205,7 +205,7 @@ def run(store, config, at=None, model_fn=None, clock=now):
             raise ValueError('组合输入超过预算，保留全部事实等待处理')
         if not config['model_enabled']:
             raise ValueError('组合模型未启用')
-        raw = (model_fn or run_json)(prompt,SCHEMA,folder/'model',min(180,config['model_timeout_seconds']))
+        raw = (model_fn or run_json)(prompt,SCHEMA,folder/'model',min(300,config['model_timeout_seconds']))
         json_write(folder/'model-output.json',raw)
         result = validate(raw,packet)
         completed = normalize_time(clock()); expires = normalize_time((datetime.fromisoformat(completed)+timedelta(hours=config.get("portfolio_authorization_hours",1))).isoformat())
