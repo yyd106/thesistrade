@@ -15,6 +15,9 @@
 .watchlist-table tbody:not(:last-child) .watchlist-summary-row td{border-bottom:1px solid var(--line)}
 .watchlist-status-summary{margin:0;max-width:85ch;font-size:13px;line-height:1.8;color:#425b53;overflow-wrap:anywhere}
 .watchlist-table .watchlist-values td:last-child strong{display:block;white-space:normal;max-width:14em}
+.watchlist-table .watchlist-values td:first-child>strong{font-size:15px;white-space:normal;display:block;min-width:6em}
+.watchlist-summary-row details>summary{font-size:12px;cursor:pointer}
+.watchlist-summary-row details[open]>.watchlist-status-summary{margin-top:10px}
 
 /* Two mutually exclusive views under the account overview. */
 .workspace-heading{margin-bottom:22px}

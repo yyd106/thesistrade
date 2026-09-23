@@ -301,7 +301,7 @@ const observationTarget=(asset,name,category)=>({asset,name,category,kind:'BENCH
 const observationState={watchlist:[readyStock],portfolio:{holdings:[]},market_phase:'CLOSED',observation:{items:[observationTarget('GOLD','黄金','COMMODITY'),observationTarget('US:NVDA','NVIDIA Corporation','US'),observationTarget(readyStock.symbol,readyStock.name,'CN'),observationTarget('sh600547','山东黄金','CN')]}};
 context.observationFixture=observationState;vm.runInContext('state=observationFixture;observationCategory="CN";',context);
 renderWatchlist(observationState);
-assert.equal(macroNodes.get('observation-categories').children.length,4);
+assert.equal(macroNodes.get('observation-categories').children.length,3);
 assert.equal(macroNodes.get('observation-categories').children[0].textContent,'A股 2');
 assert.equal(macroNodes.get('stocks').children[0].children.length,3); // Header plus 2 distinct targets; no duplicate original stock.
 assert.match(JSON.stringify(macroNodes.get('stocks')),/动态影响/);
@@ -316,7 +316,7 @@ assert.equal(macroNodes.get('watchlist-section').hidden,false);assert.equal(macr
 const refreshed=structuredClone(observationState);refreshed.observation.items[1].name='NVIDIA updated';context.observationFixture=refreshed;vm.runInContext('state=observationFixture',context);
 renderWatchlist(refreshed);macroNodes.get('observation-categories').children[1].listeners.click();
 assert.match(JSON.stringify(macroNodes.get('stocks')),/NVIDIA updated/);
-console.log('Fact/inference chains, four categories, deduplicated discoveries, cross-board navigation and fresh-state switching passed.');
+console.log('Fact/inference chains, three categories, deduplicated discoveries, cross-board navigation and fresh-state switching passed.');
 
 // Archived targets stay outside live categories and retain a navigable, paged record.
 const archivedTarget={...observationTarget('US:OLD','Archived company','US'),pool_tier:'ARCHIVED',pool_reason:'事件观察期限已结束',review_due_at:null,priority_score:0};
@@ -370,18 +370,33 @@ assert.match(JSON.stringify(card),/网络域名解析失败/);assert.match(JSON.
 assert.match(message({kind:'review',status:'DONE',result_json:'{"status":"DEFERRED"}'})[0],/待补齐/);
 console.log('Whole-position reviews, no-trade coverage, historical quote labels and actionable failures passed.');
 assert.match(message({kind:'review',status:'DEFERRED',result_json:'{"analysis_error":"网络域名解析失败"}'})[0],/网络域名解析失败/);
-// P0 scope: four tabs, no fifth category, a true placeholder for rates/FX.
+// The removed category falls back safely; all live categories use the same table.
 context.observationFixture=observationState;vm.runInContext('state=observationFixture;observationCategory="RATES_FX"',context);
 renderWatchlist(observationState);
-assert.equal(macroNodes.get('observation-categories').children.length,4);
-assert.match(JSON.stringify(macroNodes.get('stocks')),/Coming soon/);
-assert.doesNotMatch(JSON.stringify(macroNodes.get('stocks')),/NVIDIA|山东黄金|黄金/);
-assert.equal(macroNodes.get('observation-archive').hidden,true);
-assert.equal(macroNodes.get('watchlist-refresh-button').hidden,true);
-const spotCard=new FakeElement('article');
-vm.runInContext('drawObservationCard',context)(spotCard,{...observationTarget('BTC','比特币','COMMODITY'),fixed:true,position:{qty:10000000,qty_scale:100000000,market_value_cents:140000,cost_cents:130000,average_cost_cents:1300000,average_native_cost_micros:2000000000},spot_quote:{price_micros:2100000000,fx_micros:7000000,fx_at:'2026-09-23T01:00:00Z',observed_at:'2026-09-23T01:00:00Z'},unit:'美元/枚'});
-assert.match(JSON.stringify(spotCard),/固定观察|现货模拟/);assert.match(JSON.stringify(spotCard),/买入均价/);assert.match(JSON.stringify(spotCard),/0.1/);
-console.log('Four-category placeholder, native cost comparison and fractional spot display passed.');
+assert.equal(macroNodes.get('observation-categories').children.length,3);
+assert.equal(vm.runInContext('observationCategory',context),'CN');
+assert.doesNotMatch(JSON.stringify(macroNodes.get('observation-categories')),/债券|外汇/);
+assert.doesNotMatch(JSON.stringify(macroNodes.get('stocks')),/Coming soon/);
+const spotTable=new FakeElement('table'),drawGlobalRow=vm.runInContext('drawGlobalWatchlistRow',context);
+const spotTarget={...observationTarget('BTC','比特币','COMMODITY'),fixed:true,position:{qty:10000000,qty_scale:100000000,market_value_cents:140000,cost_cents:130000,average_cost_cents:1300000,average_native_cost_micros:2000000000},spot_quote:{price_micros:2100000000,fx_micros:7000000,fx_at:'2026-09-23T01:00:00Z',observed_at:'2026-09-23T01:00:00Z'},unit:'美元/枚'};
+drawGlobalRow(spotTable,spotTarget,observationState);
+assert.match(JSON.stringify(spotTable),/固定观察/);assert.match(JSON.stringify(spotTable),/2,000.000/);assert.match(JSON.stringify(spotTable),/0.1 枚/);
+assert.match(JSON.stringify(spotTable),/1,400.00 元/);assert.match(JSON.stringify(spotTable),/2,100.00/);assert.match(JSON.stringify(spotTable),/5.00%（原币）/);
+assert.equal(spotTable.children[0].children[0].children.length,6);
+assert.equal(spotTable.children[0].children[1].children[0].children[0].tag,'details');
+assert.ok(!spotTable.children[0].children[1].children[0].children[0].open);
+const foreignState={...observationState,at:'2026-09-23T02:00:00Z',observation:{items:[{...spotTarget,asset:'ETH',name:'以太坊',position:null},spotTarget,{...spotTarget,asset:'GOLD',name:'黄金',unit:'美元/金衡盎司',position:{...spotTarget.position,market_value_cents:200000}}]}};
+context.foreignFixture=foreignState;vm.runInContext('state=foreignFixture;observationCategory="COMMODITY"',context);renderWatchlist(foreignState);
+assert.deepEqual(macroNodes.get('stocks').children[0].children.slice(1).map(g=>g.attrs['aria-label']),['黄金','比特币','以太坊']);
+assert.equal(macroNodes.get('stocks').children[0].children[0].children[0].children[0].textContent,'资产 / 持仓');
+assert.match(JSON.stringify(macroNodes.get('stocks')),/美元\/金衡盎司/);
+const missingRow=new FakeElement('table');drawGlobalRow(missingRow,{...spotTarget,position:null,spot_quote:null},foreignState);
+assert.match(JSON.stringify(missingRow),/未持仓|报价待获取|暂未形成/);assert.doesNotMatch(JSON.stringify(missingRow),/NaN|undefined/);
+const expiredRow=new FakeElement('table');drawGlobalRow(expiredRow,{...spotTarget,trade_plan:{status:'ACTIVE',created_at:'2026-09-22T00:00:00Z',valid_until:'2026-09-23T01:00:00Z',payload:{kind:'PAPER_TRADE',thesis:'依据供给变化',holding_days:5,levels:{buy_low_micros:1900000000,buy_high_micros:2000000000,sell_micros:2200000000,stop_micros:1800000000}}}},foreignState);
+assert.match(JSON.stringify(expiredRow),/仅供回看/);assert.match(JSON.stringify(expiredRow),/1,900.00 – 2,000.00/);
+vm.runInContext('observationCategory="US"',context);renderWatchlist(foreignState);
+assert.equal(macroNodes.get('stocks').children[0].tag,'table');assert.match(JSON.stringify(macroNodes.get('stocks')),/暂未发现需要跟踪的美股标的/);
+console.log('Three unified tables, native currency costs, fractional quantities, holding order, collapsed research and empty/expired states passed.');
 const showPortfolioStrategy=vm.runInContext('renderPortfolioStrategy',context);
 macroNodes.clear();
 showPortfolioStrategy({portfolio_strategy:{enabled:false}});
@@ -395,10 +410,10 @@ showPortfolioStrategy({active_jobs:[],portfolio_strategy:{enabled:true,status:'E
 assert.match(macroNodes.get('portfolio-strategy-state').textContent,/暂停新增买入.*原止损与退出继续/);
 console.log('Portfolio targets, current authorization, safe text and failure state passed.');
 const strategyCard=new FakeElement('article');
-vm.runInContext('drawObservationCard',context)(strategyCard,{...observationTarget('BTC','比特币','COMMODITY'),last_strategy_updated_at:'2026-09-23T01:23:00Z'});
+drawGlobalRow(strategyCard,{...observationTarget('BTC','比特币','COMMODITY'),last_strategy_updated_at:'2026-09-23T01:23:00Z'},foreignState);
 assert.match(JSON.stringify(strategyCard),/上一次交易策略更新时间/);
 assert.doesNotMatch(JSON.stringify(strategyCard),/尚未发布/);
 const emptyStrategyCard=new FakeElement('article');
-vm.runInContext('drawObservationCard',context)(emptyStrategyCard,observationTarget('ETH','以太坊','COMMODITY'));
+drawGlobalRow(emptyStrategyCard,observationTarget('ETH','以太坊','COMMODITY'),foreignState);
 assert.match(JSON.stringify(emptyStrategyCard),/上一次交易策略更新时间：尚未发布/);
 console.log('Per-asset strategy timestamp and missing-publication state passed.');

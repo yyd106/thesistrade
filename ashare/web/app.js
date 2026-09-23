@@ -624,7 +624,7 @@ function executionSummary(item,nextSlot){
     d?'上次检查 '+shortTime(d.at)+'：'+(d.status==='BLOCKED'?'未新增委托':label(d.action)+' · '+label(d.status))+(reason?'。'+brief(reason):''):'尚无盘面检查记录。';
   return last+(nextSlot?' 下次检查 '+shortTime(nextSlot.scheduled_at)+'。':'');
 }
-const observationCategories={CN:'A股',US:'美股',COMMODITY:'商品与贵金属',RATES_FX:'债券与外汇'};
+const observationCategories={CN:'A股',US:'美股',COMMODITY:'商品与贵金属'};
 const impactStrengths={HIGH:'潜在强影响',MEDIUM:'中等影响',LOW:'有限影响',UNKNOWN:'强度待补充'};
 let observationCategory='CN',observationArchiveOffset=0,observationArchiveData=null;
 const poolTierLabels={CORE:'原自选',FOCUS:'重点研究',ACTIVE:'持续观察',COOLING:'候补 · 待复核',ARCHIVED:'已归档'};
@@ -635,32 +635,19 @@ function drawPoolStatus(parent,target){
   parent.append(line,el('p',target.pool_reason,'subtle'));
   if(target.review_due_at)parent.append(el('p','下次复核期限 '+shortTime(target.review_due_at),'subtle'));
 }
-function drawObservationCard(parent,target,archived=false){
+function drawObservationCard(parent,target){
   const card=el('article',null,'observation-card');card.id='observed-'+target.asset;card.tabIndex=-1;
   const heading=el('div',null,'section-head');heading.append(el('h3',target.name),el('span',target.fixed?'现货模拟':target.status==='NEEDS_REVIEW'?'待复核':impactStrengths[target.strength]||impactStrengths.UNKNOWN,'badge'));
   card.append(heading,el('p',(target.symbol||target.asset)+' · '+(observationCategories[target.category]||'全球宏观背景')+' · '+macroDirections[target.direction],'subtle'));drawPoolStatus(card,target);
-  if(!archived){
-    const p=target.position,q=target.spot_quote,plan=target.trade_plan,metrics=el('div',null,'observation-metrics');
-    metrics.append(el('strong','当前持仓 '+money(p?.market_value_cents??0)+' 元'));
-    metrics.append(el('span',q?'当前价 '+(q.price_micros/1e6).toLocaleString('zh-CN',{maximumFractionDigits:2})+' '+target.unit:indicatorText(target)));card.append(metrics);
-    if(p){card.append(el('p','持有 '+(p.qty/(p.qty_scale||1)).toLocaleString('zh-CN',{maximumFractionDigits:8})+' · 买入均价 '+(p.average_native_cost_micros/1e6).toLocaleString('zh-CN',{maximumFractionDigits:3})+' 美元/单位（'+costPrice(p.average_cost_cents)+' 元） · 浮动 '+signed(p.market_value_cents-p.cost_cents)+' 元','subtle'));}
-    if(q)card.append(el('p',((new Date(state?.at||Date.now())-new Date(q.observed_at)>90000)?'最近报价 ':'报价 ')+shortTime(q.observed_at)+' · 美元兑人民币 '+(q.fx_micros/1e6).toFixed(4)+'（'+shortTime(q.fx_at)+'）','subtle'));
-    if(plan){const pp=plan.payload;card.append(el('p',pp.kind==='PAPER_TRADE'?'等待价格与资金条件':'等待：'+pp.blockers.slice(0,2).join('；')),el('p',pp.thesis));
-      if(pp.levels){const f=v=>(v/1e6).toLocaleString('zh-CN',{maximumFractionDigits:2});card.append(el('p','买入参考 '+f(pp.levels.buy_low_micros)+' – '+f(pp.levels.buy_high_micros)+' · 止损 '+f(pp.levels.stop_micros)+' · 卖出参考 '+f(pp.levels.sell_micros)+'（美元）','subtle'));}
-      card.append(el('p','持有参考 '+pp.holding_days+' 天 · 每小时复核 · 研究有效至 '+shortTime(plan.valid_until),'subtle'));
-      if(target.recheck)card.append(el('p','最近复核 '+shortTime(target.recheck.checked_at)+(target.recheck.payload.blockers.length?' · '+target.recheck.payload.blockers[0]:''),'subtle'));
-    }else if(target.fixed||target.category==='US')card.append(el('p','等待本轮研究形成交易计划。','subtle'));
-  }
   if(target.indicator)card.append(el('p','指标日期 '+target.indicator.date+(target.indicator_status==='FAILED'?' · 最近更新未成功':''),'subtle'));
   card.append(el('p','加入观察 '+shortTime(target.added_at)+' · 最近研究 '+shortTime(target.trade_plan?.created_at||target.updated_at),'subtle'));
-  if(!archived)card.append(el('p','上一次交易策略更新时间：'+(target.last_strategy_updated_at?shortTime(target.last_strategy_updated_at):'尚未发布'),'subtle'));
   drawObservationCauses(card,target);parent.append(card);
 }
 function renderObservationArchive(data){
   if(!data)return;
   $('observation-archive').hidden=!data.archive_count;
   $('observation-archive-title').textContent='候补与归档（'+(data.archive_count||0)+'）';
-  renderChanged('observation-archive-items',[data.archived_items,data.archive_offset],box=>(data.archived_items||[]).forEach(t=>drawObservationCard(box,t,true)));
+  renderChanged('observation-archive-items',[data.archived_items,data.archive_offset],box=>(data.archived_items||[]).forEach(t=>drawObservationCard(box,t)));
   const offset=data.archive_offset||0,total=data.archive_count||0;
   $('observation-archive-page').textContent='第 '+(Math.floor(offset/25)+1)+' / '+Math.max(1,Math.ceil(total/25))+' 页';
   $('observation-archive-prev').disabled=offset===0;$('observation-archive-next').disabled=offset+25>=total;
@@ -674,7 +661,7 @@ async function loadObservationArchive(offset=0,asset=null){
 }
 
 async function showObservation(asset,category){
-  observationCategory=(category&&category!=='RATES_FX'&&observationCategories[category])?category:'CN';selectBoard('watchlist',{remember:true});if(state)renderWatchlist(state);
+  observationCategory=observationCategories[category]?category:'CN';selectBoard('watchlist',{remember:true});if(state)renderWatchlist(state);
   const member=state?.observation?.membership?.[asset];
   if(member&&['COOLING','ARCHIVED'].includes(member.tier)){if(!await loadObservationArchive(0,asset))return;}
   const target=$('observed-'+asset);if(target){target.scrollIntoView({block:'center',behavior:'smooth'});target.focus({preventScroll:true});}
@@ -744,12 +731,61 @@ function drawObservationCauses(parent,target){
   }parent.append(causes);
 }
 function indicatorText(target){return target.indicator?target.indicator.value.toLocaleString('zh-CN',{maximumFractionDigits:4})+' '+target.unit:'行情暂未接入';}
+function watchlistTable(){
+  const table=el('table',null,'watchlist-table'),head=el('tr'),heading=el('thead');
+  ['资产 / 持仓','当前持仓','当前价 / 成本价','买入参考区间','卖出 / 止损参考','当前建议'].forEach((title,index)=>{
+    const th=el('th',title);th.scope='col';if(index===1){th.setAttribute('aria-sort','descending');th.append(el('span',' ↓','sort-indicator'));}head.append(th);
+  });heading.append(head);table.append(heading);return table;
+}
+const nativePrice=(micros,digits=2)=>Number.isFinite(micros)?(micros/1e6).toLocaleString('zh-CN',{minimumFractionDigits:digits,maximumFractionDigits:digits}):'—';
+function drawGlobalWatchlistRow(table,target,s){
+  const h=target.position,q=target.spot_quote,p=target.trade_plan,pp=p?.payload,l=pp?.levels;
+  const unit=target.unit||(target.category==='US'?'美元/股':'美元/单位'),quantityUnit=unit.includes('/')?unit.split('/')[1]:'单位';
+  const expired=p&&((p.status&&p.status!=='ACTIVE')||Date.parse(p.valid_until)<=Date.parse(s.at));
+  const row=el('tr',null,'watchlist-values'),name=el('td'),holding=el('td',null,'holding-value'),quote=el('td'),buy=el('td'),sell=el('td'),decision=el('td');
+  name.append(el('strong',target.name),el('p',target.symbol||target.asset,'subtle'),el('p',h?(h.qty/(h.qty_scale||1)).toLocaleString('zh-CN',{maximumFractionDigits:8})+' '+quantityUnit:'未持仓','subtle'));
+  if(target.fixed||target.pool_tier)name.append(el('span',target.fixed?'固定观察':poolTierLabels[target.pool_tier]||'动态发现','badge'));
+  holding.append(el('strong',money(h?.market_value_cents??0)+' 元'));
+  if(h){
+    const pnl=h.market_value_cents-h.cost_cents;
+    holding.append(el('p',(pnl>0?'浮盈 ':pnl<0?'浮亏 ':'浮动盈亏 ')+signed(pnl)+' 元','holding-pnl '+(pnl>0?'profit':pnl<0?'loss':'')));
+    if(!q)holding.append(el('p','暂无报价 · 按成本估算','subtle'));
+    else if(h.valuation_complete===false)holding.append(el('p','估值待更新','caution'));
+  }
+  const current=el('p',null,'position-price'),cost=el('p',null,'position-cost');
+  current.append(el('span','现价 ','subtle'),el('strong',nativePrice(q?.price_micros)));
+  cost.append(el('span','成本 ','subtle'),el('strong',nativePrice(h?.average_native_cost_micros,3)));
+  cost.title='当前剩余持仓的平均买入成本，含买入费用；按成交时汇率还原原币成本。';
+  quote.append(current,cost,el('p',unit,'subtle'));
+  if(h?.average_native_cost_micros>0&&Number.isFinite(q?.price_micros)){
+    const change=(q.price_micros/h.average_native_cost_micros-1)*100;
+    quote.append(el('p','较成本 '+(change>0?'+':'')+percent(change)+'（原币）','cost-return '+(change>0?'profit':change<0?'loss':'')));
+  }
+  quote.append(el('p',q?'最近报价 · '+shortTime(q.observed_at):'报价待获取','subtle'));
+  buy.append(el('strong',l?nativePrice(l.buy_low_micros)+' – '+nativePrice(l.buy_high_micros):'暂未形成'));
+  sell.append(el('p',l?nativePrice(l.sell_micros)+' / '+nativePrice(l.stop_micros):'暂未形成'));
+  if(l){buy.append(el('p',unit,'subtle'));sell.append(el('p',unit,'subtle'));}
+  if(expired)buy.append(el('p','研究已过期 · 仅供回看','caution'));
+  const blockers=target.recheck?.payload?.blockers?.length?target.recheck.payload.blockers:pp?.blockers||[];
+  const title=expired?'研究已过期，等待更新':!p?'等待研究形成交易计划':blockers.length?'等待：'+blockers.slice(0,2).join('；'):pp.kind==='PAPER_TRADE'?(h?'按策略持续检查':'等待价格与资金条件'):'当前研究暂不买入';
+  decision.append(el('strong',title,'caution'),el('p',p?'研究 '+shortTime(p.created_at):'等待首次研究','subtle'),el('p','上一次交易策略更新时间：'+(target.last_strategy_updated_at?shortTime(target.last_strategy_updated_at):'尚未发布'),'subtle'));
+  row.append(name,holding,quote,buy,sell,decision);
+  const summaryRow=el('tr',null,'watchlist-summary-row'),cell=el('td'),research=details('研究逻辑与动态影响','watchlist-research:'+target.asset);cell.colSpan=6;
+  if(pp){research.append(el('p',pp.thesis,'watchlist-status-summary'),el('p','持有参考 '+pp.holding_days+' 天 · 每小时复核 · 研究有效至 '+shortTime(p.valid_until),'subtle'));}
+  else research.append(el('p','等待本轮研究形成交易计划。','subtle'));
+  if(target.recheck)research.append(el('p','最近复核 '+shortTime(target.recheck.checked_at)+(blockers.length?' · '+blockers.join('；'):''),'subtle'));
+  if(q)research.append(el('p','美元兑人民币 '+(q.fx_micros/1e6).toFixed(4)+' · '+shortTime(q.fx_at),'subtle'));
+  if(target.indicator)research.append(el('p','历史指标 '+indicatorText(target)+' · '+target.indicator.date,'subtle'));
+  drawPoolStatus(research,target);drawObservationCauses(research,target);cell.append(research);summaryRow.append(cell);
+  const group=el('tbody');group.id='observed-'+target.asset;group.tabIndex=-1;group.setAttribute('aria-label',target.name);group.append(row,summaryRow);table.append(group);
+}
 function renderWatchlist(s){
+  if(!observationCategories[observationCategory])observationCategory='CN';
   const observed=s.observation?.items||[],manual=new Set(s.watchlist.map(w=>w.symbol));
   renderChanged('observation-categories',[observed.map(t=>[t.asset,t.category]),s.watchlist.map(w=>w.symbol),observationCategory],box=>{
     Object.entries(observationCategories).forEach(([category,title],index)=>{
       const count=observed.filter(t=>t.category===category&&!manual.has(t.asset)).length+(category==='CN'?manual.size:0);
-      const b=el('button',title+(category==='RATES_FX'?'':' '+count));b.type='button';b.id='category-'+category;b.setAttribute('role','tab');b.setAttribute('aria-selected',String(category===observationCategory));b.setAttribute('aria-controls','stocks');b.tabIndex=category===observationCategory?0:-1;
+      const b=el('button',title+' '+count);b.type='button';b.id='category-'+category;b.setAttribute('role','tab');b.setAttribute('aria-selected',String(category===observationCategory));b.setAttribute('aria-controls','stocks');b.tabIndex=category===observationCategory?0:-1;
       b.addEventListener('click',()=>{observationCategory=category;renderWatchlist(state||s);});
       b.addEventListener('keydown',event=>{const keys=Object.keys(observationCategories),next=event.key==='ArrowRight'?(index+1)%keys.length:event.key==='ArrowLeft'?(index+keys.length-1)%keys.length:event.key==='Home'?0:event.key==='End'?keys.length-1:null;if(next!==null){event.preventDefault();observationCategory=keys[next];renderWatchlist(state||s);$('category-'+keys[next]).focus();}});box.append(b);
     });
@@ -758,30 +794,28 @@ function renderWatchlist(s){
   $('observation-pool-summary').textContent=pool?(limits.total_limit?'观察 '+pool.total+' / '+limits.total_limit+' · ':'')+'动态活跃 '+pool.active+' / '+limits.active_limit+' · 重点研究 '+pool.focus+' / '+limits.focus_limit+(pool.protected_overflow?' · 持仓与委托保护超额 '+pool.protected_overflow+' 个，暂停其他新增':''):'';
   renderObservationArchive(observationArchiveOffset&&observationArchiveData?observationArchiveData:s.observation);
   $('stocks').setAttribute('aria-labelledby','category-'+observationCategory);
-  if(observationCategory==='RATES_FX')$('observation-archive').hidden=true;
   $('last-updated').hidden=observationCategory!=='CN';$('update-coverage').hidden=observationCategory!=='CN';
   for(const id of ['followup-section','watchlist-performance'])if($(id))$(id).hidden=observationCategory!=='CN';
-  $('activity-section').hidden=observationCategory==='RATES_FX';
-  $('watchlist-refresh-button').hidden=observationCategory==='RATES_FX';
+  $('activity-section').hidden=false;
+  $('watchlist-refresh-button').hidden=false;
   $('watchlist-refresh-button').dataset.run=observationCategory==='CN'?'cycle':'global_research';
-  $('watchlist-note').hidden=observationCategory==='RATES_FX';
-  $('watchlist-note').textContent=observationCategory==='CN'?'单位：元。成本价为当前持仓的平均买入成本（含买入费用）。盈亏按已取得的最近报价计算；参考区间用于观察。':'持仓价值以元显示，行情单位与日期见各标的。加入观察表示持续跟踪。';
+  $('watchlist-note').hidden=false;
+  $('watchlist-note').textContent=observationCategory==='CN'?'单位：元。成本价为当前持仓的平均买入成本（含买入费用）。盈亏按已取得的最近报价计算；参考区间用于观察。':'持仓价值与浮动盈亏以人民币显示；现价、成本价及买卖区间使用标注的原币单位。较成本变动按原币计算，人民币盈亏还受汇率影响。';
   $('research-timing').textContent=s.watchlist.length+' 只原自选股 · '+observed.filter(t=>!manual.has(t.asset)&&!t.fixed).length+' 个动态发现标的'+(observed.some(t=>t.fixed)?' · 4 个固定现货资产':'');
   renderChanged('stocks',[s.watchlist,s.portfolio.holdings,s.market_phase,s.next_runs,observed,observationCategory,[...s.watchlist,...observed].map(item=>quoteIsStale(item.quote,s))],box=>{
     const holdings=new Map(s.portfolio.holdings.filter(h=>h.origin!=='dynamic').map(h=>[h.symbol,h]));
     const discoveries=new Map(observed.map(t=>[t.asset,t]));
-    if(observationCategory==='RATES_FX'){box.append(el('p','Coming soon','empty'));return;}
     if(observationCategory!=='CN'){
       const targets=observed.filter(t=>t.category===observationCategory).sort((a,b)=>(b.position?.market_value_cents||0)-(a.position?.market_value_cents||0)||(a.pool_tier!=='FOCUS')-(b.pool_tier!=='FOCUS')||(b.priority_score||0)-(a.priority_score||0)||(a.fixed&&b.fixed?['GOLD','SILVER','BTC','ETH'].indexOf(a.asset)-['GOLD','SILVER','BTC','ETH'].indexOf(b.asset):0));
-      if(!targets.length){box.append(el('p','暂未发现需要跟踪的'+observationCategories[observationCategory]+'标的。新事件形成影响结论后会自动加入。','empty'));return;}
-      targets.forEach(target=>drawObservationCard(box,target));return;
+      const table=watchlistTable();
+      if(!targets.length){const body=el('tbody'),row=el('tr'),cell=el('td');cell.colSpan=6;cell.append(el('p','暂未发现需要跟踪的'+observationCategories[observationCategory]+'标的。新事件形成影响结论后会自动加入。','empty'));row.append(cell);body.append(row);table.append(body);}
+      targets.forEach(target=>drawGlobalWatchlistRow(table,target,s));box.append(table);return;
     }
     const extra=observed.filter(t=>t.category==='CN'&&!manual.has(t.asset)).map(t=>({symbol:t.asset,name:t.name,quote:t.quote,discovery:t}));
     for(const item of extra){const h=s.portfolio.holdings.find(h=>h.origin==='dynamic'&&h.symbol===item.symbol);if(h)holdings.set(item.symbol,h);}
     const value=item=>holdings.get(item.symbol)?.market_value_cents??0;
     const ordered=[...s.watchlist,...extra].sort((a,b)=>value(b)-value(a));
-    const t=el('table',null,'watchlist-table'),head=el('tr');
-    ['股票 / 持仓','当前持仓','当前价 / 成本价','买入参考区间','卖出 / 止损参考','当前建议'].forEach((title,index)=>{const th=el('th',title);th.scope='col';if(index===1){th.setAttribute('aria-sort','descending');th.append(el('span',' ↓','sort-indicator'));}head.append(th);});const heading=el('thead');heading.append(head);t.append(heading);
+    const t=watchlistTable();
     for(const item of ordered){const row=el('tr'),name=el('td'),holding=el('td',null,'holding-value'),quote=el('td'),buy=el('td'),sell=el('td'),decision=el('td');
       const h=holdings.get(item.symbol),p=item.plan,l=p?.payload?.levels,discovery=discoveries.get(item.symbol),v=item.discovery?{title:discovery.status==='NEEDS_REVIEW'?'影响待复核':macroDirections[discovery.direction],reason:'动态发现标的，持续观察事件条件与后续证据。',ready:false}:researchDecision(item,s.market_phase);
       name.append(item.discovery?el('strong',item.name):pageLink(item.name,'/stocks/'+item.symbol),el('p',item.symbol,'subtle'),el('p',h?h.qty+' 股 · '+percent(h.weight_pct):'未持仓','subtle'));
@@ -800,9 +834,10 @@ function renderWatchlist(s){
       decision.append(el('p','上一次交易策略更新时间：'+(item.last_strategy_updated_at||discovery?.last_strategy_updated_at?shortTime(item.last_strategy_updated_at||discovery.last_strategy_updated_at):'尚未发布'),'subtle'));
       row.className='watchlist-values';row.append(name,holding,quote,buy,sell,decision);
       const summaryRow=el('tr',null,'watchlist-summary-row'),summaryCell=el('td');summaryCell.colSpan=6;
-      summaryCell.append(el('p',overviewSummary(item,v),'watchlist-status-summary'));summaryRow.append(summaryCell);
+      const research=details('研究逻辑'+(discovery?'与动态影响':''),'watchlist-research:'+item.symbol);
+      research.append(el('p',overviewSummary(item,v),'watchlist-status-summary'));summaryRow.append(summaryCell);
       if(!item.discovery)summaryCell.append(el('p',executionSummary(item,s.next_runs?.find(r=>r.kind==='slot')),'subtle'));
-      if(discovery){drawPoolStatus(summaryCell,discovery);drawObservationCauses(summaryCell,discovery);}
+      if(discovery){drawPoolStatus(research,discovery);drawObservationCauses(research,discovery);}summaryCell.append(research);
       const group=el('tbody');group.id='observed-'+item.symbol;group.tabIndex=-1;group.setAttribute('aria-label',item.name);group.append(row,summaryRow);t.append(group);
     }box.append(t);
   });
