@@ -86,6 +86,7 @@ cd /Users/dean/Documents/Codex/Agents/ashare-agent
 ./agent model-check
 ./agent digest --date 2026-09-25
 ./agent digest --since 2026-09-21
+./agent issues new --key OTHER_DATA --title "标题" --detail "现象与依据"
 ./agent evaluate
 ./agent weekly-report
 ./agent proposals list

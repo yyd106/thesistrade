@@ -142,6 +142,28 @@ class CliCommandTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_operator_records_an_issue_and_repeats_collapse(self):
+        from ashare.cli import _store_command
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(tmp)
+            try:
+                args = argparse.Namespace(command='issues', action='new', id=None, status='OPEN', note=None, wontfix=False, key='OTHER_DATA',
+                                          symbol=None, title='巨潮公告目录连续两天为空', detail='digest 2026-09-26、27 新入库公告为 0', evidence=['workflow/digests/2026-09-27.md'])
+                first = _store_command(args, {}, store)
+                self.assertEqual((first['status'], first['occurrences']), ('OPEN', 1))
+                self.assertEqual(_store_command(args, {}, store)['occurrences'], 2)
+                args.title = '腾讯日线接口午间超时'
+                self.assertNotEqual(_store_command(args, {}, store)['id'], first['id'])
+                row = store.db.execute('SELECT category,title,payload_json FROM engineering_issues WHERE id=?', (first['id'],)).fetchone()
+                self.assertEqual((row['category'], row['title']), ('DATA', '巨潮公告目录连续两天为空'))
+                self.assertIn('source:agent', json.loads(row['payload_json'])['latest']['evidence'])
+                args.key = 'CHECK_BUY_WHILE_HALTED'
+                with self.assertRaisesRegex(ValueError, '问题类型'):_store_command(args, {}, store)
+                args.key, args.detail = 'OTHER_DATA', ' '
+                with self.assertRaisesRegex(ValueError, '--detail'):_store_command(args, {}, store)
+            finally:
+                store.close()
+
 
 if __name__ == '__main__':
     unittest.main()

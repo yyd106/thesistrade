@@ -51,12 +51,13 @@ def guidance(store, route, symbol, at):
              'claim_type': 'ADOPTED_RESEARCH_RULE'} for r in rows]
 
 
-def record_issue(store, issue_key, symbol, detail, evidence, at, *, title=None):
-    """Upsert one engineering issue per (issue key, symbol). Caller owns the transaction."""
+def record_issue(store, issue_key, symbol, detail, evidence, at, *, title=None, dedupe=None):
+    """Upsert one engineering issue per (issue key, symbol), or per (key, symbol, dedupe) for issues an
+    operator records by hand, so distinct manual reports under a generic key do not merge. Caller owns the transaction."""
     if issue_key not in ISSUE_KEYS:
         issue_key = 'OTHER_SYSTEM'
     category, default_title = ISSUE_KEYS[issue_key]
-    iid = digest(issue_key + '|' + (symbol or 'MARKET'))[:24]
+    iid = digest(issue_key + '|' + (symbol or 'MARKET') + ('|' + dedupe if dedupe else ''))[:24]
     at = normalize_time(at)
     row = store.db.execute('SELECT * FROM engineering_issues WHERE id=?', (iid,)).fetchone()
     item = {'detail': str(detail)[:600], 'evidence': [str(e) for e in evidence][:10], 'at': at}

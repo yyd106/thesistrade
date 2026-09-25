@@ -62,9 +62,12 @@ def main():
     prop.add_argument('--to', help='decide：READY/APPROVED/REJECTED/ADOPTED/RETIRED')
     prop.add_argument('--approved-by', help='批准、上线、撤下时必填：用户本人确认的记录')
     prop.add_argument('--note', help='决定理由或实施说明')
-    iss = sub.add_parser('issues', help='工程问题：list/resolve')
-    iss.add_argument('action', choices=['list', 'resolve']);iss.add_argument('id', nargs='?')
+    iss = sub.add_parser('issues', help='工程问题：list/new/resolve')
+    iss.add_argument('action', choices=['list', 'new', 'resolve']);iss.add_argument('id', nargs='?')
     iss.add_argument('--status', default='OPEN');iss.add_argument('--note');iss.add_argument('--wontfix', action='store_true')
+    iss.add_argument('--key', help='new：问题类型，如 OTHER_DATA、OTHER_SYSTEM、OTHER_EXECUTION、MISSING_DAILY_BARS')
+    iss.add_argument('--symbol', help='new：相关代码，全市场问题不填');iss.add_argument('--title', help='new：一句话标题；同类型、同代码、同标题的再次登记只累加次数')
+    iss.add_argument('--detail', help='new：现象与依据');iss.add_argument('--evidence', action='append', help='new：证据位置，可重复')
     sub.add_parser('guidance', help='列出已上线的研究规则')
     dg = sub.add_parser('digest', help='运行日报：一页汇总当天的抓取、研究、组合策略、执行、复盘与调整（程序生成，不调用模型）')
     dg.add_argument('--date', help='某一天（YYYY-MM-DD，北京时间），默认今天')
@@ -230,6 +233,18 @@ def _store_command(args, config, store):
     if command == 'issues':
         if args.action == 'list':
             return governance.issues(store, None if args.status == 'ALL' else args.status)
+        if args.action == 'new':
+            key = getattr(args, 'key', None) or 'OTHER_SYSTEM'
+            if key not in governance.REVIEW_ISSUE_KEYS:
+                raise ValueError('问题类型只能是：' + '、'.join(governance.REVIEW_ISSUE_KEYS) + '（程序检查类由复盘自动登记）')
+            title, detail = (getattr(args, 'title', None) or '').strip(), (getattr(args, 'detail', None) or '').strip()
+            if not title or not detail:
+                raise ValueError('登记工程问题需要 --title 和 --detail')
+            with store.db:
+                iid = governance.record_issue(store, key, getattr(args, 'symbol', None), detail, ['source:agent'] + list(getattr(args, 'evidence', None) or []),
+                                              now(), title=title[:120], dedupe=title[:120])
+            row = store.db.execute('SELECT status,occurrences FROM engineering_issues WHERE id=?', (iid,)).fetchone()
+            return {'status': row['status'], 'id': iid, 'occurrences': row['occurrences']}
         governance.resolve_issue(store, args.id, args.note, status='WONTFIX' if args.wontfix else 'RESOLVED')
         return {'status': 'UPDATED', 'id': args.id}
     if command == 'proposals':
