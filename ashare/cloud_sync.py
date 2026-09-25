@@ -71,8 +71,10 @@ def display_packet(config):
     return result
 
 
-# The cloud recomputes these per-stock fields from its own ledger, so they are never sent.
-VOLATILE=('quote','last_decision','open_orders')
+# The cloud recomputes these per-asset fields from its own ledger and received strategies, so they are
+# never sent. last_strategy_updated_at changes with every new strategy for every asset; sending it would
+# mark every section as changed and defeat the delta.
+VOLATILE=('quote','last_decision','open_orders','last_strategy_updated_at')
 
 
 def display_sections(display):
@@ -82,6 +84,8 @@ def display_sections(display):
         if key=='watchlist':
             sections['watchlist:__order__']=[w['symbol'] for w in item]
             for w in item:sections['watchlist:'+w['symbol']]={k:v for k,v in w.items() if k not in VOLATILE}
+        elif key=='observation' and isinstance(item,dict) and isinstance(item.get('items'),list):
+            sections['top:'+key]={**item,'items':[{k:v for k,v in i.items() if k not in VOLATILE} if isinstance(i,dict) else i for i in item['items']]}
         else:sections['top:'+key]=item
     return sections
 

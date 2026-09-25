@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 from .storage import now, json_write
 
-OPERATIONAL = {'collection_times', 'review_time', 'evaluation_time', 'weekly_report_time', 'weekly_report_weekday',
+OPERATIONAL = {'collection_times', 'review_time', 'evaluation_time', 'weekly_report_time', 'weekly_report_weekday', 'digest_time',
                'research_reuse_hours', 'portfolio_refresh_minutes', 'external_news_enabled', 'external_news_articles_per_source',
                'external_news_lookback_days', 'pdf_downloads_per_stock', 'pdf_revision_checks_per_stock', 'document_recheck_hours',
                'announcement_lookback_days', 'max_announcement_pages', 'quote_poll_seconds', 'announcement_poll_seconds',

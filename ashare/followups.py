@@ -11,7 +11,7 @@ from .guidance import trade_guidance
 
 OWNER_NAMES={'SYSTEM':'系统','USER':'你','ENGINEERING':'程序维护','DISCLOSURE':'系统跟踪披露','MARKET':'系统跟踪行情'}
 STATE_NAMES={'AUTO':'自动处理','RUNNING':'正在处理','ESCALATED':'已转后续处理','WAITING':'等待条件','ACTION':'需要处理'}
-JOB_NAMES={'slot':'盘面判断','research':'研究','cycle':'资料研究','collect':'资料采集','repair':'单股补齐','review':'复盘','settle':'模拟撮合','evaluate':'评估打分','weekly_report':'周度评估报告'}
+JOB_NAMES={'slot':'盘面判断','research':'研究','cycle':'资料研究','collect':'资料采集','repair':'单股补齐','review':'复盘','settle':'模拟撮合','evaluate':'评估打分','weekly_report':'周度评估报告','digest':'运行日报'}
 
 
 def job_failed(j):
