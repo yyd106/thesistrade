@@ -69,6 +69,11 @@ def validate(value,packet):
     for lesson in value.get('lessons',[]):
         try:
             if lesson['category'] not in ('DATA','RESEARCH','EXECUTION','SYSTEM','OBSERVATION'):raise ValueError('分类无效')
+            # Defects need a known class so repeats collapse; observations carry no defect class.
+            from .governance import REVIEW_ISSUE_KEYS
+            if lesson['category'] in ('DATA','EXECUTION','SYSTEM'):
+                if lesson.get('issue_key') not in REVIEW_ISSUE_KEYS:lesson['issue_key']='OTHER_'+lesson['category']
+            else:lesson['issue_key']='STRATEGY_OBSERVATION'
             if not lesson['decision_ids'] and not lesson['fill_ids']:raise ValueError('缺少执行引用')
             for k in ('symbol','lesson','applicability'):
                 if not isinstance(lesson[k],str) or not lesson[k].strip():raise ValueError('字段无效')
@@ -103,7 +108,12 @@ PROMPT=('你是全仓投资复盘分析员，仅输出中文JSON，不调用工�
     'research_ids只能引用该持仓research_ids里的标识，至少一项；确实无研究则INSUFFICIENT并空数组。'
     '报价MISSING/STALE/INTRADAY_LAST不能冒充完整收盘表现，late_quote说明历史行情事后补齐，不能称买入时已知。'
     'summary最多200汉字；每仓reason最多120汉字，每类points最多2条各60汉字，next_check最多80汉字。'
-    'lessons最多3条内部待验证经验，必须引用提供的真实decision_ids或fill_ids；symbol只能为单一股票代码，跨股票使用MARKET，禁止拼接代码。'
+    'lessons最多3条，必须引用提供的真实decision_ids或fill_ids；symbol只能为单一股票代码，跨股票使用MARKET，禁止拼接代码。'
+    'lessons不会进入任何研究输入：DATA、EXECUTION、SYSTEM类记为程序缺陷，issue_key从给定枚举选最贴近的一项（无合适项用OTHER_类别）；'
+    'RESEARCH、OBSERVATION类记为待检验的策略观察，issue_key填STRATEGY_OBSERVATION，并在applicability写清要用什么数据、多长期限检验。'
+    '执行端只检查：价格进入计划买入区间、20日均价与60日均价的趋势条件、研究结论与计划限制、未研究的新公告、组合授权、资金与硬风控、板块与最小申报数量；'
+    '退出只看成本或计划止损、止盈参考价和组合减仓。旧研究里写的量能、企稳等盘面条件执行端本来就不检查，不要当作执行失误；如需记录，用EXECUTION_IGNORES_RESEARCH_TRIGGER一次即可。'
+    'program_checks是程序已完成的一致性检查结果，照录其结论，不重复推断。'
     '不评价未保存的无操作次数、错失机会，不自动修改策略或交易。若缺少因果证据要直接说尚待验证。')
 
 PROMPT += PORTFOLIO_NOTICE

@@ -1,5 +1,5 @@
 {
-  "design_version": "1.1",
+  "design_version": "1.2",
   "requirements_version": "1.2",
   "deployment_status": "DESIGN_ONLY_NOT_LOADED_BY_RUNTIME",
   "timezone": "Asia/Shanghai",
@@ -18,7 +18,7 @@
     ],
     "review_interval_hours": 24,
     "review_window_hours": 24,
-    "review_feedback": "internal_lessons_in_future_research_snapshots",
+    "review_feedback": "findings_routed_to_engineering_issues_or_proposal_drafts; only_user_adopted_strategy_guidance_enters_research",
     "initial_capital_limit_cny": 100000,
     "reinvest_gains": true,
     "withdrawal_rule": "reduce_to_retained_equity",
@@ -328,6 +328,7 @@
     "portfolio_cash_reservation_atomic": true,
     "late_slots_must_not_replay_orders": true,
     "internal_lessons_are_not_external_evidence": true,
+    "review_findings_never_enter_research_directly": true,
     "strategy_changes_require_separate_validation": true,
     "enable_live_trading_from_this_file": false,
     "enable_scheduler_from_this_file": false

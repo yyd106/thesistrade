@@ -184,7 +184,10 @@ class CloudHTTPTests(unittest.TestCase):
         self.assertEqual(self.call('/api/sync/bootstrap',{},headers=h,sign=False)[0],403)
         code,raw,_,_=self.call('/health',{},headers=h,sign=False,method='GET')
         self.assertEqual(code,200)
-        self.assertEqual(set(json.loads(raw)),{'ok','version','role'})
+        # Health exposes deployment identity only (feature flags, code hash, calendar), never account data.
+        health=json.loads(raw)
+        self.assertEqual(set(health),{'ok','version','role','features','code','calendar'})
+        self.assertIn('ledger_v2',health['features']);self.assertRegex(health['code'],r'^[0-9a-f]{12}$')
 
 class SplitScheduleTests(unittest.TestCase):
     def test_sleep_catchup_and_role_separation(self):

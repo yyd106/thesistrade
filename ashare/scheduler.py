@@ -39,7 +39,10 @@ def schedule_due(store,config,at):
     cursor=start;items=[]
     while cursor<=finish:
         for kind,times in (('cycle',config['collection_times']),('review',[config['review_time']]),
-            ('slot',config['slot_times'] if trading_day(cursor) is True else [])):
+            ('slot',config['slot_times'] if trading_day(cursor) is True else []),
+            # Model-free evaluation after each trading day's data is collected, and a weekly report.
+            ('evaluate',[config['evaluation_time']] if config.get('evaluation_enabled',True) and trading_day(cursor) is True else []),
+            ('weekly_report',[config['weekly_report_time']] if config.get('evaluation_enabled',True) and cursor.weekday()==config.get('weekly_report_weekday',5) else [])):
             if role(config)=='research' and kind=='slot':continue
             if role(config)=='cloud' and kind!='slot':continue
             for hhmm in times:
@@ -131,7 +134,7 @@ def schedule_reconnected(store,config,at):
 class Scheduler:
     def __init__(self,config_path):
         self.config_path=config_path;self.stop=Event();self.pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix='ashare')
-        self.futures={};self.last_settle=0;self.last_followups=0
+        self.futures={};self.last_settle=0;self.last_followups=0;self.last_maintenance=0
         self.sync_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='cloud-sync');self.sync_future=None;self.last_sync=0
         self.dynamic_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='dynamic')
         self.dynamic_futures={}
@@ -144,6 +147,10 @@ class Scheduler:
     def recover(self):
         config=load_config(self.config_path);store=Store(config['data_dir'])
         try:
+            if role(config)=='cloud':
+                # Log mutable ledger changes from startup so research replicas can pull increments.
+                from .cloud_ledger import ensure_change_log
+                with store.db:ensure_change_log(store)
             with store.db:
                 store.db.execute("UPDATE jobs SET status='INTERRUPTED',finished_at=?,error='服务重启：保留中断记录' WHERE status='RUNNING'",(now(),))
                 store.db.execute("UPDATE slots SET status='INTERRUPTED',finished_at=? WHERE status='RUNNING'",(now(),))
@@ -257,6 +264,12 @@ class Scheduler:
                 if store.db.execute("SELECT 1 FROM paper_orders WHERE status IN ('OPEN','PARTIAL') LIMIT 1").fetchone():
                     enqueue(store,'settle',stamp)
                 self.last_settle=time.monotonic()
+            if time.monotonic()-self.last_maintenance>=3600:
+                from .maintenance import run as maintain
+                try:maintain(store,config,stamp)
+                except Exception as exc:
+                    with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('maintenance_error',?)",(stamp+' '+str(exc)[:300],))
+                self.last_maintenance=time.monotonic()
             if role(config)!='cloud' and time.monotonic()-self.last_followups>=60:
                 from .followups import reconcile
                 try:

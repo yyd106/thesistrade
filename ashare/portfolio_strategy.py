@@ -181,9 +181,10 @@ def request(store, config, at, *, changed=False):
     if store.db.execute("SELECT 1 FROM jobs WHERE kind='portfolio_strategy' AND status IN ('PENDING','RUNNING')").fetchone():
         return None
     last = store.db.execute('SELECT * FROM portfolio_runs ORDER BY started_at DESC,rowid DESC LIMIT 1').fetchone()
-    if last and (datetime.fromisoformat(at)-datetime.fromisoformat(last['started_at'])).total_seconds() < (300 if last['status']!='SUCCEEDED' else 60 if dirty else 3300):
+    refresh = config.get('portfolio_refresh_minutes',55)*60
+    if last and (datetime.fromisoformat(at)-datetime.fromisoformat(last['started_at'])).total_seconds() < (300 if last['status']!='SUCCEEDED' else 60 if dirty else refresh):
         return None
-    if not dirty and active(store,at) and last and (datetime.fromisoformat(at)-datetime.fromisoformat(last['started_at'])).total_seconds()<3300:
+    if not dirty and active(store,at) and last and (datetime.fromisoformat(at)-datetime.fromisoformat(last['started_at'])).total_seconds()<refresh:
         return None
     from .scheduler import enqueue
     return enqueue(store,'portfolio_strategy',at,'portfolio:'+at[:16])
@@ -208,6 +209,8 @@ def run(store, config, at=None, model_fn=None, clock=now):
         raw = (model_fn or run_json)(prompt,SCHEMA,folder/'model',min(300,config['model_timeout_seconds']))
         json_write(folder/'model-output.json',raw)
         result = validate(raw,packet)
+        from .research import model_record, record_build
+        identity = {'model': model_record(folder/'model'), 'build': record_build(store,config,at)}
         completed = normalize_time(clock()); expires = normalize_time((datetime.fromisoformat(completed)+timedelta(hours=config.get("portfolio_authorization_hours",1))).isoformat())
         # No model call or network operation in the publication transaction.
         store.db.execute('BEGIN IMMEDIATE')
@@ -227,11 +230,13 @@ def run(store, config, at=None, model_fn=None, clock=now):
         validate(result,fresh)
         candidates = current_items
         payload = {**result,'as_of':at,'input_guard':packet['guard'], 'account':packet['account'],
-                   'decisions':[{**candidates[d['key']],**d} for d in result['decisions']]}
+                   'decisions':[{**candidates[d['key']],**d} for d in result['decisions']],**identity}
         from .cloud_runtime import value
         payload['remote_ledger_version']=value(store,'remote_ledger_version')
         store.db.execute("UPDATE portfolio_decisions SET status='SUPERSEDED' WHERE status='ACTIVE'")
         store.db.execute('INSERT INTO portfolio_decisions VALUES(?,?,?,?,?,?)',(rid,completed,expires,'ACTIVE',VERSION,encoded(payload)))
+        from .evaluation import register_portfolio
+        register_portfolio(store,config,rid,completed,payload)
         cancelled = cancel_incompatible_buys(store,config,completed,rid) if config.get('deployment_role')!='research' else 0
         store.db.execute("UPDATE portfolio_runs SET finished_at=?,status='SUCCEEDED',payload_json=? WHERE id=?",(completed,encoded({'cancelled_orders':cancelled}),rid))
         store.db.execute("DELETE FROM service_state WHERE key='portfolio_dirty'")
@@ -264,9 +269,47 @@ def decision(store, config, route, identity, at):
     dependencies.update(x['key'] for x in current['payload']['decisions'] if x['reference_id'] in d['evidence_ids'])
     for g in current['payload']['risk_groups']:
         if d['key'] in g['keys']:dependencies.update(g['keys'])
+    if config.get('deployment_role')=='cloud':
+        # Targeted invalidation from research: only decisions touching a changed candidate lapse.
+        changed=value(store,'invalidated_keys') or {}
+        if any(changed.get(k,'')>current['created_at'] for k in dependencies):return None
     if any(x['source_token']!=row_token(source(store,x['route'],x['identity'])) for x in current['payload']['decisions'] if x['key'] in dependencies):
         return None
     return {**d,'portfolio_id':current['id'],'groups':current['payload']['risk_groups']}
+
+
+def candidate_sources(store, config, at):
+    """Current research source row for every candidate the portfolio layer would consider."""
+    from .global_market import targets
+    result = {}
+    held = {r[0] for r in store.db.execute('SELECT DISTINCT symbol FROM paper_lots WHERE qty>0')}
+    for symbol in sorted({i['symbol'] for i in config['watchlist']} | held):
+        result['watchlist:'+symbol] = source(store, 'watchlist', symbol)
+    from .dynamic_paper import case_position
+    seen = set()
+    # Same selection as snapshot(): every held case, and the newest unheld case per symbol.
+    for row in store.db.execute("SELECT * FROM dynamic_cases WHERE (status IN ('READY','RESEARCH') AND created_at<=? AND expires_at>?) OR id IN (SELECT case_id FROM dynamic_lots WHERE qty>0) ORDER BY created_at DESC,id", (at, at)).fetchall():
+        if row['symbol'] in seen and not case_position(store, row['id'], at)['qty']:
+            continue
+        seen.add(row['symbol'])
+        result['dynamic:'+row['id']] = row
+    held_global = {r[0] for r in store.db.execute('SELECT symbol FROM global_lots WHERE qty>0')}
+    for symbol in sorted(set(targets(store, config, at)) | held_global):
+        result['global:'+symbol] = source(store, 'global', symbol)
+    return result
+
+
+def changed_keys(store, config, at):
+    """Candidates whose research changed since the active portfolio decision. ['*'] if there is none."""
+    current = active(store, at)
+    if not current:
+        return ['*']
+    decided = {d['key']: d['source_token'] for d in current['payload']['decisions']}
+    now_sources = candidate_sources(store, config, at)
+    changed = [k for k, row in now_sources.items() if decided.get(k) != row_token(row)]
+    # Candidates that disappeared matter too: their authorization must lapse.
+    changed += [k for k in decided if k not in now_sources and decided[k] is not None]
+    return sorted(set(changed))
 
 
 def position_value(store, a, d, at):

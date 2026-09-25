@@ -15,6 +15,48 @@ from .storage import json_write, atomic_write
 _processes=set()
 _process_lock=threading.Lock()
 _stopping=threading.Event()
+_local=threading.local()
+# Pinned model identity. Set from config by pipeline.load_config; None keeps the CLI default.
+_pinned={'name':None,'effort':None}
+EFFORTS=('none','minimal','low','medium','high','xhigh')
+
+
+def configure(config):
+    """Pin model and reasoning effort for every subsequent call in this process."""
+    name=config.get('model_name');effort=config.get('model_reasoning_effort')
+    if name is not None and (not isinstance(name,str) or not re.fullmatch(r'[A-Za-z0-9._:-]{1,64}',name)):raise ValueError('model_name格式无效')
+    if effort is not None and effort not in EFFORTS:raise ValueError('model_reasoning_effort无效')
+    _pinned.update(name=name,effort=effort)
+
+
+def pinned():
+    return dict(_pinned)
+
+
+def last_meta():
+    """Metadata of the most recent model call made by this thread, or None."""
+    meta=getattr(_local,'meta',None)
+    return dict(meta) if meta else None
+
+
+def call_meta(folder):
+    """Read a saved call record; tolerate folders from releases that did not write one."""
+    path=Path(folder)/'meta.json'
+    try:return json.loads(path.read_text())
+    except (OSError,ValueError):return None
+
+
+def parse_header(text):
+    """Codex prints a header with version, model and effort, and a trailing token count."""
+    result={}
+    m=re.search(r'OpenAI Codex v([^\s]+)',text)
+    if m:result['cli_version']=m.group(1)
+    for key,label in (('actual_model','model'),('actual_effort','reasoning effort')):
+        m=re.search(r'^'+label+r':\s*(\S+)\s*$',text,re.M)
+        if m:result[key]=m.group(1)
+    m=re.search(r'tokens used\s*\n\s*([\d,]+)',text)
+    if m:result['tokens_used']=int(m.group(1).replace(',',''))
+    return result
 
 
 def cancel_models():
@@ -175,9 +217,30 @@ def run_json(prompt, schema, folder, timeout=240):
     command = [executable, "exec", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only",
                "--cd", str(sandbox), "--color", "never", "--output-schema", str(schema_path), "--output-last-message", str(output_path),
                "-c", 'web_search="disabled"']
+    wanted = pinned()
+    # --ignore-user-config leaves the CLI default model in place unless pinned here.
+    if wanted['name']:
+        command += ["-m", wanted['name']]
+    if wanted['effort']:
+        command += ["-c", f'model_reasoning_effort="{wanted["effort"]}"']
     for feature in ("shell_tool", "unified_exec", "apps", "plugins", "hooks", "browser_use", "browser_use_external", "computer_use", "multi_agent", "image_generation", "workspace_dependencies", "skill_search", "code_mode", "code_mode_host", "view_image"):
         command += ["-c", f"features.{feature}=false"]
     command.append("-")
+    from .storage import digest, now
+    import time
+    meta = {'requested_model': wanted['name'], 'requested_effort': wanted['effort'],
+            'prompt_sha256': digest(prompt), 'schema_sha256': digest(json.dumps(schema, sort_keys=True)),
+            'prompt_chars': len(prompt), 'started_at': now(), 'timed_out': False}
+    _local.meta = None
+    started = time.monotonic()
+    def finish(**extra):
+        meta.update(extra, finished_at=now(), elapsed_seconds=round(time.monotonic()-started, 1))
+        try:
+            meta.update(parse_header((folder / "stderr.log").read_text(errors="replace")))
+        except OSError:
+            pass
+        json_write(folder / "meta.json", meta)
+        _local.meta = dict(meta)
     with (folder / "stdout.log").open("w") as out, (folder / "stderr.log").open("w") as err:
         proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err, text=True, env=env, start_new_session=True)
         with _process_lock:
@@ -192,12 +255,30 @@ def run_json(prompt, schema, folder, timeout=240):
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
+            finish(exit_code=None, timed_out=True)
             raise RuntimeError("模型分析超时，资料包已保存，未使用付费后备服务")
         finally:
             with _process_lock:_processes.discard(proc)
+    finish(exit_code=proc.returncode)
     if proc.returncode or not output_path.exists():
         raise RuntimeError(f"Codex分析未完成（退出码{proc.returncode}），详见本地model日志；未切换API")
+    # A pinned model that the CLI silently replaced would make results incomparable.
+    for key, actual in (('name', meta.get('actual_model')), ('effort', meta.get('actual_effort'))):
+        if wanted[key] and actual and actual != wanted[key]:
+            raise RuntimeError(f"模型实际运行配置与固定配置不一致（{actual}≠{wanted[key]}），结果未采用")
     return json.loads(output_path.read_text())
+
+
+CHECK_SCHEMA = {"type": "object", "additionalProperties": False,
+                "properties": {"ok": {"type": "boolean"}, "echo": {"type": "string"}}, "required": ["ok", "echo"]}
+
+
+def check(folder, timeout=120):
+    """Smallest possible call proving login, pinned model and effort all work."""
+    result = run_json('只输出JSON：ok填true，echo填"模型连通"。不调用任何工具。', CHECK_SCHEMA, folder, timeout)
+    meta = last_meta() or call_meta(folder) or {}
+    ok = result.get('ok') is True
+    return {'status': 'OK' if ok else 'UNEXPECTED_OUTPUT', 'pinned': pinned(), 'meta': meta}
 
 
 def run_codex(packet, folder, timeout=240):

@@ -7,7 +7,8 @@ from unittest.mock import patch
 from ashare.storage import Store,normalize_time
 from test_config import load_config
 from ashare.demo import seed,put_quote,research_model,decision_model,run_demo,SYMBOL
-from ashare.research import make_snapshot,study
+from ashare.research import make_snapshot,study,model_packet
+from ashare import governance
 from ashare.slots import run_slot
 from ashare.paper import settle,account
 from ashare.review import run_review
@@ -139,7 +140,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(review['statistics']['actions']['BUY'],1)
         before=make_snapshot(self.store,self.cfg,SYMBOL,at='2026-09-15T20:00:00+08:00')
         after=make_snapshot(self.store,self.cfg,SYMBOL,at='2026-09-15T20:06:00+08:00')
-        self.assertFalse(before['internal_lessons']);self.assertEqual(len(after['internal_lessons']),1)
+        # Review lessons are unvalidated hypotheses: they never enter research input.
+        self.assertFalse(before['internal_lessons']);self.assertFalse(after['internal_lessons']);self.assertFalse(after['adopted_guidance'])
+        self.assertNotIn('等待明确条件',json.dumps(model_packet(after,self.cfg),ensure_ascii=False))
+        # The strategy observation is kept as a DRAFT change proposal instead.
+        drafts=governance.proposals(self.store,'DRAFT');self.assertEqual(len(drafts),1)
+        self.assertIn('等待明确条件',json.dumps(drafts[0]['payload'],ensure_ascii=False))
+        # Only guidance adopted from a user-approved proposal reaches research, from its adoption time on.
+        with self.store.db:
+            pid=governance.draft_proposal(self.store,source='agent',kind='RESEARCH_GUIDANCE',target='watchlist',title='等待明确条件',
+                payload={'guidance':{'route':'watchlist','scope':'ALL','text':'只有公司披露明确的经营变化时才改变结论'}},at='2026-09-15T20:07:00+08:00')
+        governance.decide(self.store,pid,'READY',decided_by=None,note='整理完成',at='2026-09-15T20:07:00+08:00')
+        with self.assertRaises(ValueError):governance.decide(self.store,pid,'APPROVED',decided_by='',note='代理不能自行批准',at='2026-09-15T20:07:00+08:00')
+        governance.decide(self.store,pid,'APPROVED',decided_by='Dean',note='同意试行',at='2026-09-15T20:08:00+08:00')
+        governance.decide(self.store,pid,'ADOPTED',decided_by='Dean',note='已上线',at='2026-09-15T20:09:00+08:00')
+        adopted=make_snapshot(self.store,self.cfg,SYMBOL,at='2026-09-15T20:10:00+08:00')
+        self.assertEqual([g['text'] for g in adopted['adopted_guidance']],['只有公司披露明确的经营变化时才改变结论'])
+        self.assertEqual(model_packet(adopted,self.cfg)['已采纳研究规则'][0]['id'],'G-'+pid)
         again=run_review(self.store,self.cfg,end='2026-09-15T19:30:00+08:00',model_fn=model,clock=lambda:'2026-09-15T20:06:00+08:00')
         self.assertEqual(again['status'],'ALREADY_DONE')
 

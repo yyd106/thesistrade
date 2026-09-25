@@ -14,6 +14,8 @@ auth.json
 *.log
 ashare-data/
 data/
+# Program-owned reference data (exchange calendar) ships with the code.
+!/ashare/data/
 backups/
 raw/
 workflow/

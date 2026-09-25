@@ -174,9 +174,9 @@ class ResearchPresentationTests(unittest.TestCase):
 
     def test_one_stock_packet_failure_does_not_stop_other_stock(self):
         self.cfg['watchlist'].append({'symbol':'sh600000','name':'第二只'})
-        def packet(store,config,sym,*args):
+        def packet(store,config,sym,*args,**kwargs):
             if sym==SYMBOL:raise ValueError('资料超过预算')
-            return make_snapshot(store,config,sym,*args)
+            return make_snapshot(store,config,sym,*args,**kwargs)
         with patch('ashare.workflow.make_snapshot',side_effect=packet):out=execute(self.cfg,'research',use_model=False)
         self.assertEqual(len(out),2);self.assertEqual(self.store.db.execute('SELECT count(*) FROM studies').fetchone()[0],1)
         self.assertEqual(self.failures()[0]['label'],'研究资料整理')

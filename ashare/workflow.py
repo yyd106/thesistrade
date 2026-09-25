@@ -42,13 +42,19 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
         if enabled(config):seed(store,now())
         def research_once(sym,selected_batch=None):
             try:
-                packet=make_snapshot(store,config,sym,selected_batch)
+                packet=make_snapshot(store,config,sym,selected_batch,persist=False)
                 store.record_attempt('research_input',sym,'OK')
             except Exception as exc:
                 store.record_attempt('research_input',sym,'FAILED',str(exc))
                 return {'symbol':sym,'status':'DEFERRED'}
             try:
-                result=study(store,config,packet,use_model)
+                from .research import reusable,renew,persist_snapshot
+                reuse=reusable(store,config,packet) if use_model else None
+                if reuse:
+                    result=renew(store,config,packet,reuse)
+                else:
+                    persist_snapshot(store,packet)
+                    result=study(store,config,packet,use_model)
                 store.record_attempt('research_pipeline',sym,'OK')
                 return result
             except Exception as exc:
@@ -130,30 +136,50 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
             elif command=='dynamic_slot':
                 from .dynamic_paper import run_slot as dynamic_slot
                 result=dynamic_slot(store,config,scheduled_at)
+            elif command=='evaluate':
+                from .weekly import run_daily
+                result=run_daily(store,config)
+            elif command=='weekly_report':
+                from .weekly import weekly_report
+                result=weekly_report(store,config)
             elif command=='slot':result=run_slot(store,config,scheduled_at,use_model)
             elif command=='review':result=run_review(store,config,end,use_model)
             elif command=='settle':
                 refresh_market(store,config,False)
                 result={'fills':settle(store,config,now()),'account':mark_equity(store,now())}
             else:raise ValueError('未知阶段')
+            changed=[]
             if command in ('cycle','research','repair','dynamic_cycle','global_research'):
-                from .portfolio_strategy import request
-                request(store,config,now(),changed=True)
+                from .portfolio_strategy import request,changed_keys,enabled as portfolio_enabled
+                # Only a real change in some candidate's research re-runs the portfolio and pauses its buys.
+                changed=changed_keys(store,config,now()) if portfolio_enabled(config) else ['*']
+                if changed:request(store,config,now(),changed=True)
             if role(config)=='research':
                 from . import cloud_sync
                 from .cloud_protocol import request as sync_request
-                from .cloud_runtime import put
+                from .cloud_runtime import put,value
                 try:
                     if command=='portfolio_strategy' and result.get('status')=='SUCCEEDED':
                         cloud_sync.queue_publication(store,config,result['decision_id'])
                         with task_lock(store.root,'cloud-sync'):cloud_sync.flush(store,config)
-                    elif command in ('cycle','research','repair','dynamic_cycle','global_research'):
-                        sync_request(config,'/api/sync/invalidate',{'changed_at':now()})
+                    elif changed:
+                        body={'changed_at':now()}
+                        if '*' not in changed and cloud_sync.remote_supports(store,'targeted_invalidation'):body['keys']=changed
+                        sync_request(config,'/api/sync/invalidate',body)
+                        with store.db:put(store,'last_invalidation',{**body,'command':command})
                     elif command=='review':
                         from .cloud_ledger import rows
-                        sync_request(config,'/api/sync/reviews',{**{t:rows(store,t) for t in ('reviews','lessons','research_methods','research_improvements')},'display':cloud_sync.display_packet(config)['reviews']})
+                        # Send only rows the cloud has not acknowledged; it stores them append-only.
+                        cursors=value(store,'review_sync_cursors') or {}
+                        tables=('reviews','lessons','research_methods','research_improvements');batch={};latest={}
+                        for t in tables:
+                            found=[dict(r) for r in store.db.execute('SELECT rowid AS sync_rowid,* FROM '+t+' WHERE rowid>? ORDER BY rowid',(cursors.get(t,0),))]
+                            latest[t]=found[-1]['sync_rowid'] if found else cursors.get(t,0)
+                            batch[t]=[{k:v for k,v in r.items() if k!='sync_rowid'} for r in found]
+                        sync_request(config,'/api/sync/reviews',{**batch,'display':cloud_sync.display_packet(config)['reviews']})
+                        with store.db:put(store,'review_sync_cursors',latest)
                 except Exception as exc:
                     with store.db:put(store,'last_upload_error',{'at':now(),'error':str(exc)[:500]})
-            store.periodic_backup()
+            store.periodic_backup(hourly_keep=config.get('backup_hourly_keep',6),daily_keep=config.get('backup_daily_keep',7))
             return result
     finally:store.close()
