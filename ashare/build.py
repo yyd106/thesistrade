@@ -42,13 +42,28 @@ def config_fingerprint(config):
     return _sha(selected)[:12]
 
 
-def guidance_fingerprint(store):
-    if store is None:
-        return None
+def guidance_fingerprint(store, config=None):
+    """Adopted research guidance. Without a store, read the data directory's database read-only, so doctor
+    and config changes show the same build id that research records. None means it could not be read."""
+    import sqlite3
+    query = "SELECT id,route,scope,text FROM strategy_guidance WHERE status='ADOPTED' ORDER BY id"
     try:
-        rows = [tuple(r) for r in store.db.execute("SELECT id,route,scope,text FROM strategy_guidance WHERE status='ADOPTED' ORDER BY id")]
-    except Exception:
-        return None
+        if store is not None:
+            rows = [tuple(r) for r in store.db.execute(query)]
+        else:
+            path = Path((config or {}).get('data_dir') or '') / 'agent.sqlite3'
+            if not (config or {}).get('data_dir') or not path.exists():
+                return 'none' if (config or {}).get('data_dir') else None
+            from urllib.parse import quote
+            db = sqlite3.connect('file:' + quote(str(path)) + '?mode=ro', uri=True, timeout=5)
+            try:
+                rows = [tuple(r) for r in db.execute(query)]
+            finally:
+                db.close()
+    except sqlite3.OperationalError as exc:
+        if 'no such table' not in str(exc):
+            return None
+        rows = []  # database predates 0.15.0: nothing can have been adopted
     return _sha(rows)[:8] if rows else 'none'
 
 
@@ -56,7 +71,7 @@ def info(config, store=None):
     from . import __version__
     model = f"{config.get('model_name') or 'cli-default'}/{config.get('model_reasoning_effort') or 'cli-default'}"
     parts = {'version': __version__, 'rule': config.get('strategy_version'), 'code': code_fingerprint(),
-             'config': config_fingerprint(config), 'model': model, 'guidance': guidance_fingerprint(store)}
+             'config': config_fingerprint(config), 'model': model, 'guidance': guidance_fingerprint(store, config)}
     parts['build_id'] = _sha({k: parts[k] for k in ('code', 'config', 'model', 'guidance')})[:12]
     return parts
 

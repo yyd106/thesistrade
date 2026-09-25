@@ -92,6 +92,21 @@ class BuildIdentityTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_doctor_and_config_changes_report_the_recorded_build(self):
+        cfg = {'strategy_version': 'paper_baseline_v1', 'watchlist': [{'symbol': 'sh600000'}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(build.info({**cfg, 'data_dir': tmp})['guidance'], 'none')  # no database yet
+            store = Store(tmp)
+            try:
+                with_dir = {**cfg, 'data_dir': tmp}
+                self.assertEqual(build.info(with_dir)['build_id'], build.info(cfg, store)['build_id'])
+                with store.db:
+                    store.db.execute("INSERT INTO strategy_guidance VALUES('G-1','watchlist','ALL','只看公司披露的经营变化','ADOPTED',NULL,'2026-09-01T00:00:00+00:00',NULL,'Dean','{}')")
+                self.assertEqual(build.info(with_dir)['build_id'], build.info(cfg, store)['build_id'])
+                self.assertNotEqual(build.info(with_dir)['guidance'], 'none')
+            finally:
+                store.close()
+
 
 class ResearchReuseTests(unittest.TestCase):
     def setUp(self):
