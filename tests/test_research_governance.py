@@ -19,6 +19,7 @@ out=""; model="cli-default-model"; effort="medium"
 while [ $# -gt 0 ]; do
   case "$1" in
     --output-last-message) out="$2"; shift 2;;
+    --cd) workdir="$2"; shift 2;;
     -m) model="$2"; shift 2;;
     -c) if [[ "$2" == model_reasoning_effort=* ]]; then effort="${2#model_reasoning_effort=}"; effort="${effort//\"/}"; fi; shift 2;;
     *) shift;;
@@ -28,6 +29,7 @@ cat > /dev/null
 printf 'OpenAI Codex v9.9.9-test\n--------\nmodel: %s\nreasoning effort: %s\n--------\n' "${FAKE_MODEL_OVERRIDE:-$model}" "$effort" >&2
 echo '{"ok":true,"echo":"模型连通"}' > "$out"
 printf 'tokens used\n1,234\n' >&2
+if [ -n "$FAKE_CD_LOG" ]; then printf '%s\n' "$workdir" > "$FAKE_CD_LOG"; ls -A "$workdir" >> "$FAKE_CD_LOG"; fi
 '''
 
 
@@ -56,6 +58,15 @@ class ModelPinningTests(unittest.TestCase):
         with patch.dict(os.environ, {'FAKE_MODEL_OVERRIDE': 'another-model'}):
             with self.assertRaisesRegex(RuntimeError, '不一致'):model.run_json('x', model.CHECK_SCHEMA, Path(self.tmp.name) / 'swap')
         self.assertEqual(json.loads((Path(self.tmp.name) / 'swap' / 'meta.json').read_text())['actual_model'], 'another-model')
+
+    def test_cli_runs_in_an_empty_directory_outside_the_workspace(self):
+        log = Path(self.tmp.name) / 'cd.log'
+        with patch.dict(os.environ, {'FAKE_CD_LOG': str(log)}):
+            model.run_json('x', model.CHECK_SCHEMA, Path(self.tmp.name) / 'ws' / 'call')
+        workdir, *listing = log.read_text().splitlines()
+        self.assertEqual(listing, [])
+        self.assertFalse(Path(workdir).resolve().is_relative_to(Path(self.tmp.name).resolve()))
+        self.assertFalse(Path(workdir).exists())
 
     def test_unpinned_calls_still_record_what_ran(self):
         model.configure({})

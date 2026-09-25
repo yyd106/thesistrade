@@ -6,6 +6,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import copy
 from pathlib import Path
@@ -207,8 +208,9 @@ def run_json(prompt, schema, folder, timeout=240):
         raise RuntimeError("需要ChatGPT订阅登录；禁止回退API Key")
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    sandbox = folder / "empty-workspace"
-    sandbox.mkdir(exist_ok=True)
+    # An empty directory outside the workspace: the CLI reads AGENTS.md files from its working directory
+    # and parent project folders, and the workspace root holds instructions for the operator agent.
+    sandbox = Path(tempfile.mkdtemp(prefix='thesistrade-model-'))
     schema_path = folder / "schema.json"
     output_path = folder / "model-result.json"
     json_write(schema_path, schema)
@@ -241,24 +243,27 @@ def run_json(prompt, schema, folder, timeout=240):
             pass
         json_write(folder / "meta.json", meta)
         _local.meta = dict(meta)
-    with (folder / "stdout.log").open("w") as out, (folder / "stderr.log").open("w") as err:
-        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err, text=True, env=env, start_new_session=True)
-        with _process_lock:
-            _processes.add(proc)
-            if _stopping.is_set():os.killpg(proc.pid,signal.SIGTERM)
-        try:
-            proc.communicate(prompt, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        with (folder / "stdout.log").open("w") as out, (folder / "stderr.log").open("w") as err:
+            proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err, text=True, env=env, start_new_session=True)
+            with _process_lock:
+                _processes.add(proc)
+                if _stopping.is_set():os.killpg(proc.pid,signal.SIGTERM)
             try:
-                proc.wait(timeout=5)
+                proc.communicate(prompt, timeout=timeout)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-            finish(exit_code=None, timed_out=True)
-            raise RuntimeError("模型分析超时，资料包已保存，未使用付费后备服务")
-        finally:
-            with _process_lock:_processes.discard(proc)
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                finish(exit_code=None, timed_out=True)
+                raise RuntimeError("模型分析超时，资料包已保存，未使用付费后备服务")
+            finally:
+                with _process_lock:_processes.discard(proc)
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
     finish(exit_code=proc.returncode)
     if proc.returncode or not output_path.exists():
         raise RuntimeError(f"Codex分析未完成（退出码{proc.returncode}），详见本地model日志；未切换API")
