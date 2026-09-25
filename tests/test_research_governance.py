@@ -217,7 +217,9 @@ class ReviewRoutingTests(unittest.TestCase):
             return {'summary': '测试复盘', 'lessons': lessons, 'positions': [{'position_key': p['key'], 'verdict': 'PENDING' if p['research_ids'] else 'INSUFFICIENT',
                     'reason': '测试', 'supported_points': [], 'contradicted_points': [], 'pending_points': [], 'next_check': '测试',
                     'research_ids': p['research_ids']} for p in packet['portfolio']['positions']]}
-        review = run_review(self.store, self.cfg, end='2026-09-15T19:30:00+08:00', model_fn=model_fn, clock=lambda: '2026-09-15T20:05:00+08:00')
+        # Disk space depends on the machine running the tests; only routing is under test here.
+        with patch('ashare.maintenance.disk_status', return_value={'warning': False}):
+            review = run_review(self.store, self.cfg, end='2026-09-15T19:30:00+08:00', model_fn=model_fn, clock=lambda: '2026-09-15T20:05:00+08:00')
         self.assertEqual(review['status'], 'SUCCEEDED')
         issues = governance.issues(self.store)
         self.assertEqual([i['issue_key'] for i in issues], ['QUOTE_RECORDED_AFTER_CUTOFF'])
