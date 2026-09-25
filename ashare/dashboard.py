@@ -189,7 +189,11 @@ def make_handler(config_path,token,port):
                         row=store.db.execute('SELECT * FROM jobs WHERE id=?',(query.get('id',[''])[0],)).fetchone()
                         self.send(200,dict(row)) if row else self.send(404,{'error':'未找到此任务记录。'})
                     finally:store.close()
-                elif path.path=='/health':self.send(200,{'ok':True,'version':__version__,'role':cfg.get('deployment_role','standalone')})
+                elif path.path=='/health':
+                    from .cloud_ledger import FEATURES
+                    from .build import code_fingerprint
+                    self.send(200,{'ok':True,'version':__version__,'role':cfg.get('deployment_role','standalone'),
+                        'features':list(FEATURES),'code':code_fingerprint(),'calendar':CALENDAR_VERSION})
                 elif path.path=='/api/status':
                     value=status(cfg,overview=True)
                     if user['role']!='ADMIN':

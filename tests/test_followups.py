@@ -126,9 +126,11 @@ class FollowupTests(unittest.TestCase):
         self.assertEqual(item['state'],'RUNNING');self.assertIn('不算恢复',item['trigger'])
 
     def test_unsupported_board_is_routed_before_any_order_is_attempted(self):
-        self.cfg['watchlist']=[{'symbol':'sh688062','name':'测试科创板'}]
+        # B shares remain outside the supported boards; STAR and ChiNext are supported.
+        self.cfg['watchlist']=[{'symbol':'sh900901','name':'测试B股'},{'symbol':'sh688062','name':'测试科创板'}]
         result=reconcile(self.store,self.cfg,self.at)
-        item=next(x for x in result['items'] if x['key']=='capability:sh688062')
+        self.assertFalse(any(x['key']=='capability:sh688062' for x in result['items']))
+        item=next(x for x in result['items'] if x['key']=='capability:sh900901')
         self.assertEqual(item['owner'],'ENGINEERING');self.assertIsNone(item['next_action_at'])
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM paper_orders').fetchone()[0],0)
 

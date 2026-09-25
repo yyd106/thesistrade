@@ -220,8 +220,9 @@ class Store:
             self.db.backup(dest)
         return path
 
-    def periodic_backup(self,at=None):
-        """Minute jobs share one atomic hourly backup; preserve manual backup files."""
+    def periodic_backup(self,at=None,hourly_keep=6,daily_keep=7):
+        """Minute jobs share one atomic hourly backup; preserve manual backup files.
+        Retention: the newest `hourly_keep` hourly files plus one file per day for `daily_keep` days."""
         import fcntl
         stamp=datetime.fromisoformat(normalize_time(at or now()))
         folder=self.root/'backups'/'hourly';folder.mkdir(parents=True,exist_ok=True)
@@ -236,7 +237,8 @@ class Store:
                 with sqlite3.connect(temp) as dest:self.db.backup(dest)
                 temp.replace(path)
             finally:temp.unlink(missing_ok=True)
-            for old in sorted(folder.glob('*.sqlite3'))[:-24]:old.unlink()
+            from .maintenance import backup_retention
+            backup_retention(folder,hourly_keep,daily_keep)
             return path
 
     def close(self):

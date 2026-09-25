@@ -29,6 +29,9 @@ def status(store,config):
     if not cache:
         # No public account setup is available before the signed migration completes.
         raise ValueError('等待本地研究端完成首次策略同步')
+    # A section missing from a partial display update is re-sent by research within one publication.
+    cache.setdefault('watchlist',[]);cache.setdefault('observation',{'items':[]});cache.setdefault('reviews',[])
+    cache['observation'].setdefault('items',[])
     for w in cache['watchlist']:
         w['quote']=store.latest_quote(w['symbol'],at)
         w['open_orders']=[{k:o[k] for k in ('id','side','qty','filled_qty','limit_cents','status','created_at')} for o in a['orders'] if o['symbol']==w['symbol'] and not o.get('origin')]

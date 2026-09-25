@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta
 from .storage import now, normalize_time, digest
 from .investment_policy import enabled
-from .global_market import SCALE, notional, latest, fresh, session_open, targets
+from .global_market import SCALE, notional, latest, fresh, session_open, targets, fx_age, FX_BUY_MAX_AGE, FX_SELL_MAX_AGE
 
 OPEN = "('OPEN','PARTIAL','UNKNOWN')"
 
@@ -79,7 +79,8 @@ def submit(store, config, symbol, side, q, plan, item, at):
         old = store.db.execute('SELECT * FROM global_orders WHERE intent_key=?', (intent,)).fetchone()
         if old:
             store.db.commit();return dict(old)
-        if not fresh(q, at) or not session_open(symbol, at, json.loads(q['payload_json'])):
+        # Exits keep working over FX weekends with the last known rate; entries need a current rate.
+        if not fresh(q, at, fx_max_age=FX_SELL_MAX_AGE if side == 'SELL' else FX_BUY_MAX_AGE) or not session_open(symbol, at, json.loads(q['payload_json'])):
             raise ValueError('报价/汇率过期或市场休市')
         a = account_inside_transaction(store, at)
         p = a.get('global_positions', {}).get(symbol)
@@ -132,7 +133,8 @@ def submit(store, config, symbol, side, q, plan, item, at):
         expiry = normalize_time((datetime.fromisoformat(at)+timedelta(seconds=config['paper_order_ttl_seconds'])).isoformat())
         if side == 'BUY':
             expiry = min(expiry, plan['valid_until'])
-        terms.update(portfolio_decision=ps.order_context(store,config,'global',symbol,at),portfolio_exit=side=='SELL' and portfolio_exit,reason=reason, currency='USD', qty_scale=SCALE, quote_id=q['id'], plan_id=plan['id'] if plan else None)
+        terms.update(portfolio_decision=ps.order_context(store,config,'global',symbol,at),portfolio_exit=side=='SELL' and portfolio_exit,reason=reason, currency='USD', qty_scale=SCALE, quote_id=q['id'], plan_id=plan['id'] if plan else None,
+                     fx_age_seconds=round(fx_age(q, at)), fx_stale=fx_age(q, at) > FX_BUY_MAX_AGE)
         store.db.execute('INSERT INTO global_orders VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?)',
                          (oid, intent, plan['id'] if plan else None, symbol, side, qty, limit, reserved, at, expiry, 'OPEN', json.dumps(terms)))
         store.db.commit()
@@ -165,7 +167,8 @@ def settle(store, config, at, selected):
             if o['side'] == 'BUY' and (halted(store) or eligibility(store, dict(plan) if plan else None, selected.get(o['symbol']), at)):
                 cancel();continue
             q = latest(store, o['symbol'], at)
-            if not fresh(q, at) or q['observed_at'] <= o['created_at'] or not session_open(o['symbol'], at, json.loads(q['payload_json'])):
+            limit_age = FX_SELL_MAX_AGE if o['side'] == 'SELL' else FX_BUY_MAX_AGE
+            if not fresh(q, at, fx_max_age=limit_age) or q['observed_at'] <= o['created_at'] or not session_open(o['symbol'], at, json.loads(q['payload_json'])):
                 continue
             if store.db.execute('SELECT 1 FROM global_fills WHERE order_id=? AND quote_id=?', (o['id'], q['id'])).fetchone():
                 continue

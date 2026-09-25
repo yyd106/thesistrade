@@ -1,6 +1,7 @@
 """Local-only paper execution. No broker client, account secret or live order endpoint exists."""
 from __future__ import annotations
 import json
+import re
 from datetime import datetime, timedelta
 from .calendar import local, phase
 from .finance import PaperLedger
@@ -72,11 +73,40 @@ def quote_ok(q,config,at):
     return 0<=age<=config['quote_max_age_seconds'] and q['first_seen_at']<=normalize_time(at)
 
 
+BOARDS={'MAIN':('sh600','sh601','sh603','sh605','sz000','sz001','sz002','sz003'),
+        'CHINEXT':('sz300','sz301'),'STAR':('sh688','sh689')}
+# Daily price limits are 10% (main board) and 20% (ChiNext/STAR); stay clear of the limit itself.
+LIMIT_GUARD={'MAIN':0.095,'CHINEXT':0.195,'STAR':0.195}
+# Risk warning (ST/*ST/S*ST), delisting arrangement (退), first-days listing prefixes (N/C + Chinese name).
+SPECIAL_NAME=re.compile(r'^S?\*?ST|退|^[NC](?=[^\x00-\x7f])')
+
+
+def board(symbol):
+    return next((name for name,prefixes in BOARDS.items() if symbol.startswith(prefixes)),None)
+
+
+def lot_rules(symbol):
+    """STAR buy orders need at least 200 shares; every supported board steps in 100 shares here."""
+    b=board(symbol)
+    if not b:return None
+    return {'board':b,'min_buy':200 if b=='STAR' else 100,'step':100,'min_sell':200 if b=='STAR' else 1}
+
+
+def sell_quantity(symbol,wanted,held,sellable):
+    """Round a sell to the board's declaration rule. STAR: each sell >=200 shares unless the whole
+    remaining holding is below 200, which must then be sold in one order. Returns 0 if impossible now."""
+    rules=lot_rules(symbol)
+    wanted=min(wanted,sellable)
+    if wanted<=0 or not rules or rules['board']!='STAR':return max(0,wanted)
+    if held<200:return held if sellable>=held else 0
+    if wanted<200:wanted=200 if sellable>=200 else 0
+    return wanted
+
+
 def market_guard(symbol,q):
-    # The adapter deliberately has no assumed rules for STAR/ChiNext/ST/new-listing stock.
-    if not (symbol.startswith(('sh600','sh601','sh603','sh605','sz000','sz001','sz002','sz003'))):return 'UNSUPPORTED_BOARD'
-    if any(x in q['name'].upper() for x in ('ST','退','N','C')):return 'SPECIAL_SECURITY'
-    if abs(q['price_cents']/q['prev_close_cents']-1)>=0.095:return 'NEAR_PRICE_LIMIT_OR_CORPORATE_ACTION'
+    if not board(symbol):return 'UNSUPPORTED_BOARD'
+    if SPECIAL_NAME.search((q.get('name') or '').strip().upper()):return 'SPECIAL_SECURITY'
+    if abs(q['price_cents']/q['prev_close_cents']-1)>=LIMIT_GUARD[board(symbol)]:return 'NEAR_PRICE_LIMIT_OR_CORPORATE_ACTION'
     return None
 
 
@@ -126,13 +156,20 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
             limit=min(levels['buy_high_cents'],(price*(10000+config['paper_slippage_bps'])+9999)//10000)
             stock_budget=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100-(p['qty']+a.get('dynamic_positions',{}).get(symbol,{}).get('qty',0))*price
             gross_budget=a['equity_cents']*config['paper_max_gross_pct']//100-a['market_value_cents']-a['reserved_cents']
-            budget=min(stock_budget,gross_budget,a['available_cents'],ps.buy_budget(store,config,'watchlist',symbol,at,a))
+            minimum=lot_rules(symbol)['min_buy']
+            other=min(gross_budget,a['available_cents'],ps.buy_budget(store,config,'watchlist',symbol,at,a))
+            budget=min(stock_budget,other)
             qty=max(0,budget//limit//lot*lot)
             while qty>0 and qty*limit+fee(config,'BUY',qty*limit)>budget:qty-=lot
-            if qty<=0:raise ValueError('INSUFFICIENT_BUDGET_OR_TARGET_REACHED')
+            if qty<minimum:
+                # Name the binding constraint: a whole minimum lot larger than the per-stock cap is structural.
+                smallest=minimum*limit+fee(config,'BUY',minimum*limit)
+                cap=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100
+                raise ValueError('LOT_EXCEEDS_CAP' if smallest>cap and other>=smallest else 'INSUFFICIENT_BUDGET_OR_TARGET_REACHED')
             reserve=qty*limit+fee(config,'BUY',qty*limit)
         else:
             qty=min(p['sellable_qty'],reduction_qty) if portfolio_exit else p['sellable_qty']
+            qty=sell_quantity(symbol,qty,p['qty'],p['sellable_qty'])
             if qty<=0:raise ValueError('T_PLUS_ONE_OR_NO_POSITION')
             limit=max(1,price*(10000-config['paper_slippage_bps'])//10000)
             reserve=0

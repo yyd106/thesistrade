@@ -1,4 +1,7 @@
-"""Fixed 24-hour reviews. Append-only revisions, internal lessons, no strategy self-modification."""
+"""Fixed 24-hour reviews. Append-only revisions, no strategy self-modification.
+
+Review findings are routed, not injected: program and data defects become engineering issues,
+strategy observations become DRAFT change proposals. Neither reaches a research prompt."""
 from __future__ import annotations
 import json
 import uuid
@@ -7,13 +10,37 @@ from .calendar import review_window
 from .model import run_json
 from .research import encode
 from .storage import now,normalize_time,digest,json_write
+from .governance import REVIEW_ISSUE_KEYS
 
+DEFECT_CATEGORIES=('DATA','EXECUTION','SYSTEM')
 REVIEW_SCHEMA={'type':'object','additionalProperties':False,'properties':{
  'summary':{'type':'string'},'lessons':{'type':'array','items':{'type':'object','additionalProperties':False,
  'properties':{'symbol':{'type':'string'},'category':{'type':'string','enum':['DATA','RESEARCH','EXECUTION','SYSTEM','OBSERVATION']},
+ 'issue_key':{'type':'string','enum':REVIEW_ISSUE_KEYS+['STRATEGY_OBSERVATION']},
  'lesson':{'type':'string'},'decision_ids':{'type':'array','items':{'type':'string'}},
  'fill_ids':{'type':'array','items':{'type':'string'}},'applicability':{'type':'string'}},
-    'required':['symbol','category','lesson','decision_ids','fill_ids','applicability']}}},'required':['summary','lessons']}
+    'required':['symbol','category','issue_key','lesson','decision_ids','fill_ids','applicability']}}},'required':['summary','lessons']}
+
+
+def route_lessons(store,rid,lessons,at):
+    """Defects collapse into one engineering issue per key and symbol; observations become drafts."""
+    from .governance import record_issue,draft_proposal
+    routed=[]
+    for n,lesson in enumerate(lessons):
+        evidence=['review:'+rid]+['decision:'+i for i in lesson.get('decision_ids',[])]+['fill:'+i for i in lesson.get('fill_ids',[])]
+        if lesson['category'] in DEFECT_CATEGORIES:
+            key=lesson.get('issue_key')
+            if key not in REVIEW_ISSUE_KEYS:key='OTHER_'+lesson['category']
+            iid=record_issue(store,key,lesson['symbol'],lesson['lesson'],evidence,at)
+            routed.append({'lesson':n,'to':'engineering_issue','id':iid,'issue_key':key})
+        else:
+            pid=draft_proposal(store,source='review',kind='OTHER',target=lesson['symbol'],title=lesson['lesson'][:60],
+                payload={'observations':[{'review_id':rid,'lesson':lesson['lesson'],'applicability':lesson.get('applicability'),
+                    'category':lesson['category'],'evidence':evidence}],
+                    'note':'复盘产生的策略观察草稿：尚未验证，不进入研究输入。需整理成含检验方法的完整提案并经用户批准。'},
+                at=at,dedupe_key='review:'+rid+':'+str(n))
+            routed.append({'lesson':n,'to':'proposal_draft','id':pid})
+    return routed
 
 
 def model_facts(facts,budget=110000):
@@ -124,6 +151,9 @@ def run_review(store,config,end=None,use_model=True,model_fn=None,clock=now):
     rid=uuid.uuid4().hex;folder=store.root/'workflow'/'reviews'/rid
     if prior:fp += ':'+rid  # Same facts, new analysis attempt; keep the failed revision intact.
     json_write(folder/'facts.json',facts)
+    # Deterministic checks sit outside the fingerprint: sync and disk health vary between attempts.
+    from . import review_checks
+    checks=review_checks.run(store,config,a,b,ready,facts['portfolio'])
     model_status='NOT_RUN'
     result={'summary':f"窗口内提交{len(decisions)}笔模拟委托、发生{len(fills)}笔模拟成交。无操作检查不逐次保存。",'lessons':[]}
     failure=None
@@ -134,6 +164,7 @@ def run_review(store,config,end=None,use_model=True,model_fn=None,clock=now):
         elif use_model and config['model_enabled']:
             from .review_analysis import facts_for_model,schema,validate,PROMPT
             bounded=facts_for_model(facts)
+            bounded['program_checks']=[{k:c[k] for k in ('check','status','failures','detail')} for c in checks]
             json_write(folder/'model-facts.json',bounded)
             prompt=PROMPT+'\n<UNTRUSTED_REVIEW>'+encode(bounded)+'</UNTRUSTED_REVIEW>'
             if len(prompt)>65000:raise ValueError('全仓复盘资料超过单轮预算，事实已保存')
@@ -147,18 +178,15 @@ def run_review(store,config,end=None,use_model=True,model_fn=None,clock=now):
         model_status='DEFERRED';result={'summary':'全仓盈亏已核算，研究判断分析等待补完。','positions':[],'lessons':[]}
         store.record_attempt('review_analysis','MARKET','FAILED',failure,run_id=rid)
     ready=normalize_time(clock());expires=normalize_time((datetime.fromisoformat(ready)+timedelta(days=30)).isoformat())
-    payload={'facts':facts,'analysis':result,'revision':revision,'internal_only':True,'analysis_error':failure,'analysis_scope':'ALL_POSITIONS'}
+    from .research import model_record,record_build
+    payload={'facts':facts,'analysis':result,'revision':revision,'internal_only':True,'analysis_error':failure,'analysis_scope':'ALL_POSITIONS',
+             'consistency_checks':checks,'model':model_record(folder/'model'),'build':record_build(store,config,ready)}
     with store.db:
+        payload['routing']=route_lessons(store,rid,result['lessons'],ready)
         store.db.execute('INSERT INTO reviews VALUES(?,?,?,?,?,?,?,?)',(rid,a,b,revision,ready,fp,model_status,encode(payload)))
         for n,lesson in enumerate(result['lessons']):
+            # Kept for display only; research never reads this table.
             store.db.execute('INSERT INTO lessons VALUES(?,?,?,?,?,?)',(rid+':'+str(n),rid,lesson['symbol'],ready,expires,
-                encode({**lesson,'validation_status':'HYPOTHESIS','claim_type':'INTERNAL_LESSON'})))
-    if enabled(config):
-        from .global_research import method
-        method_id=method(store,config,ready)
-        with store.db:
-            for index,lesson in enumerate(result.get('lessons',[])):
-                proposal={**lesson,'method_id':method_id,'required_validation':'去重事件样本、时间留出验证、成本后效果及风险回归；验证通过才可人工启用','automatic_activation':False}
-                store.db.execute('INSERT OR IGNORE INTO research_improvements VALUES(?,?,?,?,?)',(rid+':'+str(index),rid,ready,'HYPOTHESIS',encode(proposal)))
+                encode({**lesson,'validation_status':'ROUTED','claim_type':'REVIEW_FINDING','routed_to':payload['routing'][n]})))
     json_write(folder/'review.json',payload)
     return {'review_id':rid,'status':model_status,'revision':revision,'window_start':a,'window_end':b,'statistics':stats,'model_status':model_status,'analysis_error':failure,'portfolio_totals':facts['portfolio']['totals']}

@@ -21,7 +21,17 @@ DEFAULTS = {
  'comparison_peers':{},'business_keywords':{},'max_news_packet_pct':15
  ,'background_market_enabled':True,'quote_poll_seconds':30,'announcement_poll_seconds':120,
  'announcement_max_age_seconds':180,'research_attempts':2,
- 'recovery_interval_seconds':900,'recovery_daily_limit':2
+ 'recovery_interval_seconds':900,'recovery_daily_limit':2,
+ # Model identity is pinned explicitly; None keeps the CLI default (tests, demo).
+ 'model_name':None,'model_reasoning_effort':None,
+ # Reuse a successful study when nothing material changed; 0 disables.
+ 'research_reuse_hours':0,
+ 'portfolio_refresh_minutes':55,
+ 'backup_hourly_keep':6,'backup_daily_keep':7,
+ 'disk_free_warn_gb':10,'db_size_warn_gb':5,
+ 'evaluation_enabled':True,'evaluation_time':'19:10','evaluation_horizon_days':20,
+ 'weekly_report_weekday':5,'weekly_report_time':'10:00',
+ 'shadow_books_enabled':True,'shadow_risk_per_trade_bps':50,'shadow_start_date':None
 }
 
 
@@ -86,6 +96,23 @@ def validate_settings(config):
                    ('recovery_interval_seconds',300,3600),('recovery_daily_limit',1,3)):
         if type(config[k]) is not int or not lo<=config[k]<=hi:raise ValueError(k+'超出允许范围')
     if type(config['background_market_enabled']) is not bool:raise ValueError('后台行情开关格式错误')
+    from .model import EFFORTS
+    if config['model_name'] is not None and (not isinstance(config['model_name'],str) or not re.fullmatch(r'[A-Za-z0-9._:-]{1,64}',config['model_name'])):raise ValueError('model_name格式无效')
+    if config['model_reasoning_effort'] is not None and config['model_reasoning_effort'] not in EFFORTS:raise ValueError('model_reasoning_effort须为'+'/'.join(EFFORTS))
+    for k,lo,hi in (('research_reuse_hours',0,24),('portfolio_refresh_minutes',30,360),('backup_hourly_keep',1,48),
+                   ('backup_daily_keep',0,60),('disk_free_warn_gb',1,1000),('db_size_warn_gb',1,1000),
+                   ('evaluation_horizon_days',5,60),('weekly_report_weekday',0,6),('shadow_risk_per_trade_bps',10,200)):
+        if type(config[k]) is not int or not lo<=config[k]<=hi:raise ValueError(f'{k}必须为{lo}到{hi}之间整数')
+    for k in ('evaluation_enabled','shadow_books_enabled'):
+        if type(config[k]) is not bool:raise ValueError(k+'须为true或false')
+    for k in ('evaluation_time','weekly_report_time'):
+        if not isinstance(config[k],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',config[k]):raise ValueError(k+'格式错误')
+    if config['shadow_start_date'] is not None and (not isinstance(config['shadow_start_date'],str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',config['shadow_start_date'])):raise ValueError('shadow_start_date须为YYYY-MM-DD')
+    # Research must refresh before a plan expires, otherwise buying silently stops between rounds.
+    if config.get('deployment_role')!='cloud' and len(times)>1:
+        widest=max(b-a for a,b in zip(times,times[1:]+[times[0]+1440]))
+        if widest>config['plan_max_age_hours']*60:
+            raise ValueError('相邻两次采集研究的间隔须短于计划有效期（plan_max_age_hours），否则计划会在两轮研究之间过期')
     if not isinstance(config['comparison_peers'],dict) or not isinstance(config['business_keywords'],dict):raise ValueError('研究对照或关键词格式错误')
     for symbol,rows in config['comparison_peers'].items():
         if not re.fullmatch(r'(sh|sz)\d{6}',symbol) or not isinstance(rows,list) or len(rows)>5:raise ValueError('业务参考股配置错误')

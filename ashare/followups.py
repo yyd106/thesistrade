@@ -11,7 +11,7 @@ from .guidance import trade_guidance
 
 OWNER_NAMES={'SYSTEM':'系统','USER':'你','ENGINEERING':'程序维护','DISCLOSURE':'系统跟踪披露','MARKET':'系统跟踪行情'}
 STATE_NAMES={'AUTO':'自动处理','RUNNING':'正在处理','ESCALATED':'已转后续处理','WAITING':'等待条件','ACTION':'需要处理'}
-JOB_NAMES={'slot':'盘面判断','research':'研究','cycle':'资料研究','collect':'资料采集','repair':'单股补齐','review':'复盘','settle':'模拟撮合'}
+JOB_NAMES={'slot':'盘面判断','research':'研究','cycle':'资料研究','collect':'资料采集','repair':'单股补齐','review':'复盘','settle':'模拟撮合','evaluate':'评估打分','weekly_report':'周度评估报告'}
 
 
 def job_failed(j):
@@ -117,6 +117,11 @@ def build(store,config,at):
             elif key=='RESEARCH_VETO':
                 owner='DISCLOSURE';state='WAITING';action='在定时采集时检查新的公司披露；有实质变化后重研。'
                 route={'next_at':schedules.get('cycle'),'trigger':g['waiting'],'run':None}
+            elif key=='LOT_EXCEEDS_CAP':
+                owner='MARKET';state='WAITING';action='只研究不交易；每轮研究按最新净值与价格重新核对，不追加本金、不放宽上限。'
+                route={'next_at':schedules.get('cycle'),'trigger':g['waiting'],'run':None}
+            elif key=='UNSUPPORTED_BOARD':
+                continue  # Already reported once as a capability item above.
             elif key=='LOCAL_ONLY_DOCUMENTS_UNREVIEWED':
                 owner='USER';state='ACTION';action=g['user_action']
                 route={'next_at':None,'trigger':'你明确具体文件的合法处理许可后重研','run':None}
@@ -207,6 +212,7 @@ def build(store,config,at):
         'MODEL_DEFERRED':('盘面分析未完成','下一Slot重新判断；如连续失败，检查模型登录、额度及超时记录。','新的盘面分析在本Slot时限内成功','SYSTEM')}
     decision_routes.update({
         'UNSUPPORTED_BOARD':('该板块的模拟执行规则尚未实现','需要补充该板块的申报数量、价格限制和交易规则并验证；重复研究不能解决。','对应执行规则实现且通过测试','ENGINEERING'),
+        'LOT_EXCEEDS_CAP':('单手金额超过单股仓位上限','按账户规模只研究不交易；不追加本金、不放宽单股上限。账户净值增长或价格下降后自动恢复评估。','最小申报数量的金额不超过单股上限','MARKET'),
         'SPECIAL_SECURITY':('证券特殊状态需要核对','核对风险警示、上市阶段或退市状态；当前执行规则不支持时需先补充程序。','证券状态与对应执行规则已核验','ENGINEERING'),
         'NEAR_PRICE_LIMIT_OR_CORPORATE_ACTION':('价格接近限制或需核对公司行为','核对当日交易状态及公司行为公告，等待可执行的价格与规则条件。','价格和公司行为检查通过','DISCLOSURE'),
         'RESEARCH_MODE':('当前仅启用研究模式','若要运行独立模拟，需要将本地模式明确设置为paper；该操作不会连接实盘。','你确认模拟模式后重新检查','USER')})
@@ -248,6 +254,19 @@ def build(store,config,at):
     if trading_day(local(at).date()) is None:
         add('service:calendar','MARKET','交易日历需要更新','当前年份尚无核验过的交易日历。',owner='ENGINEERING',state='ACTION',
             action='根据交易所当年休市通知更新日历并测试，再恢复盘面定时任务。',trigger='日历更新通过验证后继续',done='当前年份交易日期可明确判断',impact='交易Slot暂停，资料研究可继续')
+    from .calendar import next_year_warning
+    upcoming=next_year_warning(at)
+    if upcoming:
+        add('service:calendar-next-year','MARKET',f"{upcoming['year']}年交易日历尚未录入",
+            f"距离年底还有{upcoming['days_left']}天。未录入的年份不会执行任何交易。",owner='ENGINEERING',state='ACTION',
+            action='交易所发布次年休市安排后（通常在12月），按《年度交易日历更新》流程录入、测试并部署到本地和云端。',
+            trigger='次年休市安排发布后',done=f"{upcoming['year']}年日历已录入并通过测试",impact='现在不影响交易；若1月1日前未完成，新年起全部交易暂停')
+    disk=json.loads((store.db.execute("SELECT value FROM service_state WHERE key='maintenance'").fetchone() or ['{}'])[0]).get('disk')
+    if disk and disk.get('warning'):
+        add('service:disk','MARKET','磁盘空间或数据库体积超过警戒线',
+            f"可用空间{disk['free_gb']}GB，数据库{disk['db_gb']}GB，备份{disk['backups_gb']}GB。",owner='USER',state='ACTION',
+            action='按运维手册“磁盘空间”一节处理：确认备份保留设置、清理旧发布包副本，必要时停服务后整理数据库。',
+            trigger='空间释放后自动消失',done='可用空间和数据库体积回到警戒线以内',impact='空间耗尽会导致研究、复盘与备份失败')
     return items,latest
 
 

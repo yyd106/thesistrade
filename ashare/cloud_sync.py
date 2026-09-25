@@ -10,10 +10,16 @@ from . import cloud_ledger as ledger
 def pull(store,config):
     if role(config)!='research':return None
     for _ in range(200):
-        packet=request(config,'/api/sync/ledger',{'cursors':value(store,'ledger_cursors',{})})
+        # An older cloud ignores the v2 fields and answers with the v1 full-table packet.
+        packet=request(config,'/api/sync/ledger',{'cursors':value(store,'ledger_cursors',{}),'protocol':2,
+            'change_cursor':value(store,'ledger_change_cursor'),'support_since':value(store,'ledger_support_since')})
         ledger.import_ledger(store,config,packet)
         if not packet['more']:return packet
     raise RuntimeError('账本仍在分页同步，完成前不进行组合决策或复盘')
+
+
+def remote_supports(store,feature):
+    return feature in (value(store,'remote_features') or [])
 
 
 def source_records(store,decisions):
@@ -65,6 +71,31 @@ def display_packet(config):
     return result
 
 
+# The cloud recomputes these per-stock fields from its own ledger, so they are never sent.
+VOLATILE=('quote','last_decision','open_orders')
+
+
+def display_sections(display):
+    """Split the UI summary into independently versioned parts: one per watchlist stock plus each top-level block."""
+    sections={}
+    for key,item in display.items():
+        if key=='watchlist':
+            sections['watchlist:__order__']=[w['symbol'] for w in item]
+            for w in item:sections['watchlist:'+w['symbol']]={k:v for k,v in w.items() if k not in VOLATILE}
+        else:sections['top:'+key]=item
+    return sections
+
+
+def assemble_display(sections):
+    display={k[4:]:v for k,v in sections.items() if k.startswith('top:')}
+    display['watchlist']=[sections['watchlist:'+s] for s in sections.get('watchlist:__order__',[]) if 'watchlist:'+s in sections]
+    return display
+
+
+def section_hashes(sections):
+    return {k:digest(canonical(v))[:16] for k,v in sections.items()}
+
+
 def queue_publication(store,config,decision_id):
     if role(config)!='research':return
     row=store.db.execute('SELECT * FROM portfolio_decisions WHERE id=?',(decision_id,)).fetchone()
@@ -75,14 +106,26 @@ def queue_publication(store,config,decision_id):
     for k,c in capsules.items():
         if c['route']=='global':c['item']=selected.get(c['symbol'])
     watermark=store.db.execute("SELECT value FROM dynamic_state WHERE key='news_watermark'").fetchone()
+    display=display_packet(config)
     payload={'protocol':1,'kind':'strategy','bundle_id':row['id'],'completed_at':row['created_at'],'decision':dict(row),'sources':tables,'contracts':capsules,
              'ledger_version':decision.get('remote_ledger_version'),'news_watermark':watermark[0] if watermark else None,
-             'active_assets':list({d['symbol'] for d in decision['decisions']}),'display':display_packet(config)}
+             'active_assets':list({d['symbol'] for d in decision['decisions']}),'display':display}
+    if remote_supports(store,'display_delta'):
+        # Send only the parts of the UI summary the cloud does not already hold.
+        sections=display_sections(display);hashes=section_hashes(sections);known=value(store,'remote_display_hashes') or {}
+        payload['display']=None
+        payload['display_delta']={'hashes':hashes,'sections':{k:v for k,v in sections.items() if known.get(k)!=hashes[k]}}
     with store.db:
         if store.db.execute('SELECT 1 FROM cloud_outbox WHERE id=?',(row['id'],)).fetchone():return
         seq=value(store,'publication_sequence',0)+1;payload['sequence']=seq;put(store,'publication_sequence',seq)
-        store.db.execute('INSERT INTO cloud_outbox VALUES(?,?,?,?,?)',(row['id'],now(),'PENDING',canonical(payload).decode(),None))
-    json_write(store.root/'workflow/cloud-sync'/row['id']/'publication.json',payload)
+        body=canonical(payload).decode()
+        store.db.execute('INSERT INTO cloud_outbox VALUES(?,?,?,?,?)',(row['id'],now(),'PENDING',body,None))
+    # A small manifest replaces the multi-megabyte publication copy; the database keeps the body until sent.
+    enc=lambda v:len(canonical(v))
+    json_write(store.root/'workflow/cloud-sync'/row['id']/'manifest.json',{'bundle_id':row['id'],'sequence':seq,'created_at':now(),
+        'sha256':digest(body.encode()),'bytes':len(body.encode()),'sections':{k:enc(v) for k,v in payload.items() if k not in ('sequence',)},
+        'display_mode':'DELTA' if payload['display'] is None else 'FULL',
+        'display_sections_sent':sorted(payload.get('display_delta',{}).get('sections',{}))})
 
 
 def flush(store,config):
@@ -97,8 +140,13 @@ def flush(store,config):
         with store.db:
             store.db.execute("UPDATE cloud_outbox SET status='SENT',error=NULL WHERE id=?",(latest['id'],))
             store.db.execute("UPDATE cloud_outbox SET status='SUPERSEDED' WHERE status='PENDING' AND created_at<=?",(latest['created_at'],))
-            put(store,'last_upload',{'at':now(),'bundle_id':latest['id'],'result':answer})
-        json_write(store.root/'workflow/cloud-sync'/latest['id']/'receipt.json',answer)
+            receipt={k:v for k,v in answer.items() if k!='display_hashes'}
+            put(store,'last_upload',{'at':now(),'bundle_id':latest['id'],'result':receipt})
+            if isinstance(answer.get('display_hashes'),dict):put(store,'remote_display_hashes',answer['display_hashes'])
+            elif payload.get('display') is not None:put(store,'remote_display_hashes',{})
+        json_write(store.root/'workflow/cloud-sync'/latest['id']/'receipt.json',receipt)
+        from .maintenance import prune_outbox
+        prune_outbox(store)
         return answer
     except Exception as exc:
         with store.db:
@@ -150,19 +198,39 @@ def receive_strategy(store,config,body,at):
         if d['source_token']!=row_token(source(store,d['route'],d['identity'])):raise ValueError('源策略摘要校验失败')
     store.db.execute('DELETE FROM cloud_contracts')
     for k,c in body['contracts'].items():store.db.execute('INSERT INTO cloud_contracts VALUES(?,?,?)',(k,completed,canonical(c).decode()))
-    put(store,'active_assets',body['active_assets']);put(store,'display',body['display'])
+    put(store,'active_assets',body['active_assets'])
+    display_hashes=receive_display(store,body)
+    # Key invalidations older than this decision no longer apply.
+    put(store,'invalidated_keys',{k:v for k,v in (value(store,'invalidated_keys') or {}).items() if v>completed})
     store.db.execute("UPDATE portfolio_decisions SET status='SUPERSEDED' WHERE status='ACTIVE'")
     ledger.upsert(store,'portfolio_decisions',[decision])
     if body.get('news_watermark'):store.db.execute("INSERT OR REPLACE INTO dynamic_state VALUES('news_watermark',?)",(normalize_time(body['news_watermark']),))
     put(store,'research_completed_at',completed);put(store,'research_received_at',at);put(store,'last_sequence',seq)
     store.db.execute('INSERT INTO cloud_receipts VALUES(?,?,?,?,?)',(seq,bid,at,completed,hashed))
     cancelled=cancel_incompatible_buys(store,config,at,bid)
-    return {'status':'ACCEPTED','bundle_id':bid,'completed_at':completed,'cancelled_buys':cancelled,'ledger_version':ledger.version(store)}
+    return {'status':'ACCEPTED','bundle_id':bid,'completed_at':completed,'cancelled_buys':cancelled,'ledger_version':ledger.version(store),
+            'display_hashes':display_hashes}
+
+
+def receive_display(store,body):
+    """Full display (older research nodes) or a delta over the sections the cloud already holds.
+    A section whose base is missing keeps its last value; the returned hashes tell the sender what to resend."""
+    delta=body.get('display_delta')
+    if body.get('display') is None and isinstance(delta,dict):
+        wanted=delta.get('hashes') or {};provided=delta.get('sections') or {};stored=value(store,'display_sections') or {}
+        merged={}
+        for key,expected in wanted.items():
+            if key in provided and digest(canonical(provided[key]))[:16]==expected:merged[key]=provided[key]
+            elif key in stored:merged[key]=stored[key]
+    else:
+        merged=display_sections(body.get('display') or {})
+    put(store,'display_sections',merged);put(store,'display',assemble_display(merged))
+    return section_hashes(merged)
 
 
 def handle(store,config,path,body,at):
     if path=='/api/sync/bootstrap':return ledger.import_bootstrap(store,config,body,at)
-    if path=='/api/sync/ledger':return ledger.export_ledger(store,body.get('cursors',{}),at)
+    if path=='/api/sync/ledger':return ledger.export_ledger(store,body.get('cursors',{}),at,body=body)
     if path=='/api/sync/strategy':return receive_strategy(store,config,body,at)
     if path=='/api/sync/activate':
         if body.get('local_execution_disabled') is not True:raise ValueError('必须先停用本地交易执行')
@@ -172,11 +240,18 @@ def handle(store,config,path,body,at):
     if path=='/api/sync/invalidate':
         changed=normalize_time(body['changed_at'])
         if abs((datetime.fromisoformat(at)-datetime.fromisoformat(changed)).total_seconds())>300:raise ValueError('失效通知时间无效')
+        keys=body.get('keys')
         if changed>value(store,'research_completed_at',''):
-            put(store,'invalidated_at',changed)
+            if isinstance(keys,list) and keys and '*' not in keys:
+                # Only the listed candidates (and decisions depending on them) stop buying.
+                if len(keys)>200 or any(not isinstance(k,str) or not 3<=len(k)<=120 for k in keys):raise ValueError('失效标的格式无效')
+                current=value(store,'invalidated_keys') or {}
+                for k in keys:current[k]=max(current.get(k,''),changed)
+                put(store,'invalidated_keys',current)
+            else:put(store,'invalidated_at',changed)
             from .portfolio_strategy import cancel_incompatible_buys
             cancel_incompatible_buys(store,config,at,'research-invalidation')
-        return {'status':'ACCEPTED'}
+        return {'status':'ACCEPTED','scope':'KEYS' if isinstance(keys,list) and keys and '*' not in keys else 'ALL'}
     if path=='/api/sync/reviews':
         for t in ('reviews','lessons','research_methods','research_improvements'):ledger.upsert(store,t,body.get(t,[]),immutable=True)
         put(store,'display_reviews',body.get('display',[]));return {'status':'ACCEPTED'}

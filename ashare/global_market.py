@@ -63,13 +63,23 @@ def session_open(symbol, at, payload):
     return False
 
 
-def fresh(q, at, max_age=90):
+# Buys need a current CNY rate. Sells (exits and stops) accept the last rate for up to four days,
+# because the FX market is closed at weekends while BTC/ETH still trade and must stay protected.
+FX_BUY_MAX_AGE = 3600
+FX_SELL_MAX_AGE = 4 * 86400
+
+
+def fresh(q, at, max_age=90, fx_max_age=FX_BUY_MAX_AGE):
     if not q:
         return False
     t = datetime.fromisoformat(normalize_time(at))
     return (q['first_seen_at'] <= normalize_time(at)
             and 0 <= (t-datetime.fromisoformat(q['observed_at'])).total_seconds() <= max_age
-            and 0 <= (t-datetime.fromisoformat(q['fx_at'])).total_seconds() <= 3600)
+            and 0 <= (t-datetime.fromisoformat(q['fx_at'])).total_seconds() <= fx_max_age)
+
+
+def fx_age(q, at):
+    return (datetime.fromisoformat(normalize_time(at))-datetime.fromisoformat(q['fx_at'])).total_seconds() if q else None
 
 
 def latest(store, symbol, at):
@@ -100,14 +110,20 @@ def refresh(store, symbols, at=None, fetch=get_json, history=False):
     """Network workers never share a SQLite connection; write only after joining."""
     at = normalize_time(at or now())
     fx = None
+    fx_error = None
     try:
         data = chart('CNY=X', fetch)
         if data['meta'].get('currency') != 'CNY':
             raise ValueError('人民币汇率单位错误')
         fx = {'micros': micros(data['meta']['regularMarketPrice']), 'at': stamp(data['meta']['regularMarketTime'])}
     except Exception as exc:
-        # Do not invent an FX rate or relabel a stale FX quote with fetch time.
-        return {'status': 'DEFERRED', 'error': '汇率不可用：'+str(exc)[:180], 'updated': 0}
+        # Never invent a rate or relabel an old one with the fetch time. Reuse the last observed rate
+        # with its own timestamp, so prices keep updating; buys still require a current rate.
+        last = store.db.execute('SELECT fx_micros,fx_at FROM global_quotes WHERE fx_at<=? ORDER BY fx_at DESC LIMIT 1', (at,)).fetchone()
+        if not last:
+            return {'status': 'DEFERRED', 'error': '汇率不可用：'+str(exc)[:180], 'updated': 0}
+        fx = {'micros': last['fx_micros'], 'at': last['fx_at']}
+        fx_error = '汇率刷新失败，沿用最近一次汇率（'+last['fx_at']+'）：'+str(exc)[:120]
 
     def read(symbol):
         try:
@@ -177,5 +193,5 @@ def refresh(store, symbols, at=None, fetch=get_json, history=False):
             payload = {**previous, 'status': 'FAILED', 'error': error}
         with store.db:
             store.db.execute('INSERT OR REPLACE INTO global_market VALUES(?,?,?)', (symbol, receipt, json.dumps(payload, ensure_ascii=False)))
-    return {'status': 'SUCCEEDED' if updated == len(results) else 'PARTIAL', 'updated': updated,
-            'errors': {s: error for s, _, _, error in results if error}}
+    return {'status': 'SUCCEEDED' if updated == len(results) and not fx_error else 'PARTIAL', 'updated': updated,
+            'errors': {s: error for s, _, _, error in results if error}, 'fx_error': fx_error}

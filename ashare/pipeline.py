@@ -37,6 +37,8 @@ def load_config(path):
         config['portfolio_authorization_hours']=12
     from .settings import validate_settings
     validate_settings(config)
+    from .model import configure
+    configure(config)
     return config
 
 
