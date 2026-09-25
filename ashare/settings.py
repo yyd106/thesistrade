@@ -30,7 +30,7 @@ DEFAULTS = {
  'backup_hourly_keep':6,'backup_daily_keep':7,
  'disk_free_warn_gb':10,'db_size_warn_gb':5,
  'evaluation_enabled':True,'evaluation_time':'19:10','evaluation_horizon_days':20,
- 'weekly_report_weekday':5,'weekly_report_time':'10:00',
+ 'weekly_report_weekday':5,'weekly_report_time':'10:00','digest_time':'23:50',
  'shadow_books_enabled':True,'shadow_risk_per_trade_bps':50,'shadow_start_date':None
 }
 
@@ -105,7 +105,7 @@ def validate_settings(config):
         if type(config[k]) is not int or not lo<=config[k]<=hi:raise ValueError(f'{k}必须为{lo}到{hi}之间整数')
     for k in ('evaluation_enabled','shadow_books_enabled'):
         if type(config[k]) is not bool:raise ValueError(k+'须为true或false')
-    for k in ('evaluation_time','weekly_report_time'):
+    for k in ('evaluation_time','weekly_report_time','digest_time'):
         if not isinstance(config[k],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',config[k]):raise ValueError(k+'格式错误')
     if config['shadow_start_date'] is not None and (not isinstance(config['shadow_start_date'],str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',config['shadow_start_date'])):raise ValueError('shadow_start_date须为YYYY-MM-DD')
     # Research must refresh before a plan expires, otherwise buying silently stops between rounds.

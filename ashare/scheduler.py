@@ -42,7 +42,9 @@ def schedule_due(store,config,at):
             ('slot',config['slot_times'] if trading_day(cursor) is True else []),
             # Model-free evaluation after each trading day's data is collected, and a weekly report.
             ('evaluate',[config['evaluation_time']] if config.get('evaluation_enabled',True) and trading_day(cursor) is True else []),
-            ('weekly_report',[config['weekly_report_time']] if config.get('evaluation_enabled',True) and cursor.weekday()==config.get('weekly_report_weekday',5) else [])):
+            ('weekly_report',[config['weekly_report_time']] if config.get('evaluation_enabled',True) and cursor.weekday()==config.get('weekly_report_weekday',5) else []),
+            # One-page daily summary of every stage, for the operator and the supervisor.
+            ('digest',[config.get('digest_time','23:50')])):
             if role(config)=='research' and kind=='slot':continue
             if role(config)=='cloud' and kind!='slot':continue
             for hhmm in times:
@@ -171,7 +173,7 @@ class Scheduler:
             result=execute(config,job['kind'],key=job['id'] if job['kind'] in ('cycle','collect') else None,
                 symbol=payload.get('symbol'),
                 scheduled_at=job['scheduled_at'] if job['kind'] in ('slot','dynamic_slot') else None,
-                end=job['scheduled_at'] if job['kind'] in ('review','dynamic_cycle') else None)
+                end=job['scheduled_at'] if job['kind'] in ('review','dynamic_cycle','digest') else None)
             failed=result.get('status')=='DEFERRED' if isinstance(result,dict) else any(r.get('status')=='DEFERRED' for r in result) if isinstance(result,list) else False
             state='DEFERRED' if failed else 'DONE';error=None
             if job['kind']=='slot' and isinstance(result,dict):

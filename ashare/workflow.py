@@ -142,6 +142,10 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
             elif command=='weekly_report':
                 from .weekly import weekly_report
                 result=weekly_report(store,config)
+            elif command=='digest':
+                from .digest import write as write_digest
+                from .calendar import local
+                result=write_digest(store,config,local(end or now()).date().isoformat())
             elif command=='slot':result=run_slot(store,config,scheduled_at,use_model)
             elif command=='review':result=run_review(store,config,end,use_model)
             elif command=='settle':

@@ -66,6 +66,10 @@ def main():
     iss.add_argument('action', choices=['list', 'resolve']);iss.add_argument('id', nargs='?')
     iss.add_argument('--status', default='OPEN');iss.add_argument('--note');iss.add_argument('--wontfix', action='store_true')
     sub.add_parser('guidance', help='列出已上线的研究规则')
+    dg = sub.add_parser('digest', help='运行日报：一页汇总当天的抓取、研究、组合策略、执行、复盘与调整（程序生成，不调用模型）')
+    dg.add_argument('--date', help='某一天（YYYY-MM-DD，北京时间），默认今天')
+    dg.add_argument('--since', help='汇总区间起点（YYYY-MM-DD），生成多日汇总')
+    dg.add_argument('--until', help='汇总区间终点（YYYY-MM-DD），默认今天')
     maint = sub.add_parser('maintenance', help='存储维护：清理已发送的发布包正文、磁盘状态、可选整理数据库')
     maint.add_argument('--vacuum', action='store_true', help='整理数据库文件（需先停止服务）')
     maint.add_argument('--list-publications', action='store_true', help='列出旧版本留下的 publication.json 副本')
@@ -181,9 +185,15 @@ def extended(args, config):
             finally:store.close()
         result = execute(config, 'evaluate' if command == 'evaluate' else 'weekly_report', use_model=False)
         return {**extra, **result} if extra else result
+    if command == 'digest':
+        from .digest import write, rollup
+        store = Store(config['data_dir'])
+        try:
+            return rollup(store, config, args.since, args.until) if args.since else write(store, config, args.date)
+        finally:store.close()
     if command == 'schedule':
         from .reporting import next_runs
-        keys = ('collection_times', 'review_time', 'slot_times', 'evaluation_time', 'weekly_report_weekday', 'weekly_report_time',
+        keys = ('collection_times', 'review_time', 'slot_times', 'evaluation_time', 'weekly_report_weekday', 'weekly_report_time', 'digest_time',
                 'plan_max_age_hours', 'research_reuse_hours', 'portfolio_refresh_minutes', 'dynamic_enabled', 'scheduler_enabled')
         settings = {k: config.get(k) for k in keys}
         slots = sorted(config.get('slot_times', []))

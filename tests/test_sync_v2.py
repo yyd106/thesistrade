@@ -120,6 +120,22 @@ class SyncV2Tests(unittest.TestCase):
         stored = runtime.value(self.cloud, 'display')
         self.assertEqual(stored['reviews'], [{'id': 'r2'}]);self.assertEqual(stored['watchlist'][0]['plan'], {'id': 'p1'})
 
+    def test_new_strategy_time_alone_resends_nothing(self):
+        # Every strategy version stamps each asset; the cloud recomputes that stamp, so it must not count as a change.
+        def display(stamp):
+            return {'watchlist': [{'symbol': 'sh600519', 'plan': {'id': 'p1'}, 'last_strategy_updated_at': stamp}],
+                    'observation': {'items': [{'asset': 'BTC', 'role': 'CORE', 'last_strategy_updated_at': stamp}]}, 'reviews': []}
+        with self.store.db:runtime.put(self.store, 'remote_features', list(ledger.FEATURES))
+        first = self.publish(display(self.at))
+        answer = self.receive(first)
+        with self.store.db:runtime.put(self.store, 'remote_display_hashes', answer['display_hashes'])
+        second = self.publish(display(self.later(55)), self.later(55))
+        self.assertEqual(list(second['display_delta']['sections']), [])
+        self.receive(second, self.later(55))
+        stored = runtime.value(self.cloud, 'display')
+        self.assertEqual(stored['watchlist'][0]['plan'], {'id': 'p1'});self.assertNotIn('last_strategy_updated_at', stored['watchlist'][0])
+        self.assertEqual(stored['observation']['items'][0]['asset'], 'BTC')
+
     def test_old_cloud_gets_full_display(self):
         with self.store.db:runtime.put(self.store, 'remote_features', [])
         body = self.publish({'watchlist': [], 'reviews': []})
