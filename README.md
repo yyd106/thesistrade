@@ -1,12 +1,14 @@
 # ThesisTrade · 研究与多资产模拟交易
 
-版本 **0.15.2**。Mac 负责数据采集、研究、组合策略和复盘；Railway 负责持续盯盘、风控及模拟执行。当前观察池包含原有22只A股和黄金、白银、比特币、以太坊四种固定资产，初始模拟资金10万元，无杠杆。没有真实券商下单或转账接口。
+版本 **0.15.3**。Mac 负责数据采集、研究、组合策略和复盘；Railway 负责持续盯盘、风控及模拟执行。当前观察池包含原有22只A股和黄金、白银、比特币、以太坊四种固定资产，初始模拟资金10万元，无杠杆。没有真实券商下单或转账接口。
 
 0.15.0 补上了策略改进的检验通道：复盘发现不再直接进入研究，而是登记为工程问题或提案草稿；每个研究与组合判断登记后满 20 个交易日按沪深300打分；四本对照账本每日并行，比较纯规则、加研究、加组合决策和规则定仓位的差异；只有用户批准的研究规则才进入研究输入。模型名称固定，实际运行的模型逐次记录。账本同步改为增量，发布包不再留完整副本。变更内容、部署顺序和验收见 [升级到 0.15.0](docs/UPGRADE_0.15.md)。
 
 0.15.1 起，本机每天 23:50 生成一页“运行日报”（`ashare-data/workflow/digests/<日期>.md`）：由程序从原始记录汇总抓取、研究、组合策略、云端执行、复盘和调整，并按固定规则标出异常，不调用模型。它是检查 ChatGPT 自动研究方向是否正确的依据，见 [升级到 0.15.1](docs/UPGRADE_0.15.1.md)。
 
 0.15.2 起，现阶段研究不要求准时：本机断网时，需要联网的任务等联网后再运行，正在进行的资料研究在下一只股票前停下，联网后补做；日报新增“本机在线”一节，离线造成的延误不再列入需要关注。见 [升级到 0.15.2](docs/UPGRADE_0.15.2.md)。
+
+0.15.3 修复公司行为核验：读懂上交所表格日期、每股金额、小数分和“差异化分红送转：否”，假设句里的送转、配股字样不再触发拒绝，分红实施后的回购调价等附属公告随实施公告一并核验；读不准的一律阻挡，真实差异化分红继续阻挡买入。新增提案“被新版替代”状态、工程问题改标题和只读的 `./agent event-check`。见 [升级到 0.15.3](docs/UPGRADE_0.15.3.md)。
 
 部署入口：[云端工作台](https://thesistrade-production.up.railway.app/)，需要登录。架构、签名 API、12小时研究心跳及迁移恢复步骤见[云端部署说明](docs/CLOUD.md)。云端只持有验签公钥；模型凭据与签名私钥保留在本地。
 
@@ -89,10 +91,14 @@ cd /Users/dean/Documents/Codex/Agents/ashare-agent
 ./agent digest --date 2026-09-25
 ./agent digest --since 2026-09-21
 ./agent issues new --key OTHER_DATA --title "标题" --detail "现象与依据"
+./agent issues retitle <编号> --title "新标题" --note "理由"
 ./agent evaluate
 ./agent weekly-report
 ./agent proposals list
+./agent proposals new --file 新版.json --supersedes <旧编号>
+./agent proposals decide <旧编号> --to SUPERSEDED --replaced-by <新编号> --note "理由"
 ./agent issues list
+./agent event-check
 ./agent guidance
 ./agent maintenance
 ./agent config show
