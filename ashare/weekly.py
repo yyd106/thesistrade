@@ -44,7 +44,18 @@ def collect(store, config, at=None, days=7):
             'engineering_issues': [{k: i[k] for k in ('id', 'issue_key', 'category', 'symbol', 'title', 'occurrences', 'first_seen_at', 'last_seen_at')} for i in issues(store, 'OPEN')][:30],
             'proposals': {s: [{k: p[k] for k in ('id', 'kind', 'target', 'title', 'created_at')} for p in proposals(store, s)][:30]
                           for s in ('DRAFT', 'READY', 'APPROVED', 'ADOPTED')},
+            'proposals_closed': closed_proposals(store),
             'disk': disk_status(store, config), 'calendar_warning': next_year_warning(at)}
+
+
+def closed_proposals(store):
+    """Closed proposals are counted, and a superseded one names its replacement, so that
+    "rejected" is not read as "the hypothesis failed"."""
+    from .governance import proposals
+    count = lambda status: store.db.execute('SELECT count(*) FROM strategy_proposals WHERE status=?', (status,)).fetchone()[0]
+    return {'REJECTED': count('REJECTED'), 'SUPERSEDED': count('SUPERSEDED'),
+            'replacements': [{'id': p['id'], 'title': p['title'], 'replaced_by': p['payload'].get('superseded_by')}
+                             for p in proposals(store, 'SUPERSEDED')][:30]}
 
 
 def markdown(report):
@@ -79,6 +90,11 @@ def markdown(report):
     lines += ['', '## 变更提案', '']
     for status, items in report['proposals'].items():
         lines.append(f"- {status}：{len(items)} 条" + ('' if not items else '；' + '；'.join(f"{p['id']} {p['title']}" for p in items[:8])))
+    closed = report.get('proposals_closed')
+    if closed:
+        replaced = closed['replacements']
+        lines.append(f"- REJECTED（驳回，累计）：{closed['REJECTED']} 条")
+        lines.append(f"- SUPERSEDED（被新版替代，累计）：{closed['SUPERSEDED']} 条" + ('' if not replaced else '；旧→新 ' + '；'.join(f"{p['id']}→{p['replaced_by']}" for p in replaced[:8])))
     disk = report['disk']
     lines += ['', '## 运行健康', '', f"- 磁盘可用 {disk['free_gb']}GB，数据库 {disk['db_gb']}GB，备份 {disk['backups_gb']}GB" + ('（超过警戒线）' if disk['warning'] else '')]
     if report['calendar_warning']:

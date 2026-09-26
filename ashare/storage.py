@@ -7,6 +7,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Page text is stored in overlapping windows so no sentence is lost at an edge; readers that
+# need the page back (event_review.document_text) drop the overlap.
+CHUNK_SIZE, CHUNK_STEP = 800, 720
+
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -152,8 +156,8 @@ class Store:
             ordinal = 0
             for page, text in pages:
                 text = text.strip()
-                for offset in range(0, len(text), 720):
-                    fragment = text[offset:offset + 800]
+                for offset in range(0, len(text), CHUNK_STEP):
+                    fragment = text[offset:offset + CHUNK_SIZE]
                     if not fragment.strip():
                         continue
                     cid = doc_id + ":" + str(ordinal)

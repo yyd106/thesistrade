@@ -83,7 +83,15 @@ card=new FakeElement('article');showGuidance(card,{symbol:'sz002415',plan:{trade
 assert.equal(card.children.length,1);assert.equal(card.children[0].hidden,true);
 assert.equal(card.children[0].id,'trade-guidance-feedback-sz002415');
 assert.match(decision({plan:{effective_status:'ACTIVE',payload:{kind:'NO_ENTRY',blockers:['UNRESOLVED_EVENT:one']},trade_guidance:{groups:[{key:'event:one',title:'分红或除权事项尚未核验'}]}}}).reason,/分红或除权/);
-console.log('Actionable trading limits, source links, and stable feedback target passed.');
+card=new FakeElement('article');
+showRecovery(card,{symbol:'sz000651',recovery:{action:null,why:'等待',next_step:'等待',automatic_attempts:0,automatic_limit:2},plan:{payload:{event_reviews:[
+  {doc_id:'m',title:'2026年半年度权益分派实施公告',status:'VERIFIED',missing:[],facts:{cash_per_share:'0.055',cash_per_share_cents:null,record_date:'2026-09-22',ex_date:'2026-09-23'}},
+  {doc_id:'f',title:'关于权益分派实施后调整回购股份价格上限的公告',status:'NEEDS_EVIDENCE',missing:['随除息日2026-09-23的实施公告一并核验'],facts:{follows:'DIVIDEND',record_date:'2026-09-22',ex_date:'2026-09-23'}},
+  {doc_id:'o',title:'规则v1的核验记录',status:'VERIFIED',missing:[],facts:{cash_per_share_cents:55,record_date:'2026-08-18',ex_date:'2026-08-19'}}]}}});
+assert.match(JSON.stringify(card),/每股税前现金分红 0.055 元/);
+assert.match(JSON.stringify(card),/每股税前现金分红 0.55 元/);
+assert.match(JSON.stringify(card),/随分红实施发布的公告（除息日 2026-09-23）/);
+console.log('Actionable trading limits, source links, and stable feedback target passed; sub-cent dividends and follow-on announcements render exactly.');
 const actionJob=vm.runInContext('actionJob',context);
 const active={watchlist:[{symbol:'one',recovery:{job_id:'one-job'}},{symbol:'two',recovery:{job_id:null}}],active_jobs:[{id:'one-job',kind:'repair',status:'RUNNING'}]};
 assert.equal(actionJob(active,'repair','one').id,'one-job');

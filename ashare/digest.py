@@ -310,11 +310,16 @@ def governance(store, a, b):
             if e and a <= normalize_time(e.get('at', '1970-01-01T00:00:00+00:00')) < b:
                 changes.append({k: e.get(k) for k in ('key', 'class', 'before', 'after', 'reason', 'approved_by', 'at')})
     proposals_new = _rows(store, 'SELECT id,kind,title,status,source FROM strategy_proposals WHERE created_at>=? AND created_at<?', (a, b))
-    proposals_decided = _rows(store, 'SELECT id,title,status,decided_by FROM strategy_proposals WHERE decided_at>=? AND decided_at<?', (a, b))
+    proposals_decided = [{'id': r['id'], 'title': r['title'], 'status': r['status'], 'decided_by': r['decided_by'],
+                          'replaced_by': (_json(r['payload_json'], {}) or {}).get('superseded_by') if r['status'] == 'SUPERSEDED' else None}
+                         for r in _rows(store, 'SELECT id,title,status,decided_by,payload_json FROM strategy_proposals WHERE decided_at>=? AND decided_at<?', (a, b))]
     guidance = _rows(store, "SELECT id,route,status,approved_by FROM strategy_guidance WHERE (adopted_at>=? AND adopted_at<?) OR (retired_at>=? AND retired_at<?)", (a, b, a, b))
     issues_new = _rows(store, 'SELECT id,issue_key,category,symbol,title FROM engineering_issues WHERE first_seen_at>=? AND first_seen_at<?', (a, b))
     issues_seen = _rows(store, 'SELECT count(*) n FROM engineering_issues WHERE last_seen_at>=? AND last_seen_at<? AND first_seen_at<?', (a, b, a))
     issues_resolved = _rows(store, 'SELECT id,title,status FROM engineering_issues WHERE resolved_at>=? AND resolved_at<?', (a, b))
+    issues_retitled = [{'id': r['id'], 'from': t.get('from'), 'to': t.get('to')}
+                       for r in _rows(store, "SELECT id,payload_json FROM engineering_issues WHERE payload_json LIKE '%\"titles\"%'")
+                       for t in (_json(r['payload_json'], {}) or {}).get('titles', []) if a <= t.get('at', '') < b]
     builds = [(_json(r['payload_json'], {}) or {}).get('build_id') for r in _rows(store, 'SELECT payload_json FROM builds WHERE first_seen_at>=? AND first_seen_at<?', (a, b))]
     notes = []
     folder = store.root / 'workflow' / 'agent-notes'
@@ -324,7 +329,14 @@ def governance(store, a, b):
                 notes.append(f.name)
     return {'config_changes': changes, 'proposals_new': proposals_new, 'proposals_decided': proposals_decided, 'guidance_changes': guidance,
             'issues_new': issues_new, 'issues_recurring': issues_seen[0]['n'] if issues_seen else 0, 'issues_resolved': issues_resolved,
+            'issues_retitled': issues_retitled,
             'new_builds': builds, 'agent_notes': notes}
+
+
+def _decision(x):
+    if x['status'] == 'SUPERSEDED':
+        return f"被新版 {x.get('replaced_by') or '—'} 替代"
+    return f"{x['status']}（{x['decided_by'] or '代理整理'}）"
 
 
 def flags(d, config, today):
@@ -396,7 +408,7 @@ EMPTY = {'availability': {'spans': [], 'offline_minutes': 0, 'paused_minutes': 0
                        'marked_at': None, 'positions': [], 'risk': {}},
          'review': {'status': 'NONE'},
          'governance': {'config_changes': [], 'proposals_new': [], 'proposals_decided': [], 'guidance_changes': [], 'issues_new': [],
-                        'issues_recurring': 0, 'issues_resolved': [], 'new_builds': [], 'agent_notes': []}}
+                        'issues_recurring': 0, 'issues_resolved': [], 'issues_retitled': [], 'new_builds': [], 'agent_notes': []}}
 SECTION_TITLES = {'availability': '本机在线', 'jobs': '任务运行', 'collection': '抓取', 'research': '研究', 'portfolio': '组合策略',
                   'execution': '云端执行', 'review': '复盘', 'governance': '调整与治理'}
 
@@ -524,11 +536,13 @@ def markdown(d):
     L += [f"- 设置修改：{x['key']} {json.dumps(x['before'], ensure_ascii=False)}→{json.dumps(x['after'], ensure_ascii=False)}（{x['class']}，"
           + (f"批准人 {x['approved_by']}，" if x.get('approved_by') else '') + f"理由：{(x.get('reason') or '')[:60]}）" for x in g['config_changes']] or ['- 设置：无修改。']
     L.append(f"- 提案：新建 {len(g['proposals_new'])}，决策 {len(g['proposals_decided'])}"
-             + ('（' + '；'.join(f"{x['id']} {x['title']} → {x['status']}，{x['decided_by']}" for x in g['proposals_decided']) + '）' if g['proposals_decided'] else '') + '。')
+             + ('（' + '；'.join(f"{x['id']} {x['title']} → {_decision(x)}" for x in g['proposals_decided']) + '）' if g['proposals_decided'] else '') + '。')
     if g['guidance_changes']:
         L.append('- 研究规则变化：' + '；'.join(f"{x['id']} {x['status']}（{x['approved_by']}）" for x in g['guidance_changes']) + '。')
     L.append(f"- 工程问题：新增 {len(g['issues_new'])}，再次出现 {g['issues_recurring']}，关闭 {len(g['issues_resolved'])}"
              + ('（新增：' + '；'.join(f"{x['title']}" for x in g['issues_new'][:5]) + '）' if g['issues_new'] else '') + '。')
+    if g.get('issues_retitled'):
+        L.append('- 工程问题改标题：' + '；'.join(f"{x['id']}「{x['from']}」→「{x['to']}」" for x in g['issues_retitled']) + '。')
     if g['new_builds']:
         L.append('- 新版本号：' + '、'.join(filter(None, g['new_builds'])) + '。')
     if g['agent_notes']:
@@ -581,9 +595,10 @@ def rollup(store, config, since, until=None):
         g = d['governance']
         events += [f"- {d['day']} 设置 {x['key']}：{json.dumps(x['before'], ensure_ascii=False)}→{json.dumps(x['after'], ensure_ascii=False)}（{x['class']}，{x.get('approved_by') or '运行类'}）" for x in g['config_changes']]
         events += [f"- {d['day']} 新提案 {x['id']}：{x['title']}（{x['status']}）" for x in g['proposals_new']]
-        events += [f"- {d['day']} 提案决策 {x['id']}：{x['title']} → {x['status']}（{x['decided_by']}）" for x in g['proposals_decided']]
+        events += [f"- {d['day']} 提案决策 {x['id']}：{x['title']} → {_decision(x)}" for x in g['proposals_decided']]
         events += [f"- {d['day']} 研究规则 {x['id']} {x['status']}" for x in g['guidance_changes']]
         events += [f"- {d['day']} 新工程问题：{x['title']}" for x in g['issues_new']]
+        events += [f"- {d['day']} 工程问题改标题 {x['id']}：「{x['from']}」→「{x['to']}」" for x in g.get('issues_retitled', [])]
     L += events or ['- 区间内没有设置、提案、研究规则或工程问题的变化。']
     last = days[-1]
     changed = [s['name'] for d in days for s in d['research']['stocks'] if s['changed']]

@@ -100,6 +100,23 @@ class DigestTests(unittest.TestCase):
         self.assertIn('2026-09-15 设置 model_name', rolled)
         self.assertIn('2026-09-15 新提案', rolled)
 
+    def test_superseded_proposals_and_retitled_issues_are_listed(self):
+        self.seed_day()
+        with self.store.db:
+            new = governance.draft_proposal(self.store, source='agent', kind='RULE', target='自选股 · 退出规则', title='趋势失效后退出（完整版）',
+                                            payload={}, at=utc('10:00'))
+            iid = governance.record_issue(self.store, 'OTHER_DATA', None, '依据', ['x'], utc('09:00'), title='旧标题', dedupe='旧标题')
+        old = self.store.db.execute("SELECT id FROM strategy_proposals WHERE dedupe_key='t1'").fetchone()[0]
+        governance.decide(self.store, old, 'SUPERSEDED', decided_by=None, note='被完整新版替代', replaced_by=new, at=utc('20:00'))
+        governance.retitle_issue(self.store, iid, '新标题', '标题不准确', at=utc('21:00'))
+        with patch('ashare.digest.now', return_value=normalize_time('2026-09-16T23:50:00+08:00')):
+            text = (self.store.root / digest.write(self.store, self.cfg, DAY)['report']).read_text(encoding='utf-8')
+            rolled = (self.store.root / digest.rollup(self.store, self.cfg, '2026-09-14', '2026-09-16')['report']).read_text(encoding='utf-8')
+        self.assertIn(f'{old} 趋势失效后退出 → 被新版 {new} 替代', text)
+        self.assertIn(f'工程问题改标题：{iid}「旧标题」→「新标题」', text)
+        self.assertIn(f'提案决策 {old}：趋势失效后退出 → 被新版 {new} 替代', rolled)
+        self.assertIn(f'工程问题改标题 {iid}：「旧标题」→「新标题」', rolled)
+
     def test_scheduled_on_the_research_node_and_written_by_the_job(self):
         from ashare.scheduler import schedule_due
         from ashare.workflow import execute

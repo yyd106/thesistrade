@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 from ashare.storage import Store,normalize_time
 from test_config import load_config
-from ashare.followups import reconcile,view,next_market,build
+from ashare.followups import reconcile,view,next_market,build,event_route
 from ashare.scheduler import enqueue
 from ashare.demo import SYMBOL,seed,research_model
 from ashare.research import study
@@ -94,6 +94,19 @@ class FollowupTests(unittest.TestCase):
         trend=next(x for x in items if x['key'].endswith('TREND_NOT_CONFIRMED'))
         self.assertEqual(trend['owner'],'MARKET');self.assertIsNone(trend['run'])
         self.assertEqual(next(x for x in items if x['key'].endswith('UNKNOWN_RULE'))['owner'],'ENGINEERING')
+
+    def test_event_items_follow_the_review_resolution(self):
+        g={'waiting':'等待条件','user_action':'用户动作'};schedules={'cycle':self.at}
+        cases={'LINKED':('DISCLOSURE','WAITING'),'UNSUPPORTED':('ENGINEERING','ACTION'),'EVIDENCE':('USER','ACTION'),'WAIT':('DISCLOSURE','WAITING')}
+        for kind,expected in cases.items():
+            owner,state,action,route=event_route('event:x',{'status':'NEEDS_EVIDENCE','missing':['原因'],'resolution':kind},g,schedules)
+            self.assertEqual((owner,state),expected)
+        self.assertIn('随对应的实施公告一并解除',event_route('event:x',{'status':'NEEDS_EVIDENCE','missing':['x'],'resolution':'LINKED'},g,schedules)[2])
+        # Reviews written before rule v2 have no resolution and are routed by their wording, as before.
+        old=event_route('event:x',{'status':'NEEDS_EVIDENCE','missing':['除息日尚未到达，不提前确认未来实施结果']},g,schedules)
+        self.assertEqual(old[:2],('DISCLOSURE','WAITING'))
+        self.assertEqual(event_route('PRICE_DISCONTINUITY',None,g,schedules)[0],'ENGINEERING')
+        self.assertIsNone(event_route('event:x',None,g,schedules))
 
     def test_paused_scheduler_does_not_promise_next_automatic_attempt(self):
         self.cfg['scheduler_enabled']=False;self.fail();result=reconcile(self.store,self.cfg,self.at)
