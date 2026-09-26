@@ -2,7 +2,9 @@
 import re
 
 POLICY_VERSION = 'decision_evidence_v1'
-CORPORATE_ACTION = r'权益分派|分红派息|除权|除息|送转|配股|拆股|合并股份'
+CORPORATE_ACTION = (r'权益分派|分红派息|除权|除息|送转|配股|拆股|合并股份'
+                    r'|(?:利润分配|现金分红|现金红利|股息|红利|转增股本)(?:方案)?(?:的)?(?:派发)?实施'
+                    r'|(?:终止|取消|暂缓|延期|推迟|中止)(?:实施)?[^，。]{0,20}?(?:利润分配|分红|股息|红利)')
 RISK = r'立案|处罚|诉讼|仲裁|退市|风险警示|违约|冻结|重大资产|重组|停牌|财务重述|更正|留置'
 MATERIAL = r'业绩预告|业绩快报|减持|增持|回购|许可协议|临床|药品|关联交易|重大合同|中标|收购|募集说明书|募集资金|担保|股权转让|对外投资'
 ROUTINE = r'法律意见|会议决议|股东[大会]+通知|股东会的通知|召开.*股东|会议资料|公司章程|议事规则|管理制度|登记制度|说明会.*公告|参加.*说明会|集体接待|英文版|年度.*评估报告'
@@ -17,7 +19,7 @@ def periodic(title):
 def classify(title, kind='', symbol=None):
     if kind in ('financial_data',):
         return {'level':'BASELINE','priority':0,'required':False,'reason':'按报告期维护的财务底稿'}
-    if re.search(CORPORATE_ACTION,title):
+    if re.search(CORPORATE_ACTION,title) and not (re.search(r'优先股',title) and not re.search(r'权益分派|分红派息|除权|除息|送转|配股',title)):
         return {'level':'CORPORATE_ACTION','priority':0,'required':True,'reason':'需核对公司行为及价格可比性'}
     if re.search(RISK,title):
         return {'level':'RISK','priority':0,'required':True,'reason':'需核验实质风险与后续进展'}

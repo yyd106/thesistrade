@@ -8,6 +8,7 @@ from .reporting import next_runs
 from .presentation import failure_help,failure_reason,SOURCE_NAMES
 from .recovery import recovery_status
 from .guidance import trade_guidance
+from .event_review import resolution as event_resolution
 
 OWNER_NAMES={'SYSTEM':'系统','USER':'你','ENGINEERING':'程序维护','DISCLOSURE':'系统跟踪披露','MARKET':'系统跟踪行情'}
 STATE_NAMES={'AUTO':'自动处理','RUNNING':'正在处理','ESCALATED':'已转后续处理','WAITING':'等待条件','ACTION':'需要处理'}
@@ -52,6 +53,25 @@ def recovery_time(store,config,at,exhausted):
         end=normalize_time(day.replace(hour=22,minute=0,second=0,microsecond=0).isoformat())
         proposed=max(earliest,start)
         if proposed<end:return proposed
+    return None
+
+
+def event_route(key,review,g,schedules):
+    """Owner, state, next action and route of an unverified event, from the review's resolution.
+    None keeps the defaults (no review to go by)."""
+    missing='；'.join(review.get('missing',[])) if review else g['waiting']
+    kind=event_resolution(review)
+    if kind=='UNSUPPORTED' or key=='PRICE_DISCONTINUITY':
+        return ('ENGINEERING','ACTION','需要补充该事项的核验或账务处理规则，并用原文验证。可将本条交给我继续开发；当前没有后台自动修代码的任务。',
+                {'next_at':None,'trigger':'程序修复并验证后重新研究；单纯重复抓取不能解决','run':None})
+    if kind=='WAIT':
+        return ('DISCLOSURE','WAITING','等待实施日期到达、完整日线取得后再次核验。',{'next_at':schedules.get('cycle'),'trigger':missing,'run':None})
+    if kind=='LINKED':
+        return ('DISCLOSURE','WAITING','本公告随分红实施发布，本身不改变价格；随对应的实施公告一并解除，不需要单独补充材料。',
+                {'next_at':schedules.get('cycle'),'trigger':missing,'run':None})
+    if review:
+        return ('USER','ACTION',g['user_action']+' 需要的具体内容：'+missing,
+                {'next_at':schedules.get('cycle'),'trigger':'补充对应正式原文后重新核验；后台也继续检查新披露','run':None})
     return None
 
 
@@ -130,16 +150,8 @@ def build(store,config,at):
                 route={'next_at':None,'trigger':'程序维护确认规则原因并验证处理后继续','run':None}
             elif key.startswith('event:') or key=='PRICE_DISCONTINUITY':
                 review=next((r for r in packet.get('event_reviews',[]) if 'event:'+r['doc_id']==key),None)
-                missing='；'.join(review.get('missing',[])) if review else g['waiting']
-                if review and re.search(r'尚未实现|未支持|处理规则|账务|通用风险事项',missing) or key=='PRICE_DISCONTINUITY':
-                    owner='ENGINEERING';state='ACTION';action='需要补充该事项的核验或账务处理规则，并用原文验证。可将本条交给我继续开发；当前没有后台自动修代码的任务。'
-                    route={'next_at':None,'trigger':'程序修复并验证后重新研究；单纯重复抓取不能解决','run':None}
-                elif review and re.search(r'尚未到达|等待除息日',missing):
-                    owner='DISCLOSURE';state='WAITING';action='等待实施日期到达、完整日线取得后再次核验。'
-                    route={'next_at':schedules.get('cycle'),'trigger':missing,'run':None}
-                elif review:
-                    owner='USER';state='ACTION';action=g['user_action']+' 需要的具体内容：'+missing
-                    route={'next_at':schedules.get('cycle'),'trigger':'补充对应正式原文后重新核验；后台也继续检查新披露','run':None}
+                routed=event_route(key,review,g,schedules)
+                if routed:owner,state,action,route=routed
             item=add('plan:'+symbol+':'+key,symbol,g['title'],g['why'],owner=owner,state=state,
                 action=action,done=g['release'],documents=g['documents'],evidence=[plan['id']],**route)
             item['waiting_for']=g['waiting'];escalate(item,symbol)

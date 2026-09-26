@@ -69,6 +69,8 @@ def main():
     iss.add_argument('--symbol', help='new：相关代码，全市场问题不填');iss.add_argument('--title', help='new：一句话标题；同类型、同代码、同标题的再次登记只累加次数')
     iss.add_argument('--detail', help='new：现象与依据');iss.add_argument('--evidence', action='append', help='new：证据位置，可重复')
     sub.add_parser('guidance', help='列出已上线的研究规则')
+    evc = sub.add_parser('event-check', help='按当前规则重放各股的公司行为核验：哪些公告仍阻挡买入、原因是什么（只读，不调用模型）')
+    evc.add_argument('--symbol', action='append', help='只查指定代码，可重复；默认全部自选股')
     dg = sub.add_parser('digest', help='运行日报：一页汇总当天的抓取、研究、组合策略、执行、复盘与调整（程序生成，不调用模型）')
     dg.add_argument('--date', help='某一天（YYYY-MM-DD，北京时间），默认今天')
     dg.add_argument('--since', help='汇总区间起点（YYYY-MM-DD），生成多日汇总')
@@ -203,6 +205,12 @@ def extended(args, config):
         settings['slot_times'] = f"{len(slots)}个（{slots[0]}–{slots[-1]}，云端执行）" if slots else []
         return {'settings': settings, 'next_runs': next_runs(config, now()),
                 'fixed': {'cloud_sync_seconds': 60, 'dynamic_cycle_minutes': 30, 'maintenance_minutes': 60, 'followups_seconds': 60}}
+    if command == 'event-check':
+        from .event_review import check
+        store = Store(config['data_dir'])
+        try:
+            return check(store, config, args.symbol)
+        finally:store.close()
     if command in ('proposals', 'issues', 'guidance', 'maintenance', 'backtest'):
         store = Store(config['data_dir'])
         try:
