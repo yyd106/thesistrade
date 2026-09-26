@@ -37,7 +37,15 @@ def collect_batch(store,config,key=None,on_ready=None):
         return {'batch_id':batch['id'],'status':'ALREADY_DONE'}
     bid=batch['id']
     from .pipeline import collect
-    collect(store,bid,config,on_ready=lambda item: finish_stock(store,bid,item,on_ready))
+    from .connectivity import Offline
+    try:
+        collect(store,bid,config,on_ready=lambda item: finish_stock(store,bid,item,on_ready))
+    except Offline as exc:
+        # Stocks finished before the outage keep this batch; the rest keep their previous one.
+        with store.db:
+            store.db.execute("UPDATE batches SET finished_at=?,status='PARTIAL' WHERE id=?",(now(),bid))
+            store.db.execute("UPDATE runs SET as_of=?,finished_at=?,status='PARTIAL',error=? WHERE id=?",(now(),now(),str(exc)[:300],bid))
+        raise
     gaps=store.db.execute("SELECT count(*) FROM source_checks WHERE run_id=? AND status!='OK'",(bid,)).fetchone()[0]
     status='PARTIAL' if gaps else 'READY'
     with store.db:

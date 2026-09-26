@@ -225,9 +225,11 @@ def cycle(store,config,end=None,model_fn=None,collect_fn=None,impact_model_fn=No
  rid=digest('dynamic:'+stop+':'+at)[:24]
  with store.db:store.db.execute('INSERT OR REPLACE INTO dynamic_runs VALUES(?,?,?,?,?,?,?)',(rid,start,stop,at,None,'RUNNING','{}'))
  payload={};failures=[]
+ from .connectivity import check as online_or_stop
  try:
   payload=(collect_fn or data.collect)(store,start,stop,at)
   failures+=payload.get('failures',[])
+  online_or_stop(store)
   from . import macro,macro_sources,macro_impact,impact_history,news_triage
   from .observation_pool import reconcile
   from .news_evidence import fetch_missing
@@ -252,6 +254,7 @@ def cycle(store,config,end=None,model_fn=None,collect_fn=None,impact_model_fn=No
   payload['global_market_failures']=market_failures
   payload['global_measured']=macro.measure(store,now())
   busy=store.db.execute("SELECT 1 FROM jobs WHERE kind IN ('cycle','research','repair') AND status='RUNNING' LIMIT 1").fetchone()
+  online_or_stop(store)
   if selected_global and (model_fn or config['model_enabled']) and not busy:
    try:
     if model_fn is None:
@@ -295,6 +298,7 @@ def cycle(store,config,end=None,model_fn=None,collect_fn=None,impact_model_fn=No
    try:data.refresh_market(store,symbol,catalog)
    except Exception as exc:failures.append(symbol+' 动态行情/公告：'+str(exc)[:120])
   measured=measure(store,config,now());payload['measured']=measured
+  online_or_stop(store)
   busy=store.db.execute("SELECT 1 FROM jobs WHERE kind IN ('cycle','research','repair') AND status='RUNNING' LIMIT 1").fetchone()
   if selected and catalog and not model_fn and config['model_enabled'] and not busy:
    with store.db:store.db.executemany('UPDATE dynamic_news SET attempts=attempts+1 WHERE id=?',[(n['id'],) for n in selected])

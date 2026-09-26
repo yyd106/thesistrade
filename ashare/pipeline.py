@@ -63,7 +63,10 @@ def collect(store, run_id, config, on_ready=None):
         attempt('external_news','MARKET',lambda:collect_external(store,run_id,config))
     from . import market_context, fundamentals
     attempt('market_comparison','MARKET',lambda:market_context.collect_comparisons(store,run_id,config))
+    from .connectivity import check as online_or_stop
     for item in config["watchlist"]:
+        # Stop before the next stock once the machine has been offline for a while; research is redone after reconnect.
+        online_or_stop(store)
         symbol = item["symbol"]
         attempt("tencent_daily", symbol, lambda: sources.collect_history(store, run_id, symbol,config))
         attempt('financials',symbol,lambda:fundamentals.collect(store,run_id,symbol))

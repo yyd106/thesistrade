@@ -274,10 +274,14 @@ def sync_once(config):
             recovered_at=now()
             if offline_since:
                 # A brief deploy restart must not restart all 22 stocks' research.
+                failure=(value(store,'last_sync') or {}).get('error')
+                long_enough=(datetime.fromisoformat(recovered_at)-datetime.fromisoformat(offline_since)).total_seconds()>=120
                 with store.db:
-                    if (datetime.fromisoformat(recovered_at)-datetime.fromisoformat(offline_since)).total_seconds()>=120:
-                        put(store,'reconnect_pending',recovered_at)
+                    if long_enough:put(store,'reconnect_pending',recovered_at)
                     put(store,'offline_since',None)
+                if long_enough:
+                    from .connectivity import local_network_error,log_interval
+                    log_interval(store.root,'offline',offline_since,recovered_at,cause='NETWORK' if local_network_error(failure) else 'CLOUD')
             phase='publish';answer=flush(store,config)
             with store.db:put(store,'last_sync',{'at':now(),'status':'OK','ledger_version':packet['ledger_version']})
             return answer or {'status':'SYNCED'}
