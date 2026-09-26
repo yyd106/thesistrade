@@ -4,6 +4,9 @@ It summarizes what the automated pipeline and the operator agent did that day �
 portfolio decisions, cloud execution, the daily review and governance changes — so a supervisor can
 check direction without reading every model output. No model is called and nothing here is a judgment:
 flags are fixed rules over counts and times. Days are Beijing calendar days.
+
+Research does not have to run on schedule (user decision, 2026-09-26): time the machine spent offline or
+asleep is shown in its own section and is not flagged; the rules flag what went wrong while it was online.
 """
 import copy
 import json
@@ -11,6 +14,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from .storage import now, normalize_time, json_write
 from .calendar import SH, local
+from .connectivity import intervals, overlap_minutes, inside, offline_since, local_network_error
 
 BLOCKER_NAMES = {'RESEARCH_VETO': '研究否决', 'TREND_NOT_CONFIRMED': '趋势未确认', 'UNREAD_DOCUMENT': '关键资料未读',
                  'UNRESOLVED_EVENT': '事项待核验', 'CORPORATE_ACTION_UNVERIFIED': '公司行为待核验', 'SOURCE_GAP': '资料缺口',
@@ -22,13 +26,16 @@ ACTION_NAMES = {'ALLOW': '放行', 'HOLD': '保持', 'PAUSE': '暂停', 'REDUCE'
 STANCE_NAMES = {'LONG': '做多', 'WAIT': '观望'}
 STATUS_NAMES = {'SUCCEEDED': '成功', 'DONE': '完成', 'FAILED': '失败', 'DEFERRED': '推迟', 'INTERRUPTED': '中断', 'PENDING': '排队',
                 'RUNNING': '进行中', 'SKIPPED_CATCHUP': '合并跳过', 'MISSED': '错过', 'NOT_NEEDED': '无需分析', 'NONE': '无记录',
-                'SENT': '已送达', 'SUPERSEDED': '被新版本替代', 'EXPIRED': '发送前过期', 'STALE': '云端拒收'}
+                'SENT': '已送达', 'SUPERSEDED': '被新版本替代', 'EXPIRED': '发送前过期', 'STALE': '云端拒收', 'OFFLINE': '断网停止'}
 CHECK_NAMES = {'CHECK_BUY_OUTSIDE_PLAN_BAND': '买入价超出计划区间', 'CHECK_BUY_WITH_PLAN_BLOCKERS': '计划有限制仍买入',
                'CHECK_BUY_WITHOUT_PORTFOLIO_ALLOW': '无组合授权仍买入', 'CHECK_BUY_WHILE_HALTED': '熔断期间买入',
                'CHECK_SELL_WITHOUT_REASON': '卖出无依据', 'CHECK_LATE_QUOTE_IN_REVIEW': '复盘用到晚到行情', 'CHECK_SYNC_STALE': '云端同步超时',
                'CHECK_OUTBOX_BACKLOG': '待发送策略积压', 'CHECK_MODEL_IDENTITY': '模型与固定配置不一致',
                'CHECK_RESEARCH_FAILURE_RATE': '研究失败率过高', 'CHECK_DISK_SPACE': '磁盘空间不足'}
-DOCUMENT_NAMES = {'announcement': '公告', 'news': '新闻', 'report': '研报', 'financial_data': '财务数据', 'official_news': '官方新闻'}
+DOCUMENT_NAMES = {'announcement': '公告', 'announcement_metadata': '公告目录', 'company_report': '公司报告', 'report': '研报',
+                  'financial_data': '财务数据', 'news': '新闻', 'news_brief': '新闻摘要', 'news_index': '新闻索引', 'official_news': '官方新闻'}
+JOB_KIND_NAMES = {'dynamic_cycle': '动态新闻', 'global_research': '全球资产研究', 'portfolio_strategy': '组合决策'}
+LONG_CYCLE_MINUTES = 120  # a collection this long keeps portfolio decisions waiting
 NETWORK_ERRORS = ('nodename nor servname', 'Name or service not known', 'Temporary failure in name resolution',
                   'Network is unreachable', 'timed out', 'Connection refused', 'Connection reset')
 ENGINE_KINDS = ('slot', 'dynamic_slot', 'global_slot', 'settle')  # cloud-side work; never runs on the research node
@@ -57,6 +64,29 @@ def _hm(stamp):
     return local(stamp).strftime('%H:%M') if stamp else '—'
 
 
+def _md(stamp):
+    return local(stamp).strftime('%m-%d %H:%M') if stamp else '—'
+
+
+def _span(s, b=None):
+    """HH:MM–HH:MM inside one day; the day's end reads 24:00."""
+    return _hm(s['from']) + '–' + ('24:00' if b and s['to'] == b else _hm(s['to'])) + ('（进行中）' if s.get('ongoing') else '')
+
+
+def _hours(minutes):
+    return round((minutes or 0) / 60, 1)
+
+
+def _online_minutes(store, start, end):
+    total = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() / 60
+    return total - overlap_minutes(start, end, intervals(store.root, start, end))
+
+
+def _state(row):
+    """Jobs stopped because the machine went offline are expected at this stage, not failures."""
+    return 'OFFLINE' if row['status'] == 'DEFERRED' and (row.get('error') or '').startswith('OFFLINE:') else row['status']
+
+
 def _yuan(cents):
     return '—' if cents is None else f'{cents / 100:,.2f}'
 
@@ -74,41 +104,64 @@ def _names(config):
     return {i['symbol']: i.get('name') or i['symbol'] for i in config.get('watchlist', [])}
 
 
+def availability(store, a, b):
+    """Periods this machine was offline or its scheduler did not run (asleep, or the service stopped)."""
+    end = min(b, normalize_time(now()))
+    spans = intervals(store.root, a, b)
+    current = offline_since(store)
+    if current and current < end and not any(s['kind'] == 'offline' and s['to'] >= end for s in spans):
+        start = max(current, a)
+        spans.append({'kind': 'offline', 'from': start, 'to': end, 'cause': 'NETWORK', 'ongoing': True,
+                      'minutes': round((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() / 60)})
+    offline = [s for s in spans if s['kind'] == 'offline']
+    paused = [s for s in spans if s['kind'] == 'pause']
+    return {'spans': sorted(spans, key=lambda s: s['from']), 'offline_minutes': round(overlap_minutes(a, end, offline)),
+            'paused_minutes': round(overlap_minutes(a, end, paused)), 'away_minutes': round(overlap_minutes(a, end, spans))}
+
+
 def jobs(store, a, b):
     rows = [r for r in _rows(store, 'SELECT id,kind,scheduled_at,started_at,finished_at,status,error FROM jobs WHERE scheduled_at>=? AND scheduled_at<? ORDER BY scheduled_at', (a, b))
             if r['kind'] not in ENGINE_KINDS and r['status'] not in ('MIGRATED', 'LOCAL_ONLY')]
     kinds = {}
     for r in rows:
-        k = kinds.setdefault(r['kind'], Counter())
-        k[r['status']] += 1
+        r['state'] = _state(r)
+        kinds.setdefault(r['kind'], Counter())[r['state']] += 1
     longest = {}
+    long_cycles = []
     for r in rows:
         if r['started_at'] and r['finished_at']:
             minutes = round((datetime.fromisoformat(r['finished_at']) - datetime.fromisoformat(r['started_at'])).total_seconds() / 60)
             longest[r['kind']] = max(longest.get(r['kind'], 0), minutes)
+            if r['kind'] in ('cycle', 'collect', 'research') and minutes >= LONG_CYCLE_MINUTES:
+                online = round(_online_minutes(store, r['started_at'], r['finished_at']))
+                if online >= LONG_CYCLE_MINUTES:
+                    long_cycles.append({'kind': r['kind'], 'at': r['scheduled_at'], 'minutes': minutes, 'online_minutes': online})
     failed = [{'kind': r['kind'], 'at': r['scheduled_at'], 'status': r['status'], 'error': (r['error'] or '')[:120]}
-              for r in rows if r['status'] in ('FAILED', 'DEFERRED', 'INTERRUPTED')]
+              for r in rows if r['state'] in ('FAILED', 'DEFERRED', 'INTERRUPTED')]
     return {'by_kind': {k: dict(v) for k, v in sorted(kinds.items())}, 'longest_minutes': longest, 'failed': failed,
-            'reconnect_recoveries': sum(1 for r in rows if r['id'].startswith('reconnect:'))}
+            'offline_stopped': [{'kind': r['kind'], 'at': r['scheduled_at']} for r in rows if r['state'] == 'OFFLINE'],
+            'long_cycles': long_cycles, 'reconnect_recoveries': sum(1 for r in rows if r['id'].startswith('reconnect:'))}
 
 
-def collection(store, a, b):
+def collection(store, a, b, spans=()):
     from .presentation import SOURCE_NAMES
-    rows = _rows(store, "SELECT source,status,detail FROM data_attempts WHERE checked_at>=? AND checked_at<? AND source NOT IN ('research_analysis','review_analysis')", (a, b))
+    rows = _rows(store, "SELECT source,status,detail,checked_at FROM data_attempts WHERE checked_at>=? AND checked_at<? AND source NOT IN ('research_analysis','review_analysis')", (a, b))
     failed = [r for r in rows if r['status'] == 'FAILED']
-    by_source = Counter(r['source'] for r in failed)
+    online_failed = [r for r in failed if not inside(r['checked_at'], spans)]
+    by_source = Counter(r['source'] for r in online_failed)
     network = sum(1 for r in failed if any(e in (r['detail'] or '') for e in NETWORK_ERRORS))
     documents = {r['kind']: r['n'] for r in _rows(store, 'SELECT kind,count(*) n FROM documents WHERE first_seen_at>=? AND first_seen_at<? GROUP BY kind', (a, b))}
     return {'attempts': len(rows), 'failed': len(failed), 'network_errors': network,
+            'attempts_offline': sum(1 for r in rows if inside(r['checked_at'], spans)), 'failed_offline': len(failed) - len(online_failed),
             'top_failures': [{'source': s, 'name': SOURCE_NAMES.get(s, s), 'count': n} for s, n in by_source.most_common(5)],
             'new_documents': documents}
 
 
-def research(store, config, a, b):
+def research(store, config, a, b, spans=()):
     names = _names(config)
-    studies = _rows(store, 'SELECT symbol,model_status FROM studies WHERE created_at>=? AND created_at<?', (a, b))
+    studies = _rows(store, 'SELECT symbol,model_status,created_at FROM studies WHERE created_at>=? AND created_at<?', (a, b))
     renewed = _rows(store, "SELECT count(*) n FROM plan_events WHERE at>=? AND at<? AND reason LIKE 'RENEWED:%'", (a, b))
-    failures = _rows(store, "SELECT count(*) n FROM data_attempts WHERE checked_at>=? AND checked_at<? AND source='research_analysis' AND status='FAILED'", (a, b))
+    failures = _rows(store, "SELECT checked_at FROM data_attempts WHERE checked_at>=? AND checked_at<? AND source='research_analysis' AND status='FAILED'", (a, b))
     models = Counter()
     stocks = []
     for symbol, name in names.items():
@@ -142,8 +195,10 @@ def research(store, config, a, b):
                              'blockers': _blockers(payload.get('blockers')), 'updated': r['created_at'] >= a})
     cases = Counter(r['status'] for r in _rows(store, 'SELECT status FROM dynamic_cases WHERE created_at>=? AND created_at<?', (a, b)))
     return {'model_studies': Counter(s['model_status'] for s in studies), 'renewed': renewed[0]['n'] if renewed else 0,
-            'analysis_failures': failures[0]['n'] if failures else 0, 'models': dict(models), 'stocks': stocks,
-            'global': global_plans, 'dynamic_new_cases': dict(cases)}
+            'studies_offline': sum(1 for s in studies if inside(s['created_at'], spans)),
+            'unsuccessful_offline': sum(1 for s in studies if s['model_status'] != 'SUCCEEDED' and inside(s['created_at'], spans)),
+            'analysis_failures': len(failures), 'analysis_failures_offline': sum(1 for f in failures if inside(f['checked_at'], spans)),
+            'models': dict(models), 'stocks': stocks, 'global': global_plans, 'dynamic_new_cases': dict(cases)}
 
 
 def portfolio(store, a, b):
@@ -172,14 +227,28 @@ def portfolio(store, a, b):
     prior = _rows(store, "SELECT max(created_at) t FROM cloud_outbox WHERE status='SENT' AND created_at<?", (a,))
     end = min(b, normalize_time(now()))
     points = ([prior[0]['t']] if prior and prior[0]['t'] else []) + sent + [end]
-    gaps = [(datetime.fromisoformat(y) - datetime.fromisoformat(x)).total_seconds() / 3600 for x, y in zip(points, points[1:])]
+    current = offline_since(store)
+    gaps = []
+    for x, y in zip(points, points[1:]):
+        if y <= x:
+            continue
+        spans = intervals(store.root, x, y) + ([{'from': max(current, x), 'to': y}] if current and current < y else [])
+        hours = (datetime.fromisoformat(y) - datetime.fromisoformat(x)).total_seconds() / 3600
+        away = overlap_minutes(x, y, spans) / 60
+        gaps.append({'from': x, 'to': y, 'hours': round(hours, 1), 'away_hours': round(away, 1), 'online_hours': round(hours - away, 1)})
+    job_rows = [{**r, 'state': _state(r)} for r in _rows(store, "SELECT status,error FROM jobs WHERE kind='portfolio_strategy' AND scheduled_at>=? AND scheduled_at<?", (a, b))]
+    reasons = Counter('同步占用' if (r['error'] or '').startswith('RuntimeError: BUSY') else '断网' if local_network_error(r['error']) else '其他'
+                      for r in job_rows if r['state'] == 'FAILED')
+    longest = max(gaps, key=lambda g: g['hours'], default=None)
     return {'runs': dict(runs), 'decisions_made': len(made), 'latest_at': latest_at,
+            'jobs': dict(Counter(r['state'] for r in job_rows)), 'job_failure_reasons': dict(reasons),
+            'longest_gap': longest, 'longest_online_gap': max(gaps, key=lambda g: g['online_hours'], default=None),
             'latest_actions': dict(Counter(d.get('action') for d in decisions)),
             'latest_target_bps': sum(d.get('target_bps') or 0 for d in decisions),
             'latest_summary': (latest.get('summary') or '')[:160], 'changes': changes,
             'publications': dict(Counter(r['status'] for r in outbox)),
             'publication_bytes': {'max': max((s for s in sizes if s), default=None), 'last': sizes[-1] if sizes else None},
-            'longest_gap_hours': round(max(gaps), 1) if gaps else None}
+            'longest_gap_hours': longest['hours'] if longest else None}
 
 
 def execution(store, config, a, b):
@@ -259,58 +328,77 @@ def governance(store, a, b):
 
 
 def flags(d, config, today):
-    """Fixed rules over the day's counts. They point at where to look; they are not conclusions."""
+    """Fixed rules over the day's counts. They point at where to look; they are not conclusions.
+    Offline and paused time is excluded: at this stage research may wait until the machine is back."""
     out = []
+    spans = d['availability']['spans']
     c = d['collection']
-    if c['attempts'] >= 20 and c['failed'] * 5 >= c['attempts']:
-        out.append(f"抓取失败率 {c['failed'] * 100 // c['attempts']}%（{c['failed']}/{c['attempts']}）" + (f"，其中网络类错误 {c['network_errors']} 次" if c['network_errors'] else ''))
+    attempts, failed = c['attempts'] - c['attempts_offline'], c['failed'] - c['failed_offline']
+    if attempts >= 20 and failed * 5 >= attempts:
+        out.append(f"联网期间抓取失败率 {failed * 100 // attempts}%（{failed}/{attempts}）")
     failed_cycles = [j for j in d['jobs']['failed'] if j['kind'] in ('cycle', 'collect', 'research')]
     if failed_cycles:
         out.append(f"资料研究任务未完成 {len(failed_cycles)} 次（最晚 {_hm(failed_cycles[-1]['at'])} 那轮）")
+    long_cycles = d['jobs'].get('long_cycles') or []
+    if long_cycles:
+        worst = max(long_cycles, key=lambda j: j['online_minutes'])
+        out.append(f"资料研究在联网状态下耗时 {worst['online_minutes']} 分钟（{_hm(worst['at'])} 那轮），超过 {LONG_CYCLE_MINUTES // 60} 小时；运行期间组合决策排队")
     r = d['research']
-    studied = sum(r['model_studies'].values())
-    if r['analysis_failures'] >= 3 or studied and r['model_studies'].get('FAILED', 0) * 10 >= studied * 3:
-        out.append(f"研究模型调用失败 {max(r['analysis_failures'], r['model_studies'].get('FAILED', 0))} 次")
+    studied = sum(r['model_studies'].values()) - r['studies_offline']
+    unsuccessful = studied + r['studies_offline'] - r['model_studies'].get('SUCCEEDED', 0) - r['unsuccessful_offline']
+    if unsuccessful >= 5 and unsuccessful * 10 >= studied:
+        out.append(f"联网期间研究模型调用失败 {unsuccessful} 次（占 {unsuccessful * 100 // max(studied, 1)}%）")
     pinned = config.get('model_name')
     other = [m for m in r['models'] if pinned and m != pinned]
     if other:
         out.append('研究实际使用了非固定模型：' + '、'.join(other))
     p = d['portfolio']
-    if p['longest_gap_hours'] is not None and p['longest_gap_hours'] >= 3:
-        out.append(f"组合策略发布最长间隔 {p['longest_gap_hours']} 小时（云端 12 小时收不到新策略就停止新买入）")
+    longest, online = p.get('longest_gap'), p.get('longest_online_gap')
+    halted = longest if longest and longest['hours'] >= 12 else None
+    if halted:
+        out.append(f"组合策略 {halted['hours']} 小时没有发布（{_md(halted['from'])} 至 {_md(halted['to'])}"
+                   + (f"，其中离线或停顿 {halted['away_hours']} 小时" if halted['away_hours'] else '') + '），超过 12 小时，云端停止了新买入')
+    if online and online['online_hours'] >= 3 and not (halted and halted['from'] == online['from']):
+        out.append(f"组合策略在联网状态下 {online['online_hours']} 小时没有发布（{_md(online['from'])} 至 {_md(online['to'])}）")
     if not p['publications'].get('SENT'):
-        out.append('当天没有成功发布到云端的组合策略')
-    review_hour = int(config.get('review_time', '19:30').split(':')[0])
-    if d['review']['status'] not in ('SUCCEEDED', 'NOT_NEEDED') and (not today or local(now()).hour > review_hour):
-        out.append('当天复盘未成功（' + STATUS_NAMES.get(d['review']['status'], str(d['review']['status'])) + '）')
+        away = d['availability']['away_minutes']
+        out.append('当天没有成功发布到云端的组合策略' + (f"（当天离线或停顿 {_hours(away)} 小时）" if away else ''))
+    review_time = config.get('review_time', '19:30')
+    review_at = normalize_time(f"{d['day']}T{review_time}:00+08:00")
+    if d['review']['status'] not in ('SUCCEEDED', 'NOT_NEEDED') and (not today or normalize_time(now()) >= review_at):
+        if inside(review_at, spans):
+            out.append('当天复盘未完成：复盘时间本机离线或停顿，联网后补做')
+        else:
+            out.append('当天复盘未成功（' + STATUS_NAMES.get(d['review']['status'], str(d['review']['status'])) + '）')
     if d['review'].get('checks_failed'):
         out.append('复盘程序检查未通过：' + '、'.join(CHECK_NAMES.get(c, c) for c in d['review']['checks_failed']))
     if d['execution']['risk'].get('halted'):
         out.append('风控已触发暂停')
     g = d['governance']
-    strategy_changes = [x['key'] for x in g['config_changes'] if x.get('class') == 'STRATEGY']
+    strategy_changes = list(dict.fromkeys(x['key'] for x in g['config_changes'] if x.get('class') == 'STRATEGY'))
     if strategy_changes:
         out.append('策略类设置被修改：' + '、'.join(strategy_changes))
     if g['issues_new']:
         out.append(f"新增工程问题 {len(g['issues_new'])} 条")
-    if d['jobs']['reconnect_recoveries']:
-        out.append('服务曾中断或断网，恢复后补跑了任务')
     return out
 
 
 # Neutral values used when a section cannot be built; the page then says so instead of implying nothing happened.
-EMPTY = {'jobs': {'by_kind': {}, 'longest_minutes': {}, 'failed': [], 'reconnect_recoveries': 0},
-         'collection': {'attempts': 0, 'failed': 0, 'network_errors': 0, 'top_failures': [], 'new_documents': {}},
-         'research': {'model_studies': {}, 'renewed': 0, 'analysis_failures': 0, 'models': {}, 'stocks': [], 'global': [], 'dynamic_new_cases': {}},
-         'portfolio': {'runs': {}, 'decisions_made': 0, 'latest_at': None, 'latest_actions': {}, 'latest_target_bps': 0, 'latest_summary': '',
+EMPTY = {'availability': {'spans': [], 'offline_minutes': 0, 'paused_minutes': 0, 'away_minutes': 0},
+         'jobs': {'by_kind': {}, 'longest_minutes': {}, 'failed': [], 'offline_stopped': [], 'long_cycles': [], 'reconnect_recoveries': 0},
+         'collection': {'attempts': 0, 'failed': 0, 'network_errors': 0, 'attempts_offline': 0, 'failed_offline': 0, 'top_failures': [], 'new_documents': {}},
+         'research': {'model_studies': {}, 'renewed': 0, 'studies_offline': 0, 'unsuccessful_offline': 0, 'analysis_failures': 0,
+                      'analysis_failures_offline': 0, 'models': {}, 'stocks': [], 'global': [], 'dynamic_new_cases': {}},
+         'portfolio': {'runs': {}, 'decisions_made': 0, 'latest_at': None, 'jobs': {}, 'job_failure_reasons': {}, 'longest_gap': None,
+                       'longest_online_gap': None, 'latest_actions': {}, 'latest_target_bps': 0, 'latest_summary': '',
                        'changes': [], 'publications': {}, 'publication_bytes': {'max': None, 'last': None}, 'longest_gap_hours': None},
          'execution': {'fills': {}, 'orders_created': {}, 'equity_start_cents': None, 'equity_end_cents': None, 'cash_end_cents': None,
                        'marked_at': None, 'positions': [], 'risk': {}},
          'review': {'status': 'NONE'},
          'governance': {'config_changes': [], 'proposals_new': [], 'proposals_decided': [], 'guidance_changes': [], 'issues_new': [],
                         'issues_recurring': 0, 'issues_resolved': [], 'new_builds': [], 'agent_notes': []}}
-SECTION_TITLES = {'jobs': '任务运行', 'collection': '抓取', 'research': '研究', 'portfolio': '组合策略', 'execution': '云端执行',
-                  'review': '复盘', 'governance': '调整与治理'}
+SECTION_TITLES = {'availability': '本机在线', 'jobs': '任务运行', 'collection': '抓取', 'research': '研究', 'portfolio': '组合策略',
+                  'execution': '云端执行', 'review': '复盘', 'governance': '调整与治理'}
 
 
 def _safe(name, fn):
@@ -327,8 +415,10 @@ def build(store, config, day):
     from .build import info
     d = {'day': day, 'generated_at': normalize_time(now()), 'window': {'from': a, 'to': b}, 'version': __version__,
          'build_id': info(config, store)['build_id']}
-    for name, fn in (('jobs', lambda: jobs(store, a, b)), ('collection', lambda: collection(store, a, b)),
-                     ('research', lambda: research(store, config, a, b)), ('portfolio', lambda: portfolio(store, a, b)),
+    d['availability'] = _safe('availability', lambda: availability(store, a, b))
+    spans = d['availability']['spans']
+    for name, fn in (('jobs', lambda: jobs(store, a, b)), ('collection', lambda: collection(store, a, b, spans)),
+                     ('research', lambda: research(store, config, a, b, spans)), ('portfolio', lambda: portfolio(store, a, b)),
                      ('execution', lambda: execution(store, config, a, b)), ('review', lambda: review(store, a, b)),
                      ('governance', lambda: governance(store, a, b))):
         d[name] = _safe(name, fn)
@@ -345,21 +435,42 @@ def _failed(section):
     return [f"- 本节生成失败（{section['error']}），下列数值为空，不代表当天没有发生。", ''] if section.get('error') else []
 
 
-def markdown(d):
+def _job_names():
     from .followups import JOB_NAMES
+    return {**JOB_NAMES, **JOB_KIND_NAMES}
+
+
+def markdown(d):
+    names = _job_names()
+    b = d['window']['to']
     L = [f"# 运行日报 {d['day']}（北京时间）", '',
          f"程序根据原始记录生成，不含模型判断。版本 {d['version']}，build {d['build_id']}，生成于 {local(d['generated_at']).strftime('%m-%d %H:%M')}。", '',
          '## 需要关注', '']
     L += [f'- {f}' for f in d['flags']] or ['- 无。']
+    v = d['availability']
+    L += ['', '## 本机在线', ''] + _failed(v)
+    offline = [s for s in v['spans'] if s['kind'] == 'offline']
+    paused = [s for s in v['spans'] if s['kind'] == 'pause']
+    if offline:
+        L.append(f"- 断网 {len(offline)} 次，共 {_hours(v['offline_minutes'])} 小时：" + '、'.join(_span(s, b) for s in offline) + '。')
+    if paused:
+        L.append(f"- 停顿 {len(paused)} 次，共 {_hours(v['paused_minutes'])} 小时（电脑睡眠或服务停止）：" + '、'.join(_span(s, b) for s in paused) + '。')
+    stopped = Counter(names.get(j['kind'], j['kind']) for j in d['jobs'].get('offline_stopped') or [])
+    if stopped:
+        L.append('- 断网时停止、联网后重做的任务：' + '、'.join(f'{k} {n}' for k, n in stopped.items()) + '。')
+    if not offline and not paused:
+        L.append('- 没有断网或停顿记录。')
     c = d['collection']
-    L += ['', '## 抓取', ''] + _failed(c) + [f"- 采集尝试 {c['attempts']} 次，失败 {c['failed']} 次" + (f"（网络类错误 {c['network_errors']} 次）" if c['network_errors'] else '') + '。']
+    L += ['', '## 抓取', ''] + _failed(c) + [f"- 采集尝试 {c['attempts']} 次，失败 {c['failed']} 次" + (f"（网络类错误 {c['network_errors']} 次）" if c['network_errors'] else '')
+                                              + (f"；其中离线或停顿期间尝试 {c['attempts_offline']} 次、失败 {c['failed_offline']} 次" if c['attempts_offline'] else '') + '。']
     if c['top_failures']:
-        L.append('- 失败最多：' + '、'.join(f"{x['name']} {x['count']}" for x in c['top_failures']) + '。')
+        L.append('- 联网期间失败最多：' + '、'.join(f"{x['name']} {x['count']}" for x in c['top_failures']) + '。')
     L.append('- 新入库资料：' + _counts(dict(sorted(c['new_documents'].items())), DOCUMENT_NAMES) + '。')
     r = d['research']
     studies = r['model_studies']
-    L += ['', '## 研究', ''] + _failed(r) + [f"- 模型研究 {sum(studies.values())} 次（成功 {studies.get('SUCCEEDED', 0)}），资料未变沿用结论 {r['renewed']} 次，研究生成失败 {r['analysis_failures']} 次。"
-          + (' 实际模型：' + '、'.join(f'{m} {n}' for m, n in r['models'].items()) + '。' if r['models'] else ''), '',
+    L += ['', '## 研究', ''] + _failed(r) + [f"- 模型研究 {sum(studies.values())} 次（成功 {studies.get('SUCCEEDED', 0)}），资料未变沿用结论 {r['renewed']} 次，研究生成失败 {r['analysis_failures']} 次"
+          + (f"（其中离线期间 {r['analysis_failures_offline']} 次）" if r['analysis_failures_offline'] else '') + '。'
+          + (' 当前计划所用模型：' + '、'.join(f'{m}（{n} 只）' for m, n in r['models'].items()) + '。' if r['models'] else ''), '',
           '| 股票 | 研究结论 | 计划 | 主要限制 | 来源 | 较前日 |', '|---|---|---|---|---|---|']
     for s in r['stocks']:
         L.append(f"| {s['name']} | {RESEARCH_NAMES.get(s['research'], s['research'] or '—')} | {PLAN_NAMES.get(s['plan'], s['plan'] or '—')} | "
@@ -370,12 +481,15 @@ def markdown(d):
     if r['dynamic_new_cases']:
         L.append('- 新闻发现的新候选：' + '、'.join(f'{k} {v}' for k, v in r['dynamic_new_cases'].items()) + '。')
     p = d['portfolio']
-    L += ['', '## 组合策略', ''] + _failed(p) + [f"- 组合决策运行 {sum(p['runs'].values())} 次（{_counts(p['runs'])}），发布到云端：{_counts(p['publications'])}"
-          + (f"；最长间隔 {p['longest_gap_hours']} 小时" if p['longest_gap_hours'] is not None else '') + '。']
+    gap = p.get('longest_gap')
+    L += ['', '## 组合策略', ''] + _failed(p) + [f"- 组合决策运行 {sum(p['runs'].values())} 次（{_counts(p['runs'])}）；组合决策任务：{_counts(p['jobs'])}"
+          + (f"（失败原因：{'、'.join(f'{k} {n}' for k, n in p['job_failure_reasons'].items())}）" if p['job_failure_reasons'] else '') + '。',
+          f"- 发布到云端：{_counts(p['publications'])}"
+          + (f"；最长间隔 {gap['hours']} 小时（{_md(gap['from'])} 至 {_md(gap['to'])}" + (f"，其中离线或停顿 {gap['away_hours']} 小时" if gap['away_hours'] else '') + '）' if gap else '') + '。']
     if p['publication_bytes']['last']:
         L.append(f"- 策略包大小：最后一次 {p['publication_bytes']['last'] / 1e6:.1f} MB，最大 {p['publication_bytes']['max'] / 1e6:.1f} MB。")
     if p['latest_at']:
-        L.append(f"- 最新决策（{local(p['latest_at']).strftime('%m-%d %H:%M')}）：" + '、'.join(f"{ACTION_NAMES.get(k, k)} {v}" for k, v in p['latest_actions'].items())
+        L.append(f"- 最新决策（{_md(p['latest_at'])}）：" + '、'.join(f"{ACTION_NAMES.get(k, k)} {v}" for k, v in p['latest_actions'].items())
                  + f"；目标总仓位 {p['latest_target_bps'] / 100:.1f}%。")
         L.append('- 与前一日最后决策相比：' + ('；'.join(f"{x['name']} {ACTION_NAMES.get(x['from'], x['from'])}→{ACTION_NAMES.get(x['to'], x['to'])}"
                                                    + (f"（目标 {(x['from_bps'] or 0) / 100:.1f}%→{(x['to_bps'] or 0) / 100:.1f}%）" if x['from_bps'] != x['to_bps'] else '')
@@ -421,7 +535,7 @@ def markdown(d):
         L.append('- 桌面 agent 笔记：' + '、'.join(g['agent_notes']) + '。')
     j = d['jobs']
     L += ['', '## 任务运行', ''] + _failed(j) + ['| 任务 | 结果 | 最长耗时（分钟） |', '|---|---|---|']
-    L += [f"| {JOB_NAMES.get(k, k)} | {_counts(v)} | {j['longest_minutes'].get(k, '—')} |" for k, v in j['by_kind'].items()] or ['| — | 当天没有任务记录 | — |']
+    L += [f"| {names.get(k, k)} | {_counts(v)} | {j['longest_minutes'].get(k, '—')} |" for k, v in j['by_kind'].items()] or ['| — | 当天没有任务记录 | — |']
     return '\n'.join(L) + '\n'
 
 
@@ -448,12 +562,16 @@ def rollup(store, config, since, until=None):
         days.append(build(store, config, cursor.isoformat()))
         cursor += timedelta(days=1)
     L = [f'# 运行汇总 {since} 至 {until}（北京时间）', '', '程序根据原始记录生成，不含模型判断；每天的明细见 workflow/digests/<日期>.md。', '',
-         '## 逐日概况', '', '| 日期 | 抓取失败 | 模型研究 / 沿用 / 失败 | 组合发布 / 最长间隔 | 成交笔数 | 净值（元） | 复盘 | 需关注 |', '|---|---|---|---|---|---|---|---|']
+         '## 逐日概况', '', '“离线 / 停顿”是本机断网和调度停止（睡眠或服务停止）的小时数；“最长间隔”括号里是其中离线或停顿的小时数。', '',
+         '| 日期 | 离线 / 停顿 | 抓取失败 | 模型研究 / 沿用 / 失败 | 组合发布 / 最长间隔 | 成交笔数 | 净值（元） | 复盘 | 需关注 |', '|---|---|---|---|---|---|---|---|---|']
     for d in days:
-        r, p, e = d['research'], d['portfolio'], d['execution']
+        r, p, e, v = d['research'], d['portfolio'], d['execution'], d['availability']
         trades = sum(f['buy'] + f['sell'] for f in e['fills'].values())
-        L.append(f"| {d['day']} | {d['collection']['failed']}/{d['collection']['attempts']} | {sum(r['model_studies'].values())} / {r['renewed']} / {r['analysis_failures']} | "
-                 f"{p['publications'].get('SENT', 0)} / {p['longest_gap_hours'] if p['longest_gap_hours'] is not None else '—'}h | {trades} | {_yuan(e['equity_end_cents'])} | "
+        gap = p.get('longest_gap')
+        away = f"{_hours(v['offline_minutes'])}h / {_hours(v['paused_minutes'])}h" if v['offline_minutes'] or v['paused_minutes'] else '—'
+        interval = (f"{gap['hours']}h" + (f"（{gap['away_hours']}h）" if gap['away_hours'] else '')) if gap else '—'
+        L.append(f"| {d['day']} | {away} | {d['collection']['failed']}/{d['collection']['attempts']} | {sum(r['model_studies'].values())} / {r['renewed']} / {r['analysis_failures']} | "
+                 f"{p['publications'].get('SENT', 0)} / {interval} | {trades} | {_yuan(e['equity_end_cents'])} | "
                  f"{STATUS_NAMES.get(d['review']['status'], d['review']['status'])} | {len(d['flags'])} |")
     L += ['', '## 需要关注（按日期）', '']
     L += [f"- {d['day']}：{f}" for d in days for f in d['flags']] or ['- 无。']
