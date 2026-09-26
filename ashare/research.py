@@ -161,7 +161,9 @@ def make_snapshot(store,config,symbol,batch_id=None,at=None,persist=True):
         if f:
             latest_feature={**json.loads(f['payload']),'ready_at':f['created_at'],'feature_run_id':f['run_id']}
     from .event_review import evaluate
-    event_reviews,comparable=evaluate(store,symbol,mandatory,chunks,latest_feature,stamp)
+    from .dividends import supported
+    # Shares held at a record date are verified only when the executing ledger credits the dividend.
+    event_reviews,comparable=evaluate(store,symbol,mandatory,chunks,latest_feature,stamp,credits=supported(store,config))
     if latest_feature and comparable:latest_feature['unadjusted']=comparable
     # Review lessons are unvalidated hypotheses and never enter research. Only guidance adopted
     # from a user-approved proposal does (governance.adopt), and it is versioned in the build id.

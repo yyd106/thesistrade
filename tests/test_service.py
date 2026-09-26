@@ -58,3 +58,30 @@ class LaunchdSequenceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ModelShutdownTests(unittest.TestCase):
+    """Stopping the service signals each model session; a group macOS will not signal (EPERM, only a
+    zombie left) must not abort the shutdown or the remaining sessions (seen 2026-09-26 14:37)."""
+
+    def test_permission_error_falls_back_to_the_child_and_never_raises(self):
+        from ashare import model
+        signalled = []
+
+        class Proc:
+            def __init__(self, pid):self.pid = pid
+            def poll(self):return None
+            def send_signal(self, sig):signalled.append(('child', self.pid))
+
+        def killpg(pid, sig):
+            if pid == 1:raise PermissionError(1, 'Operation not permitted')
+            if pid == 2:raise ProcessLookupError(3, 'No such process')
+            signalled.append(('group', pid))
+
+        procs = {Proc(1), Proc(2), Proc(3)}
+        with patch.object(model, '_processes', procs), patch('ashare.model.os.killpg', side_effect=killpg):
+            try:
+                model.cancel_models()
+            finally:
+                model._stopping.clear()
+        self.assertEqual(sorted(signalled), [('child', 1), ('child', 2), ('group', 3)])

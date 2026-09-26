@@ -74,6 +74,7 @@ def main():
     sub.add_parser('guidance', help='列出已上线的研究规则')
     evc = sub.add_parser('event-check', help='按当前规则重放各股的公司行为核验：哪些公告仍阻挡买入、原因是什么（只读，不调用模型）')
     evc.add_argument('--symbol', action='append', help='只查指定代码，可重复；默认全部自选股')
+    sub.add_parser('dividends', help='已记入模拟账户的现金分红，以及持仓已收分红（只读；入账由云端执行）')
     dg = sub.add_parser('digest', help='运行日报：一页汇总当天的抓取、研究、组合策略、执行、复盘与调整（程序生成，不调用模型）')
     dg.add_argument('--date', help='某一天（YYYY-MM-DD，北京时间），默认今天')
     dg.add_argument('--since', help='汇总区间起点（YYYY-MM-DD），生成多日汇总')
@@ -213,6 +214,18 @@ def extended(args, config):
         store = Store(config['data_dir'])
         try:
             return check(store, config, args.symbol)
+        finally:store.close()
+    if command == 'dividends':
+        from .dividends import due, history, supported
+        from .paper import positions
+        store = Store(config['data_dir'])
+        try:
+            stamp = now();held = positions(store, stamp);expected = due(store, stamp)
+            return {'executing_ledger_credits': supported(store, config), 'credits': history(store),
+                    # On the research node a newly verified dividend is listed here until the next publication
+                    # reaches the cloud and it credits (minutes); one listed for hours is an error to report.
+                    'due': expected['due'], 'not_yet_credited': [d for d in expected['due'] if not d['credited']], 'conflicts': expected['conflicts'],
+                    'held': {s: {k: p.get(k, 0) for k in ('qty', 'cost_cents', 'dividend_cents')} for s, p in held.items()}}
         finally:store.close()
     if command in ('proposals', 'issues', 'guidance', 'maintenance', 'backtest'):
         store = Store(config['data_dir'])

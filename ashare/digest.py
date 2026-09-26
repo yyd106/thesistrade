@@ -280,7 +280,14 @@ def execution(store, config, a, b):
         positions.sort(key=lambda p: -p['value_cents'])
     risk = _rows(store, 'SELECT payload_json FROM portfolio_risk ORDER BY updated_at DESC LIMIT 1')
     risk = _json(risk[0]['payload_json'], {}) if risk else {}
-    return {'fills': fills, 'orders_created': dict(orders),
+    from .dividends import parse, KIND
+    dividends = []
+    for r in _rows(store, 'SELECT reference,amount_cents FROM paper_flows WHERE kind=? AND created_at>=? AND created_at<? ORDER BY created_at', (KIND, a, b)):
+        d = parse(r['reference'])
+        if d:
+            dividends.append({'symbol': d['symbol'], 'name': _names(config).get(d['symbol'], d['symbol']), 'ex_date': d['ex_date'],
+                              'qty': d['qty'], 'cash_per_share': format(d['cash'], 'f'), 'amount_cents': r['amount_cents']})
+    return {'fills': fills, 'orders_created': dict(orders), 'dividends': dividends,
             'equity_start_cents': start['equity_cents'] if start else None, 'equity_end_cents': end['equity_cents'] if end else None,
             'cash_end_cents': end['cash_cents'] if end else None, 'marked_at': end['at'] if end else None,
             'positions': positions[:8], 'risk': {k: risk.get(k) for k in ('status', 'halted', 'drawdown_bps', 'peak_equity_cents') if k in risk}}
@@ -514,6 +521,8 @@ def markdown(d):
         L += [f"- {route}：买入成交 {f['buy']} 笔、卖出 {f['sell']} 笔，已实现 {_yuan(f['realized_cents'])} 元（{'、'.join(f['symbols'])}）。" for route, f in e['fills'].items()]
     else:
         L.append('- 当天没有成交。')
+    for x in e.get('dividends', []):
+        L.append(f"- 分红入账：{x['name']} {x['qty']} 股 × 每股 {x['cash_per_share']} 元 = {_yuan(x['amount_cents'])} 元（税前，除息日 {x['ex_date']}）。")
     if e['equity_end_cents'] is not None:
         change = '' if e['equity_start_cents'] is None else f"，较前一日 {(e['equity_end_cents'] - e['equity_start_cents']) / 100:+,.2f} 元"
         L.append(f"- 净值 {_yuan(e['equity_end_cents'])} 元{change}；现金 {_yuan(e['cash_end_cents'])} 元（估值于 {_hm(e['marked_at'])}）。")

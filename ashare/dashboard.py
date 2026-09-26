@@ -361,13 +361,15 @@ def serve(config_path,port=None):
         def stop_service(signum,frame):
             scheduler.stop.set()
             from .model import cancel_models
-            cancel_models()
-            threading.Thread(target=http.shutdown,daemon=True).start()
+            try:cancel_models()
+            finally:threading.Thread(target=http.shutdown,daemon=True).start()
         old_handler=signal.signal(signal.SIGTERM,stop_service)
         print(f'本地控制台 http://127.0.0.1:{port} · 仅模拟 · Ctrl+C停止',flush=True)
         try:http.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:pass
         finally:
             from .model import cancel_models
-            cancel_models();signal.signal(signal.SIGTERM,old_handler)
-            scheduler.stop.set();http.server_close();thread.join(timeout=15);scheduler.close()
+            try:cancel_models()
+            finally:
+                signal.signal(signal.SIGTERM,old_handler)
+                scheduler.stop.set();http.server_close();thread.join(timeout=15);scheduler.close()

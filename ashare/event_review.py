@@ -36,8 +36,10 @@ from decimal import Decimal, ROUND_FLOOR
 from .finance import cents
 from .storage import normalize_time, CHUNK_STEP
 from .calendar import local, trading_day, previous_trading_day
+from .materiality import DIVIDEND_IMPLEMENTATION_ADDED
+from .dividends import held_at_record
 
-RULE_VERSION='cash_dividend_review_v2.1'
+RULE_VERSION='cash_dividend_review_v2.2'
 RESOLUTIONS=('UNSUPPORTED','EVIDENCE','LINKED','WAIT')  # when several apply, the first listed is reported
 
 # PDF fonts sometimes yield Kangxi radicals (⽇ for 日) or full-width digits; fold only those.
@@ -78,7 +80,7 @@ STOCK=re.compile(r'每(?:10|十)?股(?:派[^，,。；;]{0,20}?)?(?:送红股|�
                  r'|(?:分红|分配|送转|转增)后(?:公司)?总股本(?:将)?(?:增至|增加|变更为|为)[0-9]|所送[（(]?转?[）)]?股|送[（(]转[）)]股|送转股份|红股上市|每股转增比例|每股送股比例')
 RIGHTS=re.compile(r'本次配股|配股(?:股权)?登记日|配股价格为?[0-9]|每(?:10|十)?股配(?:售)?'+NUM+r'|配股缴款|配股(?:股份)?上市')
 HALT=r'(?:取消|终止|撤销|暂缓|延期|推迟|中止)'
-CANCELLED=re.compile(HALT+r'(?:实施)?(?:本次|此次)?(?:的)?(?:权益分派|利润分配|分红|派息)')
+CANCELLED=re.compile(HALT+r'(?:实施)?(?:本次|此次)?(?:的)?(?:权益分派|利润分配|利润分派|分红|派息)')
 DIFF_LABEL=re.compile(r'(?:是否涉及)?差异化分红(?:送转)?[:：]?(是|否)')
 DIFF_NEGATED=re.compile(r'(?:不涉及|不存在|未涉及|不适用|无)差异化分红(?:送转)?')
 # Any shares said not to take part in this distribution: no ordinary pure-cash template says so.
@@ -100,16 +102,18 @@ FOREIGN=re.compile(r'港币|港元|美元|外币|HKD|USD|HK\$',re.I)
 BASE=re.compile(r'([0-9][0-9,]{3,})股为(?:分配|分红|派息)?基数')
 TOTAL=re.compile(r'总股本(?:为)?([0-9][0-9,]{3,})股')
 
-FINAL=re.compile(r'(?:权益分派|分红派息|利润分配|现金分红|现金红利|股息|红利)(?:方案)?(?:的)?(?:派发)?实施')
+# An implementation announcement: the wording of rule v2.1, plus the wording added in 0.15.5 for
+# titles such as "2026年中期利润分派A股实施公告" (the same addition materiality recognises).
+FINAL=re.compile(r'(?:权益分派|分红派息|利润分配|现金分红|现金红利|股息|红利)(?:方案)?(?:的)?(?:派发)?实施|'+DIVIDEND_IMPLEMENTATION_ADDED)
 PREFERRED=re.compile(r'优先股')  # a preferred-share dividend does not move the common stock
 NOT_FINAL=re.compile(r'更正|取消|调整|补充|修订|修正|更新|终止|暂缓|延期|推迟|中止|重新|再次')
 REVISION=re.compile(r'更正|补充|修订|修正|更新|重新|再次')
 CANCEL_TITLE=re.compile(HALT)
-DIVIDEND_TITLE=re.compile(r'权益分派|分红|派息|利润分配|除权除息')
+DIVIDEND_TITLE=re.compile(r'权益分派|分红|派息|利润分配|利润分派|股息|除权除息')
 FOLLOW_ON=re.compile(r'(?:调整|修正)[^，,。]{0,12}?(?:回购(?:股份)?价格|转股价格|行权价格|授予价格|认购价格)'
                      r'|(?:回购(?:股份)?价格(?:上限)?|转股价格|行权价格|授予价格)[^，,。]{0,6}?(?:调整|修正)|(?:停止|暂停|恢复)转股|转股(?:连续)?停牌'
                      r'|提示性公告|英文|摘要')
-PERIOD=re.compile(r'(\d{4}年.{0,10}?)(?:权益分派|利润分配|分红派息|现金分红|现金红利|股息|红利)')
+PERIOD=re.compile(r'(\d{4}年.{0,10}?)(?:权益分派|利润分配|利润分派|分红派息|现金分红|现金红利|分红|派息|股息|红利)')
 LINK_DAYS=15  # a follow-on without dates links to the one implementation published this close to it
 NEAR_DAYS=30  # two implementations this close together are treated as one distribution announced twice
 
@@ -308,6 +312,7 @@ def cash_terms(text,symbol):
 def follow_on(title):
     """An announcement that only follows from a dividend, e.g. the buyback price cap adjusted after it.
     A cancellation, postponement or revision is never one."""
+    title=tight(title)
     return bool(DIVIDEND_TITLE.search(title) and FOLLOW_ON.search(title) and not CANCEL_TITLE.search(title) and not REVISION.search(title))
 
 
@@ -317,16 +322,24 @@ def period(title):
     m=PERIOD.search(tight(title).replace('A股',''))
     if not m:return None
     p=m.group(1)
-    for old,new in (('年年度','年度'),('年度末期','年度'),('年末期','年度'),('上半年','半年度'),('前三季度','三季度'),
-                    ('第一季度','一季度'),('第三季度','三季度')):
+    for old,new in (('年度中期','年中期'),('年年度','年度'),('年度末期','年度'),('年末期','年度'),('上半年','半年度'),('前三季度','三季度'),
+                    ('第一季度','一季度'),('第三季度','三季度'),('首次','第一次')):
         p=p.replace(old,new)
+    p=re.sub(r'第([1-9])次',lambda m:'第'+'一二三四五六七八九'[int(m.group(1))-1]+'次',p)
     return re.sub(r'年中期$','年半年度',p)
 
 
-def same_distribution(a,b):
-    """Whether two titles may name one distribution; a title without a period may name any."""
+def same_distribution(a,b,halt=False):
+    """Whether two titles may name one distribution; a title without a period may name any.
+    For a halt or revision (halt=True) it fails closed: within one year every distribution other
+    than the annual one may be the one meant (a postponement of "2026年中期分红" must reach
+    "2026年第一次中期权益分派实施公告"). Duplicates and follow-on links keep exact periods, so two
+    interim dividends of one year stay two distributions."""
     pa,pb=period(a),period(b)
-    return pa is None or pb is None or pa==pb
+    if pa is None or pb is None or pa==pb:return True
+    if not halt:return False
+    annual=lambda p:p[4:]=='年度'
+    return pa[:4]==pb[:4] and annual(pa)==annual(pb)
 
 
 def _close(result,problems):
@@ -359,9 +372,10 @@ def reference_problem(store,symbol,terms,bars,at):
             '可能另有送转、特别分红或日期读错；当前核验规则未支持')
 
 
-def _timing(store,symbol,terms,u,today,at):
-    """Conditions outside the announcement: the date has passed, bars exist, no entitlement is held,
-    and the market priced the ex-date as announced."""
+def _timing(store,symbol,terms,u,today,at,credits=False):
+    """Conditions outside the announcement: the date has passed, bars exist, the market priced the
+    ex-date as announced, and shares held at the record date can be accounted for: only a ledger
+    that credits cash dividends (0.15.5 cloud, or a standalone install) can hold them."""
     problems=[];ex=terms['ex_date'];record=terms['record_date'];bars=u.get('bars',[])
     if ex>today:problems.append(('WAIT','除息日尚未到达，不提前确认未来实施结果'))
     if not u.get('last_complete_date') or u['last_complete_date']<ex:
@@ -369,9 +383,7 @@ def _timing(store,symbol,terms,u,today,at):
     elif not any(b[0]==ex for b in bars) and not (len(bars)>=60 and bars[0][0]>ex):
         # Only once the ex-date's bar is due; before that its absence is the wait above.
         problems.append(('EVIDENCE','日线中尚无除息日记录，需核对停牌、日期与价格来源'))
-    cutoff=normalize_time(record+'T23:59:59+08:00')
-    qty=store.db.execute("SELECT coalesce(sum(CASE side WHEN 'BUY' THEN qty ELSE -qty END),0) FROM paper_fills WHERE symbol=? AND occurred_at<=?",(symbol,cutoff)).fetchone()[0]
-    if qty>0:problems.append(('UNSUPPORTED','策略在登记日持有股票；需先完成现金分红入账和成本核对，当前尚未实现该账务处理'))
+    if held_at_record(store,symbol,record)>0 and not credits:problems.append(('UNSUPPORTED','策略在登记日持有股票；需先完成现金分红入账和成本核对，当前尚未实现该账务处理'))
     if len(bars)<60 or u.get('basis')!='UNADJUSTED':problems.append(('EVIDENCE','需要至少60个完整交易日的原始价格记录'))
     if (trading_day(ex) is None or trading_day(record) is None) and bars and ex>=bars[0][0]:
         problems.append(('UNSUPPORTED','交易日历未覆盖登记日或除息日所在年份，不能核对日期后调整价格'))
@@ -392,13 +404,14 @@ def _after(a,b,low,high):
     return low<=days<=high
 
 
-def evaluate(store,symbol,documents,chunks,features,at):
+def evaluate(store,symbol,documents,chunks,features,at,credits=False):
     from .materiality import document_policy
     u=copy.deepcopy((features or {}).get('unadjusted') or {})
     results={};mains={};attached=[];revised=[];today=local(at).date().isoformat()
     for doc in documents:
         policy=document_policy(doc)
         if policy['level'] not in ('CORPORATE_ACTION','RISK'):continue
+        title=tight(doc['title'])
         result={'doc_id':doc['id'],'title':doc['title'],'url':doc['url'],'content_hash':doc['content_hash'],
             'rule_version':RULE_VERSION,'checked_at':at,'status':'NEEDS_EVIDENCE','missing':[],'resolution':None,
             'evidence_ids':[c['id'] for c in chunks.get(doc['id'],[])],'facts':{}}
@@ -407,18 +420,18 @@ def evaluate(store,symbol,documents,chunks,features,at):
             problems=[('UNSUPPORTED','需取得此事项的最新进展或正式结论原文，并确认是否仍有赔偿、冻结、处罚或经营影响；当前通用风险事项不能仅凭标题或已读状态自动解除')]
         elif doc['source']!='cninfo' or doc['kind']!='company_report' or not doc['cloud_allowed']:
             problems=[('EVIDENCE','需要成功取得巨潮原始公告正文；标题、摘要或未经来源核对的导入文本不能自动核验')]
-        elif PREFERRED.search(doc['title']) and not re.search(r'权益分派|分红派息|除权|除息',doc['title']):
+        elif PREFERRED.search(title) and not re.search(r'权益分派|分红派息|除权|除息',title):
             problems=[('EVIDENCE','优先股股息公告不影响普通股价格，但当前规则不自动核验，需确认与本股票的关系')]
-        elif follow_on(doc['title']):
+        elif follow_on(title):
             attached.append(doc);continue
-        elif not FINAL.search(doc['title']) or NOT_FINAL.search(doc['title']):
+        elif not FINAL.search(title) or NOT_FINAL.search(title):
             problems=[('EVIDENCE','需要最终实施公告；方案、预案、更正、补充或取消公告还需核对版本关系')]
-            if CANCEL_TITLE.search(doc['title']) or REVISION.search(doc['title']):revised.append(doc['title'])
+            if CANCEL_TITLE.search(title) or REVISION.search(title):revised.append(doc['title'])
         else:
             terms,problems=cash_terms(document_text(chunks.get(doc['id'],[])),symbol);result['facts']=terms
             mains[doc['id']]=doc
             if not problems:
-                problems=_timing(store,symbol,terms,u,today,at)
+                problems=_timing(store,symbol,terms,u,today,at,credits)
                 if not problems:result['status']='VERIFIED'
         _close(result,problems)
     main_results=[results[i] for i in mains]
@@ -452,7 +465,7 @@ def evaluate(store,symbol,documents,chunks,features,at):
         # A cancellation, postponement or revision of the same distribution (or of an unnamed one)
         # voids the dividend's facts.
         for r in main_results:
-            if same_distribution(title,r['title']):
+            if same_distribution(title,r['title'],halt=True):
                 _block(r,'EVIDENCE',f'存在同一次分配的取消、暂缓、更正或补充公告《{title}》，需核对最新版本')
     verified=[r for r in main_results if r['status']=='VERIFIED']
     repeated=set()
@@ -509,13 +522,33 @@ def resolution(review):
     return 'EVIDENCE'
 
 
+# A title that reads like a distribution being paid out but was not recognised as a corporate action;
+# listed by the replay so an unrecognised wording is noticed (中国移动's "利润分派A股实施" was one).
+PAYOUT_WORDS=re.compile(r'分红|派息|股息|红利|利润分[配派]|权益分派|送股|转增|除权|除息')
+PAYOUT_VERBS=re.compile(r'实施|派发|发放')
+NOT_PAYOUT=re.compile(r'预案|提议|议案|说明会|决议|法律意见|核查意见|独立意见|审核意见|规划|回报|承诺|差别化|实施后|子公司|参股|H股|B股|英文')
+
+
+def unrecognised(store,symbol,coverage):
+    found=[]
+    for m in coverage:
+        title=tight(m['title'])
+        if m['importance']=='CORPORATE_ACTION' or not PAYOUT_WORDS.search(title) or not PAYOUT_VERBS.search(title) or NOT_PAYOUT.search(title):continue
+        row=store.db.execute('SELECT symbol FROM documents WHERE id=?',(m['doc_id'],)).fetchone()
+        if row and row[0]==symbol:found.append({'doc_id':m['doc_id'],'title':m['title'],'importance':m['importance']})
+    return found
+
+
 def check(store,config,symbols=None,at=None):
     """Replay the current rule over each stock's announcements, exactly as the next research would,
-    without writing anything. Reports titles, statuses, reasons, dates and amounts; no document text."""
+    without writing anything. Reports titles, statuses, reasons, dates and amounts; no document text.
+    For a dividend on shares the account held at its record date it also shows the cash to be credited."""
     from .research import make_snapshot
     from .storage import now
+    from .dividends import supported, amount_cents
     stamp=normalize_time(at or now())
     names={w['symbol']:w['name'] for w in config['watchlist']}
+    credits=supported(store,config)
     stocks=[]
     for symbol in symbols or list(names):
         item={'symbol':symbol,'name':names.get(symbol,symbol)}
@@ -526,15 +559,23 @@ def check(store,config,symbols=None,at=None):
             stocks.append({**item,'error':str(exc)[:300]});continue
         coverage={m['doc_id']:m for m in packet['mandatory_coverage'] if m['critical']}
         reviews=[r for r in packet['event_reviews'] if coverage.get(r['doc_id'],{}).get('importance')=='CORPORATE_ACTION']
-        stocks.append({**item,'blocks_buying':any(r['status']!='VERIFIED' for r in reviews),
-            'reviews':[{'doc_id':r['doc_id'],'title':r['title'],'status':r['status'],'resolution':resolution(r),
-                        'missing':r['missing'],'facts':r['facts']} for r in reviews],
+        listed=[]
+        for r in reviews:
+            entry={'doc_id':r['doc_id'],'title':r['title'],'status':r['status'],'resolution':resolution(r),'missing':r['missing'],'facts':r['facts']}
+            facts=r['facts']
+            if facts.get('record_date') and facts.get('cash_per_share'):
+                qty=held_at_record(store,symbol,facts['record_date'])
+                if qty>0:entry['held_at_record']={'qty':qty,'cash_cents':amount_cents(qty,facts['cash_per_share'])}
+            listed.append(entry)
+        stocks.append({**item,'blocks_buying':any(r['status']!='VERIFIED' for r in reviews),'reviews':listed,
+            'unrecognised':unrecognised(store,symbol,packet['mandatory_coverage']),
             'risk_items':sum(1 for m in coverage.values() if m.get('importance')=='RISK')})
     kinds={}
     for s in stocks:
         for r in s.get('reviews',[]):
             key=r['resolution'] or 'VERIFIED';kinds[key]=kinds.get(key,0)+1
-    return {'rule_version':RULE_VERSION,'at':stamp,
+    return {'rule_version':RULE_VERSION,'at':stamp,'dividend_credit':credits,
             'summary':{'stocks':len(stocks),'blocked_by_corporate_actions':sum(1 for s in stocks if s.get('blocks_buying')),
-                       'reviews':kinds,'errors':sum(1 for s in stocks if 'error' in s)},
+                       'reviews':kinds,'errors':sum(1 for s in stocks if 'error' in s),
+                       'unrecognised_titles':sum(len(s.get('unrecognised',[])) for s in stocks)},
             'stocks':stocks}

@@ -17,11 +17,15 @@ def fee(config,side,notional):
 
 def positions(store,at):
     day=local(at).date().isoformat()
-    result={}
+    result={};lots={}
     for r in store.db.execute('SELECT * FROM paper_lots WHERE qty>0'):
         p=result.setdefault(r['symbol'],{'qty':0,'sellable_qty':0,'cost_cents':0})
         p['qty']+=r['qty'];p['cost_cents']+=r['cost_cents']
         if r['acquired_day']<day:p['sellable_qty']+=r['qty']
+        lots.setdefault(r['symbol'],[]).append(r)
+    # Cash dividends already received on these shares; the cost stop counts them (slots.hard_reason).
+    from .dividends import received
+    for symbol,cents in received(store,lots).items():result[symbol]['dividend_cents']=cents
     return result
 
 
