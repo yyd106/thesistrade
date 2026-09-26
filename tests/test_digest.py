@@ -76,9 +76,11 @@ class DigestTests(unittest.TestCase):
     def test_flags_point_at_failures_gaps_and_strategy_changes(self):
         self.seed_day()
         flags = '\n'.join(self.build()['flags'])
-        self.assertIn('抓取失败率', flags);self.assertIn('网络类错误 6 次', flags)
+        self.assertIn('联网期间抓取失败率 22%（6/27）', flags)
         self.assertIn('资料研究任务未完成 1 次', flags)
-        self.assertIn('组合策略发布最长间隔', flags)  # 09:41 until the day's end
+        self.assertIn('资料研究在联网状态下耗时 259 分钟（18:00 那轮）', flags)
+        self.assertIn('组合策略 14.2 小时没有发布（09-15 09:41 至 09-15 23:50），超过 12 小时', flags)  # 09:41 until the page was generated
+        self.assertNotIn('组合策略在联网状态下', flags)  # the same gap is reported once
         self.assertIn('复盘程序检查未通过：买入价超出计划区间', flags)
         self.assertIn('策略类设置被修改：model_name', flags)
 
@@ -94,7 +96,7 @@ class DigestTests(unittest.TestCase):
             summary = digest.rollup(self.store, self.cfg, '2026-09-14', '2026-09-16')
         self.assertEqual(summary['days'], 3)
         rolled = (self.store.root / summary['report']).read_text(encoding='utf-8')
-        self.assertIn('| 2026-09-15 | 6/', rolled)
+        self.assertIn('| 2026-09-15 | — | 6/', rolled)
         self.assertIn('2026-09-15 设置 model_name', rolled)
         self.assertIn('2026-09-15 新提案', rolled)
 
@@ -120,6 +122,25 @@ class DigestTests(unittest.TestCase):
         self.assertIn('“云端执行”一节生成失败', d['flags'][0])
         self.assertIn('本节生成失败（RuntimeError: equity_marks unreadable）', text)
         self.assertIn('## 复盘', text)
+
+    def test_offline_time_is_shown_and_not_flagged(self):
+        # At this stage research may wait while the machine is offline: show it, do not flag it.
+        self.seed_day()
+        from ashare.connectivity import log_interval
+        log_interval(self.store.root, 'offline', utc('17:55'), utc('22:30'), cause='NETWORK')
+        with self.store.db:
+            self.store.db.execute('UPDATE jobs SET status=?,error=? WHERE id=?', ('DEFERRED', 'OFFLINE: 本机自 x 起断网，本轮在此停止，联网后重做', 'cycle:x'))
+            self.store.db.execute('DELETE FROM reviews')  # the 19:30 review waited for the network
+        d = self.build()
+        flags = '\n'.join(d['flags'])
+        for quiet in ('抓取失败率', '资料研究任务未完成', '资料研究在联网状态下耗时'):
+            self.assertNotIn(quiet, flags)
+        self.assertIn('当天复盘未完成：复盘时间本机离线或停顿，联网后补做', flags)
+        self.assertEqual(d['availability']['offline_minutes'], 275)
+        text = digest.markdown(d)
+        self.assertIn('断网 1 次，共 4.6 小时：17:55–22:30。', text)
+        self.assertIn('断网时停止、联网后重做的任务：资料研究 1。', text)
+        self.assertIn('最长间隔 14.2 小时（09-15 09:41 至 09-15 23:50，其中离线或停顿 4.6 小时）', text)
 
     def test_empty_database_still_produces_a_page(self):
         with patch('ashare.digest.now', return_value=normalize_time('2026-09-15T23:50:00+08:00')):

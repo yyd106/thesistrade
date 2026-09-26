@@ -11,6 +11,7 @@ from .pipeline import load_config
 from .storage import Store,now,normalize_time
 from .workflow import execute
 from .cloud_protocol import role
+from .connectivity import NEEDS_NETWORK,PAUSE_SECONDS,Offline,log_interval,offline_since
 
 
 def enqueue(store,kind,scheduled,key=None,status='PENDING',payload=None):
@@ -179,6 +180,9 @@ class Scheduler:
             if job['kind']=='slot' and isinstance(result,dict):
                 # No per-minute HOLD or rejected-attempt history in job payloads.
                 result={**result,'decisions':[d for d in result.get('decisions',[]) if d['status']=='SUBMITTED']}
+        except Offline as exc:
+            # Stopped because this machine lost its network; research is redone after reconnect.
+            result=None;state='DEFERRED';error=str(exc)[:500]
         except Exception as exc:
             result=None;state='FAILED';error=type(exc).__name__+': '+str(exc)[:500]
         store=Store(config['data_dir'])
@@ -192,6 +196,14 @@ class Scheduler:
         self.poll_seconds=config['scheduler_poll_seconds']
         try:
             stamp=now()
+            offline=None
+            if role(config)!='cloud':
+                # A long gap between ticks means the machine slept or the service was stopped.
+                prior=store.db.execute("SELECT value FROM service_state WHERE key='tick_at'").fetchone()
+                if prior and (datetime.fromisoformat(stamp)-datetime.fromisoformat(prior[0])).total_seconds()>=PAUSE_SECONDS:
+                    log_interval(store.root,'pause',prior[0],stamp)
+                with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('tick_at',?)",(stamp,))
+            if role(config)=='research':offline=offline_since(store,stamp)
             if role(config)!='research':self.monitor.tick(config)
             if role(config)=='research':
                 if self.sync_future and self.sync_future.done():
@@ -235,6 +247,7 @@ class Scheduler:
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind NOT IN ('dynamic_cycle','dynamic_slot','global_research','global_slot','portfolio_strategy') ORDER BY CASE kind WHEN 'slot' THEN 0 WHEN 'review' THEN 1 ELSE 2 END,scheduled_at LIMIT 40").fetchall():
                 if len(self.futures)>=3:break
                 if row['kind'] in active_kinds:continue
+                if offline and row['kind'] in NEEDS_NETWORK:continue
                 if row['kind'] in ('research','cycle','collect','repair') and active_kinds & {'research','cycle','collect','repair'}:continue
                 with store.db:
                     store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))
@@ -247,6 +260,7 @@ class Scheduler:
                     finally:del self.dynamic_futures[jid]
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind IN ('dynamic_cycle','dynamic_slot') ORDER BY CASE kind WHEN 'dynamic_slot' THEN 0 ELSE 1 END,scheduled_at DESC LIMIT 4").fetchall():
                 if len(self.dynamic_futures)>=2 or row['kind'] in active_kinds:continue
+                if offline and row['kind'] in NEEDS_NETWORK:continue
                 # Preserve watchlist's existing allocation order. Dynamic receives
                 # the remaining shared budget after that minute's original slot.
                 if row['kind']=='dynamic_slot' and store.db.execute("SELECT 1 FROM jobs WHERE kind='slot' AND scheduled_at=? AND status IN ('PENDING','RUNNING')",(row['scheduled_at'],)).fetchone():continue
@@ -257,6 +271,7 @@ class Scheduler:
                     f.result();del self.global_futures[jid]
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind IN ('global_slot','global_research','portfolio_strategy') ORDER BY CASE kind WHEN 'global_slot' THEN 0 ELSE 1 END,scheduled_at DESC").fetchall():
                 if len(self.global_futures)>=2 or row['kind'] in active_kinds:continue
+                if offline and row['kind'] in NEEDS_NETWORK:continue
                 if row['kind'] in ('global_research','portfolio_strategy') and active_kinds & {'research','cycle','collect','repair','review','dynamic_cycle','global_research','portfolio_strategy'}:continue
                 if row['kind']=='global_slot' and store.db.execute("SELECT 1 FROM jobs WHERE kind IN ('slot','dynamic_slot') AND scheduled_at=? AND status IN ('PENDING','RUNNING')",(row['scheduled_at'],)).fetchone():continue
                 with store.db:store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))

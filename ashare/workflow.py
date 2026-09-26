@@ -60,9 +60,12 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
             except Exception as exc:
                 store.record_attempt('research_pipeline',sym,'FAILED',str(exc))
                 return {'symbol':sym,'status':'DEFERRED'}
+        from .connectivity import check as online_or_stop
         def research_stock(sym,selected_batch=None):
             result=None
             for attempt in range(config.get('research_attempts',2) if use_model else 1):
+                # A retry while offline only burns another model timeout.
+                if attempt:online_or_stop(store)
                 result=research_once(sym,selected_batch)
                 if result.get('status')!='DEFERRED':break
                 failure=store.db.execute("SELECT detail FROM data_attempts WHERE symbol=? AND source IN ('research_input','research_analysis','research_pipeline') AND status!='OK' ORDER BY id DESC LIMIT 1",(sym,)).fetchone()
@@ -83,6 +86,7 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                 result=[]
                 for item in config['watchlist']:
                     if symbol and item['symbol']!=symbol:continue
+                    online_or_stop(store)
                     with task_lock(store.root,'research-'+item['symbol']):
                         result.append(research_stock(item['symbol'],batch_id))
             elif command=='repair':
