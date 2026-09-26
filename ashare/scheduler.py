@@ -137,7 +137,7 @@ def schedule_reconnected(store,config,at):
 class Scheduler:
     def __init__(self,config_path):
         self.config_path=config_path;self.stop=Event();self.pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix='ashare')
-        self.futures={};self.last_settle=0;self.last_followups=0;self.last_maintenance=0
+        self.futures={};self.last_settle=0;self.last_followups=0;self.last_maintenance=0;self.last_dividends=0
         self.sync_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='cloud-sync');self.sync_future=None;self.last_sync=0
         self.dynamic_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='dynamic')
         self.dynamic_futures={}
@@ -281,6 +281,9 @@ class Scheduler:
                 if store.db.execute("SELECT 1 FROM paper_orders WHERE status IN ('OPEN','PARTIAL') LIMIT 1").fetchone():
                     enqueue(store,'settle',stamp)
                 self.last_settle=time.monotonic()
+            # The executing ledger credits verified cash dividends on held shares (the research node never does).
+            if role(config)!='research' and time.monotonic()-self.last_dividends>=300:
+                self.credit_dividends(store,config,stamp);self.last_dividends=time.monotonic()
             if time.monotonic()-self.last_maintenance>=3600:
                 from .maintenance import run as maintain
                 try:maintain(store,config,stamp)
@@ -296,6 +299,22 @@ class Scheduler:
                     with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('followups_error',?)",(stamp+' '+type(exc).__name__,))
                 self.last_followups=time.monotonic()
         finally:store.close()
+
+    def credit_dividends(self,store,config,stamp):
+        """Credit due cash dividends. A failure is recorded in service_state and never stops the clock."""
+        from .dividends import credit
+        try:
+            result=credit(store,config,stamp)
+        except Exception as exc:
+            if store.db.in_transaction:store.db.rollback()
+            with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('dividend_error',?)",(stamp+' '+type(exc).__name__+': '+str(exc)[:300],))
+            return None
+        with store.db:
+            store.db.execute("DELETE FROM service_state WHERE key='dividend_error'")
+            if result['conflicts']:
+                store.db.execute("INSERT OR REPLACE INTO service_state VALUES('dividend_conflicts',?)",(stamp+' '+','.join(result['conflicts'])[:300],))
+            else:store.db.execute("DELETE FROM service_state WHERE key='dividend_conflicts'")
+        return result
 
     def run(self):
         self.recover()

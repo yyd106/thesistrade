@@ -158,13 +158,21 @@ def build(store,config,start,end,known_at):
             'valuation_complete':all(p['quality'] in ('CLOSE','RECENT','NO_POSITION') for p in valuations)}
     first,last=balance(start,opening),balance(end,closing)
     cumulative=last['cumulative_realized_cents']+last['unrealized_cents'] if last['unrealized_cents'] is not None else None
+    from .dividends import parse,KIND
+    dividends=[]
+    for f in store.db.execute("SELECT reference,amount_cents,created_at FROM paper_flows WHERE kind=? AND created_at>=? AND created_at<?",(KIND,start,end)):
+        d=parse(f['reference'])
+        if d:dividends.append({'symbol':d['symbol'],'ex_date':d['ex_date'],'record_date':d['record_date'],'qty':d['qty'],
+                               'cash_per_share':format(d['cash'],'f'),'amount_cents':f['amount_cents'],'credited_at':f['created_at']})
     return {'version':VERSION,'scope':'ALL_POSITIONS','window_start':start,'window_end':end,
         'positions':sorted(positions,key=lambda p:-(p['closing']['market_value_cents'] or 0)),'research':list(research.values()),
         'fills':[{**({'portfolio_decision':f['portfolio_decision']} if f.get('portfolio_decision') else {}),**{k:f.get(k) for k in ('qty_scale','gross_cents','price_micros','fx_micros')},**{k:f[k] for k in ('id','order_id','research_id','origin','symbol','side','qty','price_cents','fee_cents','realized_cents','occurred_at','recorded_at')}} for f in fills if f['id'] in {i for p in positions for i in p['fill_ids']}],
         'opening':first,'closing':last,'totals':{'holding_count':sum(p['closing']['qty']>0 for p in positions),'reviewed_position_count':len(positions),
             'period_fill_count':len(window),'period_fee_cents':sum(f['fee_cents'] for f in window),'period_realized_cents':sum(f['realized_cents'] for f in window),
             'period_profit_cents':total([p['period_profit_cents'] for p in positions]),'cumulative_profit_cents':cumulative},
-        'valuation_notice':'按截止前最后报价估值；非收盘、缺失和事后补齐的历史报价逐项标注。期内损益=期内已实现+期末浮动−期初浮动，已计费用；短期盈亏不等于研究因果已验证。'}
+        'dividends':dividends,
+        'valuation_notice':'按截止前最后报价估值；非收盘、缺失和事后补齐的历史报价逐项标注。期内损益=期内已实现+期末浮动−期初浮动，已计费用；短期盈亏不等于研究因果已验证。'
+            '现金分红记入现金（见dividends），不在持仓损益内；除息日股价按分红下调不是亏损。'}
 
 
 def model_view(portfolio,budget=40000):
@@ -179,6 +187,7 @@ def model_view(portfolio,budget=40000):
                 'next_checks':a.get('next_checks',[])[:3],'thesis':str(plan.get('thesis',''))[:length],
                 'levels':plan.get('levels'),'event_analysis':{k:a[k] for k in ('direction','rationale','invalidation','conditions') if k in a}})
         view={k:portfolio[k] for k in ('version','scope','window_start','window_end','positions','opening','closing','totals','valuation_notice')}
+        if portfolio.get('dividends'):view['dividends']=portfolio['dividends']
         view['research']=research;view['fills']=portfolio['fills']
         if len(json.dumps(view,ensure_ascii=False))<=budget:return view
     raise ValueError('全仓复盘资料超过预算，事实已保存；需减少单条研究长度或分批处理')

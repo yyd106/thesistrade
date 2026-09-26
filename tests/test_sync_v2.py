@@ -54,6 +54,18 @@ class SyncV2Tests(unittest.TestCase):
         original = self.store;self.store = self.cloud;self.quote(at=self.later(60));self.store = original
         self.assertEqual(len(global_paper.settle(self.cloud, self.cloud_cfg, self.later(60), items)), 1)
 
+    def test_research_verifies_held_dividends_only_after_the_cloud_advertises_credits(self):
+        from ashare import dividends
+        self.assertFalse(dividends.supported(self.store, self.cfg))  # an older cloud: held shares stay blocked
+        with self.cloud.db:  # what dividends.apply writes on the cloud
+            self.cloud.db.execute('INSERT INTO paper_flows VALUES(?,?,?,?,?,?)', ('f1', 'DEMO_PAPER', 'CASH_DIVIDEND', 50200,
+                                  'cash_dividend:sh600519:2026-09-30:2026-09-29:200:2.51', self.later(10)))
+            self.cloud.db.execute("UPDATE paper_accounts SET cash_cents=cash_cents+50200 WHERE id='DEMO_PAPER'")
+        self.pull(self.later(20))
+        self.assertTrue(dividends.supported(self.store, self.cfg))
+        self.assertEqual(ledger.version(self.store), ledger.version(self.cloud))
+        self.assertEqual(dividends.history(self.store)[0]['amount_cents'], 50200)
+
     def test_first_pull_is_full_then_only_changes_travel(self):
         first = self.export(self.at)
         self.assertEqual(first['protocol'], 2);self.assertTrue(first['full_mutable']);self.assertIn('ledger_v2', first['features'])

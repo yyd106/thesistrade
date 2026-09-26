@@ -78,8 +78,9 @@ def unreviewed_events(store,plan,at,config=None):
 
 def hard_reason(q,p,params,config):
     if not q or not p or not p['qty']:return None
-    # Cost-based reference remains explicit; A-share T+1 can still block the sale.
-    if q['price_cents']*p['qty']*10000 <= p['cost_cents']*(10000-config['paper_stop_loss_bps']):return 'COST_STOP_TRIGGER'
+    # Cost-based reference remains explicit; A-share T+1 can still block the sale. Cash dividends
+    # received on the shares still held count as part of their value: an ex-dividend drop is not a loss.
+    if (q['price_cents']*p['qty']+p.get('dividend_cents',0))*10000 <= p['cost_cents']*(10000-config['paper_stop_loss_bps']):return 'COST_STOP_TRIGGER'
     levels=params.get('levels') or {}
     if q['price_cents']<=levels.get('stop_cents',0):return 'PLAN_STOP_TRIGGER'
     if q['price_cents']>=levels.get('sell_cents',10**18):return 'PLAN_EXIT_TRIGGER'

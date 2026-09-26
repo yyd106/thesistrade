@@ -39,7 +39,7 @@ def trade_guidance(store,config,symbol,plan,packet,at):
             if key in ('UNRESOLVED_EVENT','CORPORATE_ACTION_UNVERIFIED'):
                 from .research import RISK_WORDS
                 matched='、'.join(dict.fromkeys(re.findall(RISK_WORDS,doc['title'])))
-                dividend=bool(re.search(r'权益分派|分红|除权|除息',doc['title']))
+                dividend=bool(re.search(r'权益分派|利润分[配派]|分红|派息|股息|红利|除权|除息|送转|转增',doc['title']))
                 title='分红或除权事项尚未核验' if dividend else '公告中的风险线索尚未核验'
                 why=('公告标题涉及权益分派、分红或除权，触发了价格可比性的核对要求；这不代表公司出现重大利空。' if dividend else
                      '公告标题含有风险筛选词，触发事件核对；这是待核验线索，并非已确认的重大风险。')
@@ -50,7 +50,7 @@ def trade_guidance(store,config,symbol,plan,packet,at):
                 waiting='；'.join(review.get('missing',[])) if review and review.get('missing') else waiting
                 action=('请打开下方实施公告核对每10股现金分红、是否送转、股权登记日及除息日。已有正文无需再下载；点击“补齐资料并重研”会重新核验。' if dividend else
                         '请提供该事项最新进展或正式结论的公告链接，以及对应案件或事项编号；需要核对影响是否仍存在，不是只确认“读过了”。')
-                release=('纯现金分红的正文、日期、价格调整及登记日策略持仓检查全部通过后，新研究自动解除这一事项；送转、配股、差异化分红或分红账务未支持时会明确保留缺口；随分红发布的回购调价等公告随实施公告一并解除。' if dividend else
+                release=('纯现金分红的正文、日期和价格调整核验全部通过后，新研究自动解除这一事项；登记日持有的股票，分红由云端记入模拟账户；送转、配股、差异化分红未支持时会明确保留缺口；随分红发布的回购调价等公告随实施公告一并解除。' if dividend else
                          '正式结论与影响核验通过后才能解除；通用诉讼、处罚等尚不能自动判断风险已消除，需补充个案核验规则。')
                 add('event:'+value,title,why,waiting,action,release,documents=[doc],run='research')
             else:

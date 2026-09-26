@@ -2,9 +2,21 @@
 import re
 
 POLICY_VERSION = 'decision_evidence_v1'
+# The implementation announcement of a distribution, however the company names it. Matched on the
+# title without spaces ("利润分派 A 股实施" in some PDFs).
+# Wording recognised up to 0.15.4, unchanged (it also covers "利润分配实施后调整…" notices):
+DIVIDEND_IMPLEMENTATION_V21 = r'(?:利润分配|现金分红|现金红利|股息|红利|转增股本)(?:方案)?(?:的)?(?:派发)?实施'
+# Added in 0.15.5, anchored to the implementation announcement itself: "2026年中期利润分派A股实施公告",
+# "A股派息实施公告", "关于现金红利发放的实施公告". Not "…实施后调整…" or "…实施完成/进展/情况/细则…"
+# notices: they can never be verified and would block buying for good.
+DIVIDEND_IMPLEMENTATION_ADDED = (r'(?:利润分派|利润分配|分红|派息|现金分红|现金红利|股息)'
+                                 r'(?:A股)?(?:方案)?(?:的)?(?:派发|发放)?(?:的)?(?:A股)?实施(?:的)?公告')
+DIVIDEND_IMPLEMENTATION = DIVIDEND_IMPLEMENTATION_V21 + '|' + DIVIDEND_IMPLEMENTATION_ADDED
+# The added wording names only the company's own A-share distribution.
+NOT_OWN_DISTRIBUTION = r'子公司|下属|参股|联营|合营|H股|B股|英文|(?i:english)'
 CORPORATE_ACTION = (r'权益分派|分红派息|除权|除息|送转|配股|拆股|合并股份'
-                    r'|(?:利润分配|现金分红|现金红利|股息|红利|转增股本)(?:方案)?(?:的)?(?:派发)?实施'
-                    r'|(?:终止|取消|暂缓|延期|推迟|中止)(?:实施)?[^，。]{0,20}?(?:利润分配|分红|股息|红利)')
+                    r'|' + DIVIDEND_IMPLEMENTATION_V21 +
+                    r'|(?:终止|取消|暂缓|延期|推迟|中止)(?:实施)?[^，。]{0,20}?(?:利润分配|利润分派|分红|派息|股息|红利)')
 RISK = r'立案|处罚|诉讼|仲裁|退市|风险警示|违约|冻结|重大资产|重组|停牌|财务重述|更正|留置'
 MATERIAL = r'业绩预告|业绩快报|减持|增持|回购|许可协议|临床|药品|关联交易|重大合同|中标|收购|募集说明书|募集资金|担保|股权转让|对外投资'
 ROUTINE = r'法律意见|会议决议|股东[大会]+通知|股东会的通知|召开.*股东|会议资料|公司章程|议事规则|管理制度|登记制度|说明会.*公告|参加.*说明会|集体接待|英文版|年度.*评估报告'
@@ -19,7 +31,9 @@ def periodic(title):
 def classify(title, kind='', symbol=None):
     if kind in ('financial_data',):
         return {'level':'BASELINE','priority':0,'required':False,'reason':'按报告期维护的财务底稿'}
-    if re.search(CORPORATE_ACTION,title) and not (re.search(r'优先股',title) and not re.search(r'权益分派|分红派息|除权|除息|送转|配股',title)):
+    compact = re.sub(r'\s+', '', title)
+    action = re.search(CORPORATE_ACTION,compact) or (re.search(DIVIDEND_IMPLEMENTATION_ADDED,compact) and not re.search(NOT_OWN_DISTRIBUTION,compact))
+    if action and not (re.search(r'优先股',compact) and not re.search(r'权益分派|分红派息|除权|除息|送转|配股',compact)):
         return {'level':'CORPORATE_ACTION','priority':0,'required':True,'reason':'需核对公司行为及价格可比性'}
     if re.search(RISK,title):
         return {'level':'RISK','priority':0,'required':True,'reason':'需核验实质风险与后续进展'}

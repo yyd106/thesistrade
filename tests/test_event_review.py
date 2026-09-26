@@ -52,6 +52,33 @@ def szse(per_ten='13.300000', record='2026年9月7日', ex='2026年9月8日', ex
 本次分派对象为：截止{record}下午深圳证券交易所收市后登记在册的本公司全体股东。'''
 
 
+def red_chip(record='2026/9/29', ex='2026/9/30'):
+    """A company listed in Hong Kong and Shanghai: the dividend is declared in HKD, A shares are paid
+    in RMB, and the title says 利润分派 with "A 股" spaced out."""
+    return f'''证券代码：600001 证券简称：示例通信 公告编号：2026-020
+示例通信有限公司2026年中期利润分派 A 股实施公告
+重要内容提示：
+● 每股分配比例
+A股每股现金红利人民币2.51元（含税）
+● 相关日期
+股份类别 股权登记日 最后交易日 除权（息）日 现金红利发放日
+A股 {record} － {ex} {ex}
+● 差异化分红送转：否
+一、 通过分配方案的股东会届次和日期
+本次利润分派方案经公司2026年8月6日的董事会审议通过。
+二、 分配方案
+本次利润分派以公司A股股数902,767,867股为基数，每股派发现金红利人民币2.51元（含税）。港元股息金额为每股2.9003港元，按照董事会宣派股息之日前一周港元对人民币中间价平均值计算。
+港股股东（港股通股东除外）有权选择以港元或人民币可选择货币支付予港股股东，本公司以人民币支付予A股股东。
+三、 相关日期
+股份类别 股权登记日 最后交易日 除权（息）日 现金红利发放日
+A股 {record} － {ex} {ex}
+四、 分配实施办法
+（1）对于持有本公司A股股份的个人股东，公司暂不扣缴个人所得税，每股实际派发现金红利人民币2.51元；
+（2）对于合格境外机构投资者（QFII），按照10%的税率代扣代缴企业所得税，税后每股实际派发现金红利人民币2.259元。如 QFII 股东认为其取得的股息红利收入需要享受税收协定待遇的，可按照规定申请。
+五、 有关咨询办法
+关于本次利润分派事项如有疑问，请按以下联系方式咨询。'''
+
+
 # How an SSE tax section describes investors holding the company's shares; not treasury shares.
 TAX_SECTION = ('（1）对于持有本公司无限售条件流通股的个人股东及证券投资基金，持股期限超过1年的，股息红利所得暂免征收个人所得税，每股实际派发现金红利人民币0.81元；'
                '（2）对于持有本公司股票的合格境外机构投资者（QFII），由本公司按照10%的税率统一代扣代缴企业所得税，税后每股实际派发现金红利人民币0.729元；'
@@ -215,6 +242,54 @@ class CashTermsTests(unittest.TestCase):
         self.assertEqual(resolution({'status': 'NEEDS_EVIDENCE', 'missing': ['需要最终实施公告']}), 'EVIDENCE')
         self.assertEqual(resolution({'status': 'NEEDS_EVIDENCE', 'missing': ['x'], 'resolution': 'LINKED'}), 'LINKED')
         self.assertIsNone(resolution({'status': 'VERIFIED', 'missing': []}))
+
+
+class TitleCoverageTests(unittest.TestCase):
+    def test_every_implementation_wording_is_a_corporate_action(self):
+        from ashare.materiality import classify
+        for title in ('2026年中期利润分派A股实施公告', '2026年中期利润分派 A 股实施公告', '2025年末期A股派息实施公告',
+                      '关于2025年度现金红利发放的实施公告', '2025年年度分红实施公告', '2026年半年度权益分派实施公告',
+                      '2025年末期A股股息派发实施公告', '关于暂缓实施2026年中期利润分派的公告', '关于2025年度分红实施公告的更正公告',
+                      '关于2025年度利润分配实施后调整可转债转股价格的公告'):  # as before 0.15.5
+            self.assertEqual(classify(title)['level'], 'CORPORATE_ACTION', title)
+        # Not the company's own A-share implementation: none may start a block that never clears.
+        for title in ('关于2025年度利润分配预案的公告', '未来三年股东分红回报规划（2026-2028年）', '关于H股末期股息派发的公告',
+                      '关于回购股份实施结果的公告', '关于2025年年度分红实施后调整股权激励行权价格的公告', '关于全资子公司分红实施完毕的公告',
+                      '关于H股2025年末期派息实施的公告', '2026年中期利润分派A股实施公告（英文版）', '2026年中期利润分派A股实施公告（English Version）',
+                      '关于2026年中期利润分派实施后调整回购股份价格上限的公告', '关于2025年度分红实施完成的公告', '关于2025年度利润分派实施进展的公告',
+                      '2025年度分红实施情况的说明', '利润分派实施完毕的公告', '关于派息实施之后调整发行价格的公告', '关于调整2025年度分红实施方案的公告',
+                      '关于2025年度分红实施完成后调整回购股份价格上限的公告', '关于下属公司分红实施的公告'):
+            self.assertNotEqual(classify(title)['level'], 'CORPORATE_ACTION', title)
+
+    def test_red_chip_title_is_final_and_names_its_period(self):
+        from ashare.event_review import FINAL, period
+        self.assertTrue(FINAL.search(tight('2026年中期利润分派 A 股实施公告')))
+        self.assertEqual(period('2026年中期利润分派 A 股实施公告'), '2026年半年度')
+        self.assertEqual(period('2025年末期A股派息实施公告'), '2025年度')
+
+    def test_a_halt_reaches_every_non_annual_distribution_of_its_year(self):
+        from ashare.event_review import same_distribution as same
+        for halt, main in (('关于暂缓实施2026年中期分红的公告', '2026年第一次中期权益分派实施公告'),
+                           ('关于延期实施2026年半年度分红的公告', '2026年第二次中期权益分派实施公告'),
+                           ('关于暂缓实施2026年度中期分红的公告', '2026年半年度权益分派实施公告'),
+                           ('关于暂缓实施2026年第1次中期分红的公告', '2026年第一次中期权益分派实施公告'),
+                           ('关于暂缓实施2026年首次中期分红的公告', '2026年第一次中期权益分派实施公告'),
+                           ('关于暂缓实施2025年第二次中期分红的公告', '2025年前三季度权益分派实施公告'),
+                           ('关于暂缓实施本次权益分派的公告', '2026年第一次中期权益分派实施公告'),
+                           ('关于暂缓实施2025年度利润分配的公告', '2025年年度权益分派实施公告')):
+            self.assertTrue(same(halt, main, halt=True), halt)
+        for halt, main in (('关于终止实施2024年度利润分配的公告', '2026年半年度权益分派实施公告'),
+                           ('关于暂缓实施2026年度利润分配的公告', '2026年半年度权益分派实施公告')):
+            self.assertFalse(same(halt, main, halt=True), halt)
+        # Two implementations keep exact periods: two interim dividends of a year are two distributions.
+        self.assertFalse(same('2026年第一次中期权益分派实施公告', '2026年半年度权益分派实施公告'))
+        self.assertFalse(same('2026年第一次中期权益分派实施公告', '2026年第二次中期权益分派实施公告'))
+        self.assertTrue(same('2026年度中期利润分配实施公告', '2026年半年度权益分派实施公告'))
+
+    def test_red_chip_announcement_reads_rmb_amount_and_ignores_hkd_and_after_tax(self):
+        terms, problems = cash_terms(red_chip(), SSE_CODE)
+        self.assertEqual(problems, [])
+        self.assertEqual(terms, {'cash_per_share': '2.51', 'cash_per_share_cents': 251, 'record_date': '2026-09-29', 'ex_date': '2026-09-30'})
 
 
 def bars(first, last, close='10'):
@@ -395,6 +470,65 @@ class EvaluateTests(unittest.TestCase):
             self.assertEqual((blocked['status'], blocked['resolution']), ('NEEDS_EVIDENCE', 'UNSUPPORTED'), reference)
             self.assertIn('参考价', blocked['missing'][0])
 
+
+    def test_shares_held_at_the_record_date_need_a_ledger_that_credits_the_dividend(self):
+        from unittest.mock import patch
+        doc, chunks = self.doc('rc', red_chip(), title='2026年中期利润分派 A 股实施公告', symbol=SSE_CODE)
+        at, features = normalize_time('2026-09-30T20:00:00+08:00'), self.features(last='2026-09-30')
+        self.assertEqual(evaluate(self.store, SSE_CODE, [doc], {doc['id']: chunks}, features, at)[0][0]['status'], 'VERIFIED')
+        with patch('ashare.event_review.held_at_record', return_value=200):
+            blocked = evaluate(self.store, SSE_CODE, [doc], {doc['id']: chunks}, features, at)[0][0]
+            self.assertEqual(blocked['resolution'], 'UNSUPPORTED')
+            self.assertIn('登记日持有', blocked['missing'][0])
+            reviews, u = evaluate(self.store, SSE_CODE, [doc], {doc['id']: chunks}, features, at, credits=True)
+        self.assertEqual(reviews[0]['status'], 'VERIFIED')
+        self.assertEqual([(a['ex_date'], a['cash_per_share']) for a in u['corporate_actions']], [('2026-09-30', '2.51')])
+        # Before the ex-date it waits either way.
+        waiting = evaluate(self.store, SSE_CODE, [doc], {doc['id']: chunks}, self.features(last='2026-09-28'),
+                           normalize_time('2026-09-28T20:00:00+08:00'), credits=True)[0][0]
+        self.assertEqual(waiting['resolution'], 'WAIT')
+
+    def test_postponing_an_interim_dividend_voids_a_numbered_interim_implementation(self):
+        main, c1 = self.doc('np', szse(record='2026年9月7日', ex='2026年9月8日'), title='2026年第一次中期权益分派实施公告')
+        at = normalize_time('2026-09-18T10:00:00+08:00')
+        self.assertEqual(evaluate(self.store, SZSE_CODE, [main], {main['id']: c1}, self.features(), at)[0][0]['status'], 'VERIFIED')
+        for title in ('关于暂缓实施2026年中期分红的公告', '关于延期实施2026年半年度分红的公告'):
+            halt, c2 = self.doc('h' + title, '证券代码：000001 公司决定暂缓实施本次分红。', title=title, stamp='2026-09-04T09:00:00+08:00')
+            reviews, u = evaluate(self.store, SZSE_CODE, [main, halt], {main['id']: c1, halt['id']: c2}, self.features(), at, credits=True)
+            self.assertEqual((reviews[0]['status'], u['basis']), ('NEEDS_EVIDENCE', 'UNADJUSTED'), title)
+            self.assertNotIn('corporate_actions', u)
+
+    def test_two_interim_dividends_of_one_year_are_both_verified(self):
+        first, c1 = self.doc('i1', szse(record='2026年6月16日', ex='2026年6月17日'), title='2026年第一次中期权益分派实施公告',
+                             stamp='2026-06-10T09:00:00+08:00')
+        second, c2 = self.doc('i2', szse(record='2026年9月7日', ex='2026年9月8日'), title='2026年半年度权益分派实施公告')
+        reviews, u = evaluate(self.store, SZSE_CODE, [first, second], {first['id']: c1, second['id']: c2},
+                              self.features(first='2026-05-01'), normalize_time('2026-09-18T10:00:00+08:00'))
+        self.assertEqual([r['status'] for r in reviews], ['VERIFIED', 'VERIFIED'])
+        self.assertEqual([a['ex_date'] for a in u['corporate_actions']], ['2026-06-17', '2026-09-08'])
+
+    def test_replay_lists_unrecognised_payout_titles_and_the_cash_to_credit(self):
+        from unittest.mock import patch
+        from test_config import load_config
+        from ashare.demo import seed, SYMBOL
+        cfg = load_config(Path(__file__).resolve().parents[1] / 'config.json')
+        cfg.update(data_dir=self.tmp.name, watchlist=[{'symbol': SYMBOL, 'name': '合成测试'}])
+        seed(self.store, cfg)
+        text = red_chip(record='2026/9/10', ex='2026/9/11').replace('600001', SYMBOL[2:])
+        for n, title in enumerate(('2026年中期利润分派 A 股实施公告', '关于派发2026年中期现金红利的公告', '关于2025年度利润分配预案的公告')):
+            self.store.add_document(symbol=SYMBOL, kind='company_report', title=title, source='cninfo',
+                                    url=f'https://static.cninfo.com.cn/u{n}.pdf', published_at='2026-09-01T09:00:00+08:00',
+                                    first_seen_at='2026-09-01T09:00:00+08:00', ready_at='2026-09-01T09:00:00+08:00',
+                                    pages=[(1, text if n == 0 else '证券代码：' + SYMBOL[2:] + ' 公告内容')], raw_path='fixture', cloud_allowed=True)
+        with patch('ashare.event_review.held_at_record', return_value=200):
+            report = check(self.store, cfg, at='2026-09-15T10:00:00+08:00')
+        stock = report['stocks'][0]
+        self.assertTrue(report['dividend_credit'])  # a standalone install credits dividends itself
+        self.assertEqual([u['title'] for u in stock['unrecognised']], ['关于派发2026年中期现金红利的公告'])
+        self.assertEqual(report['summary']['unrecognised_titles'], 1)
+        self.assertEqual(stock['reviews'][0]['held_at_record'], {'qty': 200, 'cash_cents': 50200})
+        cfg['deployment_role'] = 'research'  # a research node waits for the cloud to advertise it
+        self.assertFalse(check(self.store, cfg, at='2026-09-15T10:00:00+08:00')['dividend_credit'])
 
     def test_replay_reports_blocking_actions_without_document_text(self):
         from test_config import load_config
