@@ -1,10 +1,12 @@
 """Corporate-action rule v2. Announcements are synthetic, written in the two exchanges' public
 layouts (fictional companies and numbers); no collected document is used."""
+import argparse
 import json
 import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from ashare import governance, weekly
 from ashare.event_review import (RULE_VERSION, cash_terms, check, dividend_dates, document_text, evaluate,
                                  follow_on, resolution, tight)
 from ashare.storage import Store, normalize_time
@@ -380,6 +382,133 @@ class EvaluateTests(unittest.TestCase):
         self.assertNotIn('截止', json.dumps(report, ensure_ascii=False))  # reasons and facts only
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM snapshots').fetchone()[0], 1)  # only seed's
         self.assertIn('不在自选股内', check(self.store, cfg, ['000333'], at='2026-09-15T10:00:00+08:00')['stocks'][0]['error'])
+
+
+class GovernanceToolTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory();self.store = Store(self.tmp.name)
+
+    def tearDown(self):
+        self.store.close();self.tmp.cleanup()
+
+    def draft(self, title):
+        with self.store.db:
+            return governance.draft_proposal(self.store, source='agent', kind='RULE', target='自选股', title=title,
+                                             payload={'hypothesis': 'h'}, at='2026-09-26T01:00:00+00:00')
+
+    def test_superseded_proposal_names_its_replacement_and_keeps_history(self):
+        old, new = self.draft('旧版'), self.draft('完整新版')
+        governance.decide(self.store, old, 'REJECTED', decided_by=None, note='被完整新版替代', at='2026-09-26T01:10:00+00:00')
+        for bad, message in ((old, '不能是它自己'), ('missing', '未找到新版提案'), (None, '--replaced-by')):
+            with self.assertRaisesRegex(ValueError, message):
+                governance.decide(self.store, old, 'SUPERSEDED', decided_by=None, note='改标', replaced_by=bad)
+        governance.decide(self.store, old, 'SUPERSEDED', decided_by=None, note='改为被新版替代', replaced_by=new, at='2026-09-26T02:00:00+00:00')
+        rows = {p['id']: p for p in governance.proposals(self.store)}
+        self.assertEqual((rows[old]['status'], rows[old]['payload']['superseded_by']), ('SUPERSEDED', new))
+        self.assertEqual([h['to'] for h in rows[old]['payload']['history']], ['REJECTED', 'SUPERSEDED'])
+        self.assertEqual(rows[new]['payload']['supersedes'], [old])
+        with self.assertRaisesRegex(ValueError, '只能由仍有效的提案替代'):
+            governance.decide(self.store, new, 'SUPERSEDED', decided_by=None, note='x', replaced_by=old)
+        with self.assertRaisesRegex(ValueError, '只有标记为SUPERSEDED'):
+            governance.decide(self.store, new, 'READY', decided_by=None, note='x', replaced_by=old)
+        text = weekly.markdown({**self.report(), 'proposals_closed': weekly.closed_proposals(self.store)})
+        self.assertIn(f'SUPERSEDED（被新版替代，累计）：1 条；旧→新 {old}→{new}', text)
+
+    def test_relabel_keeps_a_decision_made_before_history_existed(self):
+        old, new = self.draft('旧版'), self.draft('新版')
+        with self.store.db:  # a rejection recorded by 0.15.2: columns only, no history in the payload
+            self.store.db.execute("UPDATE strategy_proposals SET status='REJECTED',decided_at=?,decided_by=?,decision_note=? WHERE id=?",
+                                  ('2026-09-26T01:05:00+00:00', 'Dean', '被新版替代', old))
+        with self.assertRaisesRegex(ValueError, '由 Dean 驳回'):
+            governance.decide(self.store, old, 'SUPERSEDED', decided_by=None, note='改标', replaced_by=new)
+        approved = self.draft('已批准')
+        governance.decide(self.store, approved, 'READY', decided_by=None, note='整理')
+        governance.decide(self.store, approved, 'APPROVED', decided_by='Dean', note='同意')
+        with self.assertRaisesRegex(ValueError, '已批准'):
+            governance.decide(self.store, approved, 'REJECTED', decided_by=None, note='代理改主意')
+        governance.decide(self.store, old, 'SUPERSEDED', decided_by='Dean', note='改标', replaced_by=new)
+        history = next(p for p in governance.proposals(self.store) if p['id'] == old)['payload']['history']
+        self.assertEqual([(h['to'], h['by']) for h in history], [('REJECTED', 'Dean'), ('SUPERSEDED', 'Dean')])
+        with self.store.db:
+            forged = governance.draft_proposal(self.store, source='agent', kind='RULE', target='x', title='t',
+                                               payload={'hypothesis': 'h', 'superseded_by': old, 'history': [{'to': 'ADOPTED'}]}, at='2026-09-26T01:00:00+00:00')
+        payload = next(p for p in governance.proposals(self.store) if p['id'] == forged)['payload']
+        self.assertNotIn('superseded_by', payload);self.assertNotIn('history', payload)
+
+    def test_reports_follow_a_retitled_issue_through_every_title(self):
+        with self.store.db:
+            first = governance.record_issue(self.store, 'OTHER_DATA', None, 'd', [], '2026-09-26T01:00:00+00:00', title='甲', dedupe='甲')
+        governance.retitle_issue(self.store, first, '乙', '更准确')
+        governance.retitle_issue(self.store, first, '丙', '再改')
+        with self.store.db:
+            ids = {t: governance.record_issue(self.store, 'OTHER_DATA', None, 'd', [], '2026-09-26T02:00:00+00:00', title=t, dedupe=t) for t in ('甲', '乙', '丙')}
+            auto = governance.record_issue(self.store, 'MISSING_DAILY_BARS', 'sh600001', 'd', [], '2026-09-26T02:00:00+00:00')
+            manual = governance.record_issue(self.store, 'MISSING_DAILY_BARS', 'sh600001', 'd', [], '2026-09-26T02:00:00+00:00',
+                                             title='日线缺失或未更新', dedupe='日线缺失或未更新')
+        self.assertEqual(set(ids.values()), {first})
+        self.assertNotEqual(auto, manual)  # a hand report under a default title does not merge into the automatic issue
+        # Another issue retitled to a former title takes the reports under that title from then on.
+        with self.store.db:
+            other = governance.record_issue(self.store, 'OTHER_DATA', None, 'd', [], '2026-09-26T03:00:00+00:00', title='丁', dedupe='丁')
+        governance.retitle_issue(self.store, other, '甲', '同名')
+        with self.store.db:
+            self.assertEqual(governance.record_issue(self.store, 'OTHER_DATA', None, 'd', [], '2026-09-26T04:00:00+00:00', title='甲', dedupe='甲'), other)
+
+    def report(self):
+        return {'window': {'from': '2026-09-19T00:00:00+00:00', 'to': '2026-09-26T00:00:00+00:00'}, 'horizon_days': 20,
+                'registry': {'scored_this_week': 0, 'all_time': {'groups': {}}}, 'shadow': {'all_time': {}},
+                'builds_this_week': [], 'model_usage': {'attempts': {}, 'portfolio_runs': {}, 'research_renewals_without_model': 0},
+                'engineering_issues': [], 'proposals': {}, 'disk': {'free_gb': 1, 'db_gb': 1, 'backups_gb': 1, 'warning': False},
+                'calendar_warning': None}
+
+    def test_new_proposal_can_supersede_old_ones_in_one_command(self):
+        from ashare.cli import _store_command
+        old = self.draft('旧版')
+        spec = Path(self.tmp.name) / 'p.json'
+        spec.write_text(json.dumps({'kind': 'RULE', 'target': '自选股', 'title': '完整新版', 'hypothesis': 'h', 'change': 'c', 'evidence': 'e',
+                                    'test_plan': 't', 'failure_criteria': 'f', 'rollback': 'r'}, ensure_ascii=False))
+        args = argparse.Namespace(command='proposals', action='new', file=str(spec), id=None, status=None, to=None, approved_by=None,
+                                  note=None, supersedes=['nope'], replaced_by=None)
+        with self.assertRaisesRegex(ValueError, '未找到提案 nope'):
+            _store_command(args, {}, self.store)
+        self.assertEqual(len(governance.proposals(self.store)), 1)  # nothing written
+        spec.write_text(json.dumps({'kind': 'RULE', 'target': '自选股', 'title': '完整新版', 'hypothesis': 'h', 'change': 'c', 'evidence': 'e',
+                                    'test_plan': 't', 'failure_criteria': 'f', 'rollback': 'r', 'dedupe_key': 'same'}, ensure_ascii=False))
+        with self.store.db:
+            same = governance.draft_proposal(self.store, source='agent', kind='RULE', target='x', title='同键', payload={}, at='2026-09-26T01:00:00+00:00', dedupe_key='same')
+        args.supersedes = [same]
+        with self.assertRaisesRegex(ValueError, '替代它自己'):
+            _store_command(args, {}, self.store)
+        spec.write_text(json.dumps({'kind': 'RULE', 'target': '自选股', 'title': '完整新版', 'hypothesis': 'h', 'change': 'c', 'evidence': 'e',
+                                    'test_plan': 't', 'failure_criteria': 'f', 'rollback': 'r'}, ensure_ascii=False))
+        args.supersedes = [old]
+        result = _store_command(args, {}, self.store)
+        row = next(p for p in governance.proposals(self.store) if p['id'] == old)
+        self.assertEqual((row['status'], row['payload']['superseded_by'], result['supersedes']), ('SUPERSEDED', result['id'], [old]))
+
+    def test_retitled_issue_keeps_its_id_and_later_reports_collapse_into_it(self):
+        from ashare.cli import _store_command
+        args = argparse.Namespace(command='issues', action='new', id=None, status='OPEN', note=None, wontfix=False, key='OTHER_DATA',
+                                  symbol=None, title='每股不足一分的现金分红无法核验', detail='0.055元', evidence=[])
+        first = _store_command(args, {}, self.store)['id']
+        retitle = argparse.Namespace(command='issues', action='retitle', id=first, status='OPEN', note='实际是含半分钱尾数', wontfix=False,
+                                     key=None, symbol=None, title='每股现金分红含小数分时无法核验', detail=None, evidence=None)
+        self.assertEqual(_store_command(retitle, {}, self.store)['to'], '每股现金分红含小数分时无法核验')
+        args.title = '每股现金分红含小数分时无法核验'
+        self.assertEqual(_store_command(args, {}, self.store), {'status': 'OPEN', 'id': first, 'occurrences': 2})
+        args.title = '每股不足一分的现金分红无法核验'
+        self.assertEqual(_store_command(args, {}, self.store)['id'], first)
+        row = self.store.db.execute('SELECT title,payload_json FROM engineering_issues WHERE id=?', (first,)).fetchone()
+        self.assertEqual(row['title'], '每股现金分红含小数分时无法核验')
+        self.assertEqual(json.loads(row['payload_json'])['titles'][0]['note'], '实际是含半分钱尾数')
+        args.title = '另一件事'
+        other = _store_command(args, {}, self.store)['id']
+        retitle.id, retitle.title = other, '每股现金分红含小数分时无法核验'
+        with self.assertRaisesRegex(ValueError, first):
+            _store_command(retitle, {}, self.store)
+        retitle.note = ' '
+        with self.assertRaisesRegex(ValueError, '理由'):
+            _store_command(retitle, {}, self.store)
 
 
 if __name__ == '__main__':
