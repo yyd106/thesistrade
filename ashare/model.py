@@ -60,14 +60,25 @@ def parse_header(text):
     return result
 
 
+def _signal(proc,sig):
+    """Signal a model session's process group. A group that has just exited cannot be signalled:
+    Linux says it does not exist, macOS says "Operation not permitted" when only a zombie is left.
+    Then signal the child itself, which is ours; nothing is left to stop if that fails too."""
+    try:os.killpg(proc.pid,sig)
+    except (ProcessLookupError,PermissionError):
+        try:proc.send_signal(sig)
+        except OSError:pass
+
+
 def cancel_models():
-    """Service shutdown must not leave detached model sessions running."""
+    """Service shutdown must not leave detached model sessions running, and never raises: it runs
+    inside the stop signal handler, where an exception would skip the rest of the shutdown."""
     _stopping.set()
     with _process_lock:
         for proc in tuple(_processes):
-            if proc.poll() is None:
-                try:os.killpg(proc.pid,signal.SIGTERM)
-                except ProcessLookupError:pass
+            try:
+                if proc.poll() is None:_signal(proc,signal.SIGTERM)
+            except Exception:pass
 
 
 SCHEMA = {
@@ -248,15 +259,15 @@ def run_json(prompt, schema, folder, timeout=240):
             proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err, text=True, env=env, start_new_session=True)
             with _process_lock:
                 _processes.add(proc)
-                if _stopping.is_set():os.killpg(proc.pid,signal.SIGTERM)
+                if _stopping.is_set():_signal(proc,signal.SIGTERM)
             try:
                 proc.communicate(prompt, timeout=timeout)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGTERM)
+                _signal(proc, signal.SIGTERM)
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    _signal(proc, signal.SIGKILL)
                     proc.wait()
                 finish(exit_code=None, timed_out=True)
                 raise RuntimeError("模型分析超时，资料包已保存，未使用付费后备服务")
