@@ -37,7 +37,7 @@ from .finance import cents
 from .storage import normalize_time, CHUNK_STEP
 from .calendar import local, trading_day, previous_trading_day
 
-RULE_VERSION='cash_dividend_review_v2'
+RULE_VERSION='cash_dividend_review_v2.1'
 RESOLUTIONS=('UNSUPPORTED','EVIDENCE','LINKED','WAIT')  # when several apply, the first listed is reported
 
 # PDF fonts sometimes yield Kangxi radicals (⽇ for 日) or full-width digits; fold only those.
@@ -62,7 +62,9 @@ PER_TEN=(re.compile(r'每10股派(?:发)?(?:现金红利|现金股利|现金)?(?
 PAY=r'(?:派|发放|分配|分派|支付)'
 ANY_ONE=re.compile(r'每股[^，,。；;]{0,4}?'+PAY+r'[^，,。；;]{0,16}?'+AMOUNT+'元')
 ANY_TEN=re.compile(r'每(?:10|十)股[^，,。；;]{0,4}?'+PAY+r'[^，,。；;]{0,16}?'+AMOUNT+'元')
-STATED=re.compile(r'每股(?:现金)?(?:红利|股利|分红)(?:金额)?(?:为|[=＝])?(?:人民币)?([0-9]+\.[0-9]+)元')  # formulas in follow-ons
+# An amount stated right after the words; after "=" a formula continues with other prices
+# (e.g. the old buyback price cap), so an equals sign is not a statement of the amount.
+STATED=re.compile(r'每股(?:现金)?(?:红利|股利|分红)(?:金额)?(?:为)?(?:人民币)?([0-9]+\.[0-9]+)元')
 AFTER_TAX=re.compile(r'扣税后|税后|实际派发|扣缴|代扣|补缴')
 
 # Sentences end at full stops and bullets, and before a numbered item when the stop is missing.
@@ -83,7 +85,9 @@ DIFF_NEGATED=re.compile(r'(?:不涉及|不存在|未涉及|不适用|无)差异�
 EXCLUDED_SHARES=re.compile(r'(?:不|无权|无法)(?:参与|享有|参加|纳入)[^，,。；;]{0,10}?(?:利润|权益)?(?:分配|分派|分红)|不予分配')
 # SZSE has no label. Shares held for a buyback do not take part, and the exchange then prices the
 # ex-date from the cash spread over all shares; any of these wordings means that.
-TREASURY=re.compile(r'回购(?:专用|专户|账户|证券账户)|已回购|回购的股份|库存股|(?:持有|所持)的?本公司(?:股份|股票)|自有股份|购回的股份'
+# The company holding its own shares, not investors holding them ("对于持有本公司股份的QFII" in every tax section).
+TREASURY=re.compile(r'回购(?:专用|专户|账户|证券账户)|已回购|回购的股份|库存股|公司(?:通过[^，,。；;]{0,12}?)?(?:持有|所持)的?本公司(?:股份|股票)'
+                    r'|自有股份|购回的股份'
                     r'|(?:剔除|扣除|扣减|减去|不含|不包括)(?:公司)?(?:已)?回购')
 # A buyback notice always names the buyback account; there only a positive holding counts.
 HELD=re.compile(r'(?:已回购|累计回购|回购专用证券账户(?:中)?(?:持有|的股份)|库存股)[^，,。；;]{0,16}?(?<![0-9,.])[1-9][0-9,]*股')

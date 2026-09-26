@@ -52,6 +52,14 @@ def szse(per_ten='13.300000', record='2026年9月7日', ex='2026年9月8日', ex
 本次分派对象为：截止{record}下午深圳证券交易所收市后登记在册的本公司全体股东。'''
 
 
+# How an SSE tax section describes investors holding the company's shares; not treasury shares.
+TAX_SECTION = ('（1）对于持有本公司无限售条件流通股的个人股东及证券投资基金，持股期限超过1年的，股息红利所得暂免征收个人所得税，每股实际派发现金红利人民币0.81元；'
+               '（2）对于持有本公司股票的合格境外机构投资者（QFII），由本公司按照10%的税率统一代扣代缴企业所得税，税后每股实际派发现金红利人民币0.729元；'
+               '（3）对于通过沪股通持有本公司股份的香港市场投资者（包括企业和个人），其股息红利将由本公司通过中国结算上海分公司按股票名义持有人账户以人民币派发，扣税后每股实际派发现金红利人民币0.729元；'
+               '（4）对于投资者所持本公司股份的其他情形，由纳税人按税法规定自行判断是否应在当地缴纳企业所得税。')
+# A buyback price cap adjusted after the dividend, written as one formula.
+CAP_FORMULA = '调整后的回购价格上限=调整前的回购价格上限-每股现金红利=56.55元/股-2.00元/股=54.55元/股。'
+
 BUYBACK_CLAUSE = '若公司在回购期内发生派息、送股、资本公积金转增股本、股票拆细、缩股、配股等除权除息事项，自股价除权除息之日起，相应调整回购价格上限。'
 
 
@@ -133,6 +141,17 @@ class CashTermsTests(unittest.TestCase):
         for text in texts:
             with self.subTest(text[-60:]):
                 self.assertTrue(any(k == 'UNSUPPORTED' and ('差异化' in m) for k, m in cash_terms(text, SZSE_CODE)[1]))
+
+    def test_investors_holding_shares_are_not_treasury_shares(self):
+        self.assertEqual(cash_terms(sse(extra=TAX_SECTION), SSE_CODE)[1], [])
+        held = cash_terms(sse(extra='公司持有的本公司股份30,000,000股不参与本次利润分配。'), SSE_CODE)[1]
+        self.assertTrue(any('差异化' in m for _, m in held))
+        self.assertTrue(any('差异化' in m for _, m in cash_terms(sse(extra='公司通过回购专用证券账户所持本公司股份30,000,000股。'), SSE_CODE)[1]))
+
+    def test_a_price_cap_formula_is_not_a_cash_amount(self):
+        per_ten = szse(per_ten='20.000000', extra='公司将相应调整回购股份价格上限。' + CAP_FORMULA)
+        self.assertEqual(cash_terms(per_ten, SZSE_CODE)[1], [])
+        self.assertTrue(any('1.2768' in m for _, m in cash_terms(szse(extra='每股现金红利1.2768元/股。'), SZSE_CODE)[1]))
 
     def test_partly_cancelled_treasury_still_counts(self):
         for extra in ('截至本公告披露日，公司回购专用证券账户中的股份已注销20,000,000股，剩余30,000,000股不参与本次权益分派。',
@@ -285,6 +304,19 @@ class EvaluateTests(unittest.TestCase):
         late, late_chunks = self.doc('h', text, title='关于实施2026年半年度权益分派期间示例转债暂停转股的公告', stamp='2026-10-20T09:00:00+08:00')
         reviews, _ = evaluate(self.store, SZSE_CODE, [main, late], {main['id']: main_chunks, late['id']: late_chunks}, self.features(), at)
         self.assertEqual(reviews[1]['resolution'], 'UNSUPPORTED')
+
+    def test_price_cap_formula_in_a_follow_on_is_not_read_as_cash(self):
+        at = normalize_time('2026-09-18T10:00:00+08:00')
+        main, c1 = self.doc('x', szse(per_ten='20.000000', record='2026年8月18日', ex='2026年8月19日'))
+        text = '证券代码：000001 本次权益分派股权登记日为2026年8月18日，除权除息日为2026年8月19日。' + CAP_FORMULA
+        follow, c2 = self.doc('y', text, title='关于2026年半年度权益分派实施后调整股份回购价格上限的公告')
+        reviews, _ = evaluate(self.store, SZSE_CODE, [main, follow], {main['id']: c1, follow['id']: c2}, self.features(), at)
+        self.assertEqual([r['status'] for r in reviews], ['VERIFIED'] * 2)
+        held, c3 = self.doc('z', text.replace('。调整', '。截至本公告披露日，公司通过回购专用证券账户累计回购股份495,600股。调整'),
+                            title='关于2026年半年度权益分派实施后调整股份回购价格上限的公告')
+        reviews, _ = evaluate(self.store, SZSE_CODE, [main, held], {main['id']: c1, held['id']: c3}, self.features(), at)
+        self.assertEqual([r['resolution'] for r in reviews], ['UNSUPPORTED'] * 2)
+        self.assertNotIn('56.55', json.dumps(reviews, ensure_ascii=False))  # blocked for the treasury shares only
 
     def test_buyback_notices_without_holdings_follow_their_dividend(self):
         at = normalize_time('2026-09-18T10:00:00+08:00')
