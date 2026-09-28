@@ -57,6 +57,8 @@ README = """# ThesisTrade 报告仓库
 | `notices/outbox/*.md` | Claude | 给 Dean 的新通知，研究端导入后在网页弹窗 |
 | `checks/<批次编号>.md` | Claude | Claude 对该批次的检查结论，研究端导入后放进批次目录 |
 
+Claude 写入的文件（`notices/outbox/`、`checks/`）文件名只用英文字母、数字和连字符，扩展名为 `.md`。
+
 通知文件格式（`kind` 取 DECISION 需要决定、VETO 可否决、INFO 通知；`deadline` 可省略）：
 
 ```
