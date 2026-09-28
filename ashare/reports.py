@@ -91,9 +91,10 @@ def _env(p):
 
 
 def _git(args, cwd, env, check=True):
+    # surrogateescape: a file name that is not UTF-8, committed by anyone, must not break every sync.
     r = subprocess.run(['git', '-c', 'core.hooksPath=' + os.devnull, '-c', 'commit.gpgsign=false', '-c', 'core.symlinks=false', *args],
-                       cwd=str(cwd), env=env,
-                       capture_output=True, text=True, timeout=GIT_TIMEOUT)
+                       cwd=str(cwd), env=env, capture_output=True, text=True, encoding='utf-8', errors='surrogateescape',
+                       timeout=GIT_TIMEOUT)
     if check and r.returncode:
         raise RuntimeError(f"git {args[0]} 失败：{(r.stderr or r.stdout).strip()[-400:]}")
     return r
@@ -178,10 +179,14 @@ def _heal(repo, env):
         meta, _, path = entry.partition('\t')
         if not path:
             continue
-        owned = path in OWNED_FILES or any(path == d or path.startswith(d + '/') for d in OWNED_DIRS[:3])
-        if meta.split()[0] == '120000' and owned:
+        owned = path in OWNED_FILES or any(path == d or path.startswith(d + '/') for d in OWNED_DIRS)
+        if meta.split()[0] in ('120000', '160000') and owned:  # a link or a submodule where a page belongs
             _git(['rm', '-q', '--cached', '--', path], repo, env)
-            (repo / path).unlink(missing_ok=True)
+            target = repo / path
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
             healed.append(path)
     for d in OWNED_DIRS:
         target = repo / d

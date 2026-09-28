@@ -184,6 +184,22 @@ class ReportsRepoTests(unittest.TestCase):
         self.assertNotIn('120000', modes.values())
         self.assertEqual(reports.sync(self.store, self.cfg, AT)['pushed'], False)  # healed for good
 
+    def test_a_submodule_entry_or_an_odd_file_name_does_not_stop_publishing(self):
+        reports.sync(self.store, self.cfg, AT)
+        git('clone', '-q', str(self.bare), str(self.claude), cwd=self.tmp.name)
+        commit = git('rev-parse', 'HEAD', cwd=self.claude).strip()
+        git('update-index', '--add', '--cacheinfo', f'160000,{commit},weekly', cwd=self.claude)
+        (self.claude / 'checks').mkdir()
+        (self.claude / 'checks' / os.fsdecode(b'\xff\xfe.md')).write_text('x')
+        git('add', 'checks', cwd=self.claude);git('commit', '-q', '-m', 'odd', cwd=self.claude);git('push', '-q', 'origin', 'main', cwd=self.claude)
+        weekly = self.data / 'workflow' / 'evaluation' / 'weekly'
+        weekly.mkdir(parents=True)
+        (weekly / '2026-W40.md').write_text('# 周报\n', encoding='utf-8')
+        result = reports.sync(self.store, self.cfg, AT)
+        self.assertIn('weekly', result['healed'])
+        self.assertTrue(result['pushed'])
+        self.assertIn('weekly/2026-W40.md', self.remote_files())
+
     def test_a_push_the_remote_refuses_is_an_error_not_a_success(self):
         real = reports._git
         def refusing(args, cwd, env, check=True):

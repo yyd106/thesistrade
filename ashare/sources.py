@@ -87,9 +87,10 @@ def _store_quote(store, run_id, row, source, path):
 def collect_quotes(store, run_id, symbols, config=None, fetch_fn=None):
     """One batch request to qt.gtimg.cn; its quotes are stored at once. With a config that allows it, a
     symbol the batch cannot supply is then fetched from Tencent's minute endpoint: at most once a minute per
-    symbol, a few at a time, within 20 seconds overall. In settled continuous trading a batch whose newest
-    quote is older than the usable age has stopped updating, so all of it counts as missing; one stale stock
-    in a live batch is only an inactive stock and is stored as before. Every outage is recorded by
+    symbol, a few at a time, within 20 seconds overall. In settled continuous trading, when even the newest
+    quote of an exchange's stocks (of the whole batch, when either exchange has fewer than three) is older
+    than the usable age, that feed has stopped updating and all of its stocks count as missing; one stale
+    stock among live ones is only an inactive stock and is stored as before. Every outage is recorded by
     quote_health on the executing node. Raises when a symbol is left without a usable quote."""
     from . import quote_health as qh
     fetch_fn = fetch_fn or fetch
@@ -112,11 +113,16 @@ def collect_quotes(store, run_id, symbols, config=None, fetch_fn=None):
             unpriced.add(symbol)  # answered without a price (suspended): not an outage, no backup request
         except Exception as exc:
             reasons[symbol] = exc
-    if live and parsed and min(qh.age(r, at) for r in parsed.values()) > max_age:
-        newest = max(r['observed_at'] for r in parsed.values())
-        for symbol in parsed:
-            reasons[symbol] = ValueError(f'主接口整批报价停止更新（最新 {newest}）')
-        parsed = {}
+    boards = {b: {s: r for s, r in parsed.items() if s.startswith(b)} for b in ('sh', 'sz')}
+    # Per exchange when each has a few stocks, so a feed that stops for one exchange is still caught;
+    # otherwise the whole batch, so a single quiet stock is never mistaken for a stopped feed.
+    groups = boards if all(len(g) >= 3 for g in boards.values()) else {'': dict(parsed)}
+    for name, group in groups.items() if live else ():
+        if group and min(qh.age(r, at) for r in group.values()) > max_age:
+            newest = max(r['observed_at'] for r in group.values())
+            for symbol in group:
+                reasons[symbol] = ValueError(f'主接口{name.upper()}报价整体停止更新（最新 {newest}）')
+                del parsed[symbol]
     for symbol in symbols:
         if symbol in parsed:
             _store_quote(store, run_id, parsed[symbol], "tencent_public_research", path)

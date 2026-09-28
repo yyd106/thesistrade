@@ -303,6 +303,20 @@ class QuoteHealthTests(unittest.TestCase):
         self.assertEqual(self.events(), [])
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM quotes').fetchone()[0], 2)
 
+    def test_a_feed_stopped_for_one_exchange_is_caught_while_the_other_runs(self):
+        self.live.stop()
+        now_bj = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
+        stamp = lambda seconds: (now_bj - timedelta(seconds=seconds)).strftime('%Y%m%d%H%M%S')
+        shanghai, shenzhen = ['sh600000', 'sh600001', 'sh600002'], ['sz000001', 'sz000002', 'sz000003']
+        body = ''.join('v_' + s + '="' + '~'.join(fields(s, stamp=stamp(300 if s.startswith('sz') else 3))) + '";' for s in shanghai + shenzhen).encode('gb18030')
+        net = Endpoints(batch_body=body, minute_ok=False)
+        with patch('ashare.quote_health.live', return_value=True):
+            with self.assertRaises(ValueError):
+                collect_quotes(self.store, 'r', shanghai + shenzhen, self.cfg, fetch_fn=net)
+        self.assertEqual(sorted(u.rsplit('=', 1)[1] for u in net.minute_calls()), shenzhen)
+        self.assertEqual(sorted(r[0] for r in self.store.db.execute('SELECT symbol FROM quotes')), shanghai)
+        self.assertEqual(sorted(e['kind'] for e in self.events()), ['NO_QUOTE', 'PRIMARY_DOWN'])
+
     def test_stop_checks_for_one_stock_share_a_request_at_most_once_a_minute(self):
         self.hold(stop=950)
         t = datetime(2026, 9, 15, 2, 0, tzinfo=timezone.utc)
