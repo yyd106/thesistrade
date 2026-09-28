@@ -23,11 +23,15 @@ OPERATIONAL = {'collection_times', 'review_time', 'evaluation_time', 'weekly_rep
                'announcement_lookback_days', 'max_announcement_pages', 'quote_poll_seconds', 'announcement_poll_seconds',
                'recovery_interval_seconds', 'recovery_daily_limit', 'research_attempts', 'backup_hourly_keep', 'backup_daily_keep',
                'disk_free_warn_gb', 'db_size_warn_gb', 'evaluation_enabled', 'shadow_books_enabled', 'model_timeout_seconds',
-               'dynamic_model_timeout_seconds', 'scheduler_enabled'}
+               'dynamic_model_timeout_seconds', 'scheduler_enabled', 'quote_fallback_enabled', 'evaluation_min_trading_days',
+               'evaluation_auto_trading_days', 'reports_sync_enabled'}
 STRATEGY = {'paper_entry_band_bps', 'paper_stop_loss_bps', 'paper_take_profit_bps', 'plan_max_age_hours', 'model_name',
             'model_reasoning_effort', 'watchlist', 'dynamic_enabled', 'max_packet_chars', 'max_news_packet_pct',
             'evaluation_horizon_days', 'shadow_risk_per_trade_bps', 'shadow_start_date', 'research_topics',
             'comparison_peers', 'business_keywords', 'model_enabled'}
+
+# Written only by `./agent reports setup` (where the node's reports go), never by `config set`.
+SETUP = {'reports_remote'}
 
 # Operational keys the general loader leaves unbounded; changes made here must stay inside these ranges.
 LIMITS = {'pdf_downloads_per_stock': (1, 12), 'max_announcement_pages': (1, 20),
@@ -49,8 +53,9 @@ def parse_value(text):
         return text
 
 
-def apply(config_path, changes, *, reason, approved_by=None, data_dir=None):
-    """changes: {key: new_value}. Returns the change log entries. Raises before writing on any violation."""
+def apply(config_path, changes, *, reason, approved_by=None, data_dir=None, setup=False):
+    """changes: {key: new_value}. Returns the change log entries. Raises before writing on any violation.
+    setup=True is used by the reports setup command alone, for the keys in SETUP."""
     if not reason or not reason.strip():
         raise ValueError('需要写明修改理由')
     path = Path(config_path).resolve()
@@ -58,6 +63,8 @@ def apply(config_path, changes, *, reason, approved_by=None, data_dir=None):
     entries = []
     for key, value in changes.items():
         kind = classify(key)
+        if setup and key in SETUP:
+            kind = 'SETUP'
         if kind == 'FORBIDDEN':
             raise ValueError(f'{key} 不允许通过命令修改（本金、提取档位、市场范围、执行方式、硬风控与凭据类设置只能由用户本人决定）')
         if key in LIMITS:

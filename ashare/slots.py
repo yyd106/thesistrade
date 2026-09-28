@@ -27,7 +27,7 @@ def refresh_market(store,config,events=True):
         store.db.execute("INSERT INTO runs(id,job_key,kind,started_at,status) VALUES(?,?,'market',?,'RUNNING')",(rid,'market:'+rid,now()))
     status='OK';event_status={s:'NOT_CHECKED' for s in symbols}
     try:
-        sources.collect_quotes(store,rid,sorted(symbols))
+        sources.collect_quotes(store,rid,sorted(symbols),config)
     except Exception as e:
         status='FAILED';store.check(rid,'tencent_quotes',None,'FAILED',str(e)[:300],track=False)
     if events:

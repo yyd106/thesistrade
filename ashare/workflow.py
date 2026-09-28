@@ -150,6 +150,17 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                 from .digest import write as write_digest
                 from .calendar import local
                 result=write_digest(store,config,local(end or now()).date().isoformat())
+                if role(config)!='cloud':
+                    # Cut an evaluation batch once enough trading days have closed, then ask for a reports sync.
+                    from .evaluation_batches import auto as auto_batch
+                    try:
+                        batch=auto_batch(store,config)
+                        if batch:result['evaluation_batch']={k:batch.get(k) for k in ('status','id','trading_days')}
+                    except Exception as exc:
+                        result['evaluation_batch']={'status':'FAILED','error':f'{type(exc).__name__}: {str(exc)[:200]}'}
+                    if config.get('reports_sync_enabled'):
+                        from .reports import request_sync
+                        request_sync(store)
             elif command=='slot':result=run_slot(store,config,scheduled_at,use_model)
             elif command=='review':result=run_review(store,config,end,use_model)
             elif command=='settle':

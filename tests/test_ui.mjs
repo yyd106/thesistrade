@@ -425,3 +425,16 @@ const emptyStrategyCard=new FakeElement('article');
 drawGlobalRow(emptyStrategyCard,observationTarget('ETH','以太坊','COMMODITY'),foreignState);
 assert.match(JSON.stringify(emptyStrategyCard),/上一次交易策略更新时间：尚未发布/);
 console.log('Per-asset strategy timestamp and missing-publication state passed.');
+// Notices: only an admin sees them, oldest open first, one deferred with "稍后再看" stays hidden until reload.
+const nextNotice=vm.runInContext('nextNotice',context),noticeActions=vm.runInContext('noticeActions',context);
+const noticeState={notices:[{id:'N-1',status:'OPEN',kind:'DECISION'},{id:'N-2',status:'OPEN',kind:'INFO'}]};
+assert.equal(nextNotice(noticeState,new Set(),'ADMIN').id,'N-1');
+assert.equal(nextNotice(noticeState,new Set(['N-1']),'ADMIN').id,'N-2');
+assert.equal(nextNotice(noticeState,new Set(),'GUEST'),null);
+assert.equal(nextNotice({notices:[{id:'N-3',status:'ACKED',kind:'INFO'}]},new Set(),'ADMIN'),null);
+assert.equal(nextNotice({},new Set(),'ADMIN'),null);
+assert.deepEqual([...noticeActions('DECISION')].map(a=>a.action),['APPROVE','REJECT']);
+assert.ok(noticeActions('DECISION').every(a=>a.confirm));
+assert.deepEqual([...noticeActions('VETO')].map(a=>a.action),['VETO','ACK']);
+assert.deepEqual([...noticeActions('INFO')].map(a=>a.action),['ACK']);
+console.log('Notice selection, roles and per-kind answers passed.');

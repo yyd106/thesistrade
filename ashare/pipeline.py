@@ -54,7 +54,7 @@ def collect(store, run_id, config, on_ready=None):
             return None
     from .inbox import import_inbox
     attempt('report_inbox',None,lambda:import_inbox(store,config,run_id))
-    attempt("tencent_quotes", None, lambda: sources.collect_quotes(store, run_id, [i["symbol"] for i in config["watchlist"]]))
+    attempt("tencent_quotes", None, lambda: sources.collect_quotes(store, run_id, [i["symbol"] for i in config["watchlist"]], config))
     catalog = attempt("cninfo_stock_catalog", None, lambda: sources.stock_catalog(store))
     if catalog is not None:store.check(run_id,'cninfo_stock_catalog',None,'OK','股票目录已读取')
     attempt("official_news", "MARKET", lambda: sources.collect_news(store, run_id, config["news_url"]))

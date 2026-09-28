@@ -1,6 +1,6 @@
 # ThesisTrade · 研究与多资产模拟交易
 
-版本 **0.15.5**。Mac 负责数据采集、研究、组合策略和复盘；Railway 负责持续盯盘、风控及模拟执行。当前观察池包含原有22只A股和黄金、白银、比特币、以太坊四种固定资产，初始模拟资金10万元，无杠杆。没有真实券商下单或转账接口。
+版本 **0.15.6**。Mac 负责数据采集、研究、组合策略和复盘；Railway 负责持续盯盘、风控及模拟执行。当前观察池包含原有22只A股和黄金、白银、比特币、以太坊四种固定资产，初始模拟资金10万元，无杠杆。没有真实券商下单或转账接口。
 
 0.15.0 补上了策略改进的检验通道：复盘发现不再直接进入研究，而是登记为工程问题或提案草稿；每个研究与组合判断登记后满 20 个交易日按沪深300打分；四本对照账本每日并行，比较纯规则、加研究、加组合决策和规则定仓位的差异；只有用户批准的研究规则才进入研究输入。模型名称固定，实际运行的模型逐次记录。账本同步改为增量，发布包不再留完整副本。变更内容、部署顺序和验收见 [升级到 0.15.0](docs/UPGRADE_0.15.md)。
 
@@ -13,6 +13,8 @@
 0.15.4 修正 0.15.3 上线核对中发现的两处误读：税务说明里的投资者持股不再被当成回购股份，回购价格上限的计算公式不再被读成每股现金。见 [升级到 0.15.4](docs/UPGRADE_0.15.4.md)。
 
 0.15.5 让模拟账户处理持仓股的现金分红：云端在除息日之后按登记日持股把税前分红记入现金，成本止损把已收分红算进持仓价值；登记日持有的股票照常核验、调整均线；“利润分派A股实施”“派息实施”等写法也认作分红实施公告；新增只读的 `./agent dividends`。见 [升级到 0.15.5](docs/UPGRADE_0.15.5.md)。
+
+0.15.6 给行情加腾讯分时备用接口，中断记为事件、写进日报，不向 Dean 告警；评估改为按编号的批次（`EV-YYYYMMDD-HHMM`），手动生成至少间隔 3 个交易日，程序每 5 个交易日自动生成一批；只有需要 Dean 决定、可以否决或必须知道的事项才在云端网页弹窗；本机把日报和评估批次推到私有报告仓库，由 Claude 检查。见 [升级到 0.15.6](docs/UPGRADE_0.15.6.md)。
 
 部署入口：[云端工作台](https://thesistrade-production.up.railway.app/)，需要登录。架构、签名 API、12小时研究心跳及迁移恢复步骤见[云端部署说明](docs/CLOUD.md)。云端只持有验签公钥；模型凭据与签名私钥保留在本地。
 
@@ -104,6 +106,12 @@ cd /Users/dean/Documents/Codex/Agents/ashare-agent
 ./agent issues list
 ./agent event-check
 ./agent dividends
+./agent evaluation start
+./agent evaluation note <编号> --file 小结.md
+./agent evaluation list
+./agent notices new --kind DECISION --title "标题" --body-file 正文.md
+./agent notices list
+./agent reports sync
 ./agent guidance
 ./agent maintenance
 ./agent config show
@@ -134,6 +142,8 @@ ashare/                 程序
   slots.py / paper.py    Slot与模拟执行
   review.py             24小时复盘、一致性检查与发现分流
   evaluation.py / shadow.py / weekly.py / backtest.py  结论注册表、对照账本、周报、离线回测
+  evaluation_batches.py / reports.py  评估批次与私有报告仓库
+  quote_health.py / notices.py  行情备用接口与中断记录、给 Dean 的网页通知
   governance.py         工程问题、变更提案与已采纳研究规则
   build.py / model.py   版本号与固定模型调用
   maintenance.py        发布包清理、备份保留、磁盘检查

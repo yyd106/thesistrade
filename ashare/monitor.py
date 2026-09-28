@@ -26,7 +26,7 @@ def refresh(config, kind):
         status='OK'
         if kind=='quotes':
             try:
-                sources.collect_quotes(store,rid,symbols)
+                sources.collect_quotes(store,rid,symbols,config)
                 if store.db.execute("SELECT 1 FROM source_checks WHERE run_id=? AND source='tencent_quotes' AND status!='OK' LIMIT 1",(rid,)).fetchone():status='PARTIAL'
             except Exception as exc:
                 status='FAILED';store.check(rid,'tencent_quotes',None,'FAILED',str(exc)[:300],track=False)

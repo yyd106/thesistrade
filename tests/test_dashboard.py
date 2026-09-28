@@ -195,5 +195,25 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(current['last_decision']['reason'],'EXISTING_OPEN_ORDER')
         finally:store.close()
 
+    def test_admin_sees_and_answers_notices_guest_does_not(self):
+        # Dean answers notices on the page; guests never see them and cannot answer.
+        from ashare import notices
+        store=Store(self.data)
+        n=notices.create(store,title='购买稳定行情源',body='两周内持仓有 35 分钟没有报价，建议购买付费行情源。',kind='DECISION',author='claude')
+        guest_token,guest=auth.login(store,'guest','test-guest-password','test-guest');store.close()
+        code,raw,_=self.request('GET','/api/status')
+        self.assertEqual([x['id'] for x in json.loads(raw)['notices']],[n['id']])
+        code,raw,_=self.request('GET','/api/status',headers={'Cookie':auth.COOKIE+'='+guest_token})
+        self.assertEqual((code,json.loads(raw)['notices']),(200,[]))
+        code,raw,_=self.request('POST','/api/notices/decide',{'id':n['id'],'action':'APPROVE'},
+            {'X-CSRF-Token':guest['csrf_token'],'Origin':'http://127.0.0.1:8765','Cookie':auth.COOKIE+'='+guest_token})
+        self.assertEqual(code,403)
+        code,raw,_=self.request('POST','/api/notices/decide',{'id':n['id'],'action':'VETO'},{'X-CSRF-Token':self.csrf,'Origin':'http://127.0.0.1:8765'})
+        self.assertEqual(code,400)
+        code,raw,_=self.request('POST','/api/notices/decide',{'id':n['id'],'action':'APPROVE'},{'X-CSRF-Token':self.csrf,'Origin':'http://127.0.0.1:8765'})
+        self.assertEqual((code,json.loads(raw)['status']),(200,'APPROVED'))
+        code,raw,_=self.request('GET','/api/status')
+        self.assertEqual(json.loads(raw)['notices'],[])
+
 
 if __name__=='__main__':unittest.main()

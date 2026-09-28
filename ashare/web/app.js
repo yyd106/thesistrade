@@ -501,7 +501,58 @@ function render(s) {
       if(running)feedback(target,...jobMessage(running));else if($(target).classList.contains('pending'))feedback(target,'');
     }
   }
+  renderNotice(s);
   updateButtons();
+}
+// Notices for Dean: only matters that are his to decide, one at a time, oldest first. Guests never see them.
+const noticeKinds={DECISION:'需要你决定',VETO:'将自动上线 · 可以否决',INFO:'通知'};
+const noticeAuthors={agent:'运维助手',claude:'Claude',program:'程序'};
+const noticeLater=new Set();
+let noticeShown=null,noticePending=null,noticeBusy=false;
+function noticeActions(kind) {
+  return ({DECISION:[{action:'APPROVE',label:'批准',confirm:'确认批准',primary:true},{action:'REJECT',label:'不批准',confirm:'确认不批准'}],
+    VETO:[{action:'VETO',label:'否决这项改动',confirm:'确认否决',primary:true},{action:'ACK',label:'不否决'}],
+    INFO:[{action:'ACK',label:'我知道了',primary:true}]})[kind]||[{action:'ACK',label:'我知道了',primary:true}];
+}
+function nextNotice(s,later=noticeLater,role=currentUser?.role) {
+  if(role!=='ADMIN')return null;
+  return (s?.notices||[]).find(n=>n.status==='OPEN'&&!later.has(n.id))||null;
+}
+function drawNoticeActions(n) {
+  const box=$('notice-actions');box.replaceChildren();
+  for(const a of noticeActions(n.kind)){
+    const b=el('button',noticePending===a.action?a.confirm:a.label,a.primary?'primary':'');b.type='button';
+    b.addEventListener('click',()=>answerNotice(n,a,b));box.append(b);
+  }
+  const later=el('button','稍后再看');later.type='button';
+  later.addEventListener('click',()=>{noticeLater.add(n.id);noticeShown=null;$('notice-dialog').close();renderNotice(state);});
+  box.append(later);
+}
+function renderNotice(s) {
+  const dialog=$('notice-dialog');if(!dialog)return;
+  const n=nextNotice(s);
+  if(!n){if(dialog.open&&!noticeBusy)dialog.close();noticeShown=null;return;}
+  if(noticeShown===n.id&&dialog.open)return;
+  noticeShown=n.id;noticePending=null;
+  $('notice-kind').textContent=noticeKinds[n.kind]||'通知';
+  $('notice-title').textContent=n.title;
+  $('notice-meta').textContent=when(n.created_at)+' · 来自'+(noticeAuthors[n.author]||n.author)+(n.deadline?' · 请在 '+when(n.deadline)+' 前处理':'');
+  $('notice-body').textContent=n.body;
+  feedback('notice-feedback','');drawNoticeActions(n);
+  if(!dialog.open){if(dialog.showModal)dialog.showModal();else dialog.setAttribute('open','');}
+}
+async function answerNotice(n,a,button) {
+  if(noticeBusy)return;
+  if(a.confirm&&noticePending!==a.action){
+    noticePending=a.action;drawNoticeActions(n);
+    feedback('notice-feedback','再点一次“'+a.confirm+'”确认；点其他按钮可以改主意。','pending');return;
+  }
+  noticeBusy=true;button.disabled=true;feedback('notice-feedback','正在提交…','pending');
+  try{
+    await api.post('/api/notices/decide',{id:n.id,action:a.action});
+    noticeBusy=false;noticeShown=null;$('notice-dialog').close();await refresh();
+  }catch(error){feedback('notice-feedback',error.message,'error');}
+  finally{noticeBusy=false;button.disabled=false;}
 }
 function refreshProblem(error,stage='request') {
   if(error.kind==='AUTH')return {title:'登录已失效，请重新登录',detail:'后台仍可连接。重新登录后即可继续查看最新结果。',action:'login'};
@@ -586,6 +637,7 @@ async function boot() {
   document.querySelectorAll('a[href^="#"]').forEach(a=>a.addEventListener('click',()=>{const target=$(a.getAttribute('href').slice(1));if(target?.tagName==='DETAILS')target.open=true;else if(target?.id==='settings-section')target.querySelector('details').open=true;}));
   document.querySelectorAll('[data-run]').forEach(b=>{b.dataset.idleLabel=b.textContent;b.addEventListener('click',()=>runAction(b));});
   $('watchlist').addEventListener('input',()=>{editing=true;});
+  $('notice-dialog')?.addEventListener('cancel',()=>{if(noticeShown)noticeLater.add(noticeShown);noticeShown=null;});
   $('save').addEventListener('click',()=>{
     const watchlist=$('watchlist').value.trim().split('\n').filter(v=>v.trim()).map(v=>{const [symbol,...name]=v.trim().split(/\s+/);return {symbol,name:name.join(' ')||symbol};});
     if(!watchlist.length){feedback('settings-feedback','请至少填写一只自选股。','error');return;}
