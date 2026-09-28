@@ -165,6 +165,25 @@ class ReportsRepoTests(unittest.TestCase):
         repo = reports.paths(self.cfg)['repo']
         self.assertFalse(any(p.is_symlink() for p in repo.rglob('*')))
 
+    def test_links_at_paths_this_node_owns_are_replaced_by_real_pages(self):
+        reports.sync(self.store, self.cfg, AT)
+        git('clone', '-q', str(self.bare), str(self.claude), cwd=self.tmp.name)
+        state = self.claude / 'notices' / 'state.json'
+        state.unlink()
+        os.symlink('/etc/passwd', state)
+        os.symlink('/tmp', self.claude / 'digests')
+        git('add', '-A', cwd=self.claude);git('commit', '-q', '-m', 'links', cwd=self.claude);git('push', '-q', 'origin', 'main', cwd=self.claude)
+        digests = self.data / 'workflow' / 'digests'
+        digests.mkdir(parents=True, exist_ok=True)
+        (digests / '2026-09-28.md').write_text('# 运行日报\n', encoding='utf-8')
+        result = reports.sync(self.store, self.cfg, AT)
+        self.assertEqual(sorted(result['healed']), ['digests', 'notices/state.json'])
+        modes = {line.split('\t')[1]: line.split(' ')[0] for line in git('ls-tree', '-r', 'main', cwd=self.bare).splitlines()}
+        self.assertEqual(modes['notices/state.json'], '100644')
+        self.assertEqual(modes['digests/2026-09-28.md'], '100644')
+        self.assertNotIn('120000', modes.values())
+        self.assertEqual(reports.sync(self.store, self.cfg, AT)['pushed'], False)  # healed for good
+
     def test_a_push_the_remote_refuses_is_an_error_not_a_success(self):
         real = reports._git
         def refusing(args, cwd, env, check=True):

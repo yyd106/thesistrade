@@ -89,7 +89,7 @@ def cached_checks(store, config, events=True):
 
 class MarketMonitor:
     def __init__(self):
-        self.pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='market-data')
+        self.pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix='market-data')
         self.pending={};self.due={'quotes':0,'events':0}
 
     def tick(self,config):
@@ -98,12 +98,13 @@ class MarketMonitor:
             if future.done():
                 try:future.result()
                 finally:del self.pending[kind]
-        if not config['scheduler_enabled'] or not config['background_market_enabled']:return
+        if not config['scheduler_enabled']:return
         stamp=time.monotonic()
-        if phase(now())!='CONTINUOUS':
-            if 'sweep' not in self.pending and stamp>=self.due.get('sweep',0):
-                self.pending['sweep']=self.pool.submit(sweep_health,dict(config));self.due['sweep']=stamp+60
-            return
+        # Once a minute, in every phase and apart from the quote refresh: end idle outage events and run
+        # the queued stop checks for held stocks.
+        if 'health' not in self.pending and stamp>=self.due.get('health',0):
+            self.pending['health']=self.pool.submit(sweep_health,dict(config));self.due['health']=stamp+60
+        if not config['background_market_enabled'] or phase(now())!='CONTINUOUS':return
         for kind,interval in (('quotes',config['quote_poll_seconds']),('events',config['announcement_poll_seconds'])):
             if kind not in self.pending and stamp>=self.due[kind]:
                 self.pending[kind]=self.pool.submit(refresh,dict(config),kind)

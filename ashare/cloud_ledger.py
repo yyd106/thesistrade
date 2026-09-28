@@ -150,13 +150,16 @@ def export_ledger_v2(store,body,at,limit=1500):
     extras=body.get('extras')
     if isinstance(extras,dict) and not more:
         # Only asked for by 0.15.6+ research nodes, and only on the last page; older nodes never see the key.
+        from .quote_health import changed_since
+        from .notices import for_replica
         packet['extras']={}
-        if 'quote_health' in extras:
-            from .quote_health import changed_since
-            packet['extras']['quote_health']=changed_since(store,extras['quote_health'],at)
-        if isinstance(extras.get('notices'),dict):
-            from .notices import for_replica
-            packet['extras']['notices']=for_replica(store,extras['notices'])
+        for key,build in (('quote_health',lambda:changed_since(store,extras['quote_health'],at)),
+                          ('notices',lambda:for_replica(store,extras['notices']))):
+            if key not in extras:continue
+            try:packet['extras'][key]=build()
+            except Exception as exc:
+                # A bad cursor costs only this extra; the ledger itself is always answered.
+                packet['extras'][key+'_error']=f'{type(exc).__name__}: {str(exc)[:200]}'
     return packet
 
 
@@ -211,7 +214,10 @@ def import_extras(store,config,extras):
     savepoint keeps a bad extra from rolling back the ledger itself; the error is kept for the digest."""
     if not isinstance(extras,dict):return
     from datetime import datetime,timezone
+    stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
     for key,apply in (('quote_health',_mirror_health),('notices',_mirror_notices)):
+        if key+'_error' in extras:
+            put(store,'extras_error_'+key,{'at':stamp,'error':'云端：'+str(extras[key+'_error'])[:200]});continue
         if key not in extras:continue
         store.db.execute('SAVEPOINT ledger_extra')
         try:
@@ -219,7 +225,7 @@ def import_extras(store,config,extras):
             put(store,'extras_error_'+key,None)
         except Exception as exc:
             store.db.execute('ROLLBACK TO ledger_extra');store.db.execute('RELEASE ledger_extra')
-            put(store,'extras_error_'+key,{'at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'error':f'{type(exc).__name__}: {str(exc)[:200]}'})
+            put(store,'extras_error_'+key,{'at':stamp,'error':f'{type(exc).__name__}: {str(exc)[:200]}'})
 
 
 def _mirror_health(store,rows):

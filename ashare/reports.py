@@ -165,6 +165,33 @@ def _read(repo, path):
     return data.decode('utf-8')
 
 
+OWNED_FILES = ('README.md', 'notices/state.json')
+OWNED_DIRS = ('digests', 'weekly', 'evaluations', 'notices')
+
+
+def _heal(repo, env):
+    """Paths this node writes must be plain files in plain directories. A link committed there by anyone
+    (checked out as a small file), or a file where one of these directories belongs, is dropped from the
+    index and the working tree; the export then writes the real page as a regular file."""
+    healed = []
+    for entry in _git(['ls-files', '-s', '-z'], repo, env).stdout.split('\0'):
+        meta, _, path = entry.partition('\t')
+        if not path:
+            continue
+        owned = path in OWNED_FILES or any(path == d or path.startswith(d + '/') for d in OWNED_DIRS[:3])
+        if meta.split()[0] == '120000' and owned:
+            _git(['rm', '-q', '--cached', '--', path], repo, env)
+            (repo / path).unlink(missing_ok=True)
+            healed.append(path)
+    for d in OWNED_DIRS:
+        target = repo / d
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            _git(['rm', '-q', '--cached', '--ignore-unmatch', '--', d], repo, env)
+            target.unlink()
+            healed.append(d)
+    return healed
+
+
 def _copy(repo, src, dst, skipped):
     if src.stat().st_size > MAX_FILE:
         skipped.append(str(src.name))
@@ -269,6 +296,7 @@ def sync(store, config, at=None):
             _git(['checkout', '-q', '-f', '-B', 'main', 'refs/remotes/origin/main'], repo, env)
             _git(['clean', '-q', '-fd'], repo, env)
             result['imported'] = import_from(store, repo, at)
+            result['healed'] = _heal(repo, env)
         result['changed'], result['skipped'] = export(store, repo, at)
         _git(['add', '-A', '--', '.'], repo, env)
         if _git(['diff', '--cached', '--quiet'], repo, env, check=False).returncode:

@@ -1,16 +1,16 @@
 """Quote-source health on the executing node.
 
-The batch quote request (qt.gtimg.cn) is the only A-share price source. When it fails, leaves a symbol out
-or (in continuous trading) returns a quote older than the usable age, that symbol is fetched from Tencent's
-minute endpoint instead: at most once a minute per symbol, whether or not the last attempt worked, a few
-at a time and within an overall deadline. That protects against one endpoint failing or changing its
-format, not against Tencent blocking this server entirely.
+The batch quote request (qt.gtimg.cn) is the only A-share price source. When it fails, leaves a symbol out,
+or (in settled continuous trading) its whole answer has stopped updating, the affected symbols are fetched
+from Tencent's minute endpoint instead: at most once a minute per symbol, whether or not the last attempt
+worked, a few at a time and within an overall deadline. That protects against one endpoint failing or
+changing its format, not against Tencent blocking this server entirely.
 
 Every outage is recorded as an event so the daily digest, evaluation batches and the LLM reviews can judge
 whether a paid, stable feed is needed; nothing here alerts the user. For each held stock the stretch with
-no usable quote is tracked on its own, and afterwards the minute series is checked for a stop that would
-have triggered during that stretch. The check only records what happened: it never places or back-dates
-an order.
+no usable quote is tracked on its own and queued; the minute series is checked later, at most once a minute
+per stock and away from the quote refresh, for a stop that would have triggered during that stretch. The
+check only records what happened: it never places or back-dates an order.
 """
 import json
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -25,6 +25,7 @@ FALLBACK_DEADLINE = 20  # seconds for all backup requests of one refresh togethe
 # Refreshes only run in continuous trading, so a longer silence (lunch break, close, restart) ends an
 # event at its last observation instead of stretching it across the pause.
 GAP_SECONDS = 300
+CHECK_SECONDS = 60  # stop checks for one stock run at most once a minute; its queued stretches share one request
 KINDS = {'PRIMARY_DOWN': '主行情接口没有给出可用报价', 'NO_QUOTE': '主接口和备用接口都没有可用报价'}
 KEEP_DAYS = 8  # how far back a research replica is sent rows; older ones stay on the executing node
 COLUMNS = ('id', 'kind', 'started_at', 'last_seen_at', 'ended_at', 'symbols_json', 'held_json', 'detail', 'check_json', 'updated_at')
@@ -146,24 +147,25 @@ def _atomic(store, fn):
 
 
 def reserve_fallback(store, symbols, at):
-    """Split symbols the batch could not supply into (due, covered, failed_recently).
+    """Split symbols the batch could not supply into (due, covered, waiting).
     due: ask the minute endpoint now (reserved, so a concurrent refresher does not ask as well);
-    covered: asked under a minute ago with success, or being asked right now;
-    failed_recently: asked under a minute ago without success."""
+    covered: the last answer, under a minute ago, was a usable quote;
+    waiting: asked under a minute ago without a usable quote yet (failed, or still being asked by another
+    refresher). These have no usable quote now and are not asked again until the minute is up."""
     def update():
         marks = _state(store, 'quote_fallback_at', {})
-        due, covered, failed = [], set(), set()
+        due, covered, waiting = [], set(), set()
         for s in symbols:
             last = marks.get(s) if isinstance(marks.get(s), dict) else None
             if last is None or _seconds(last['at'], at) >= FALLBACK_SECONDS:
                 due.append(s)
                 marks[s] = {'at': at, 'ok': bool(last and last.get('ok')), 'pending': True}
-            elif last.get('ok') or last.get('pending'):
+            elif last.get('ok'):
                 covered.add(s)
             else:
-                failed.add(s)
+                waiting.add(s)
         _put(store, 'quote_fallback_at', marks)
-        return due, covered, failed
+        return due, covered, waiting
     return _atomic(store, update)
 
 
@@ -187,7 +189,8 @@ def _hm(stamp):
 
 
 def _track(current, missing_held, at, checks):
-    """Per held symbol, the runs of refreshes in which it had no usable quote. A run that ends is checked."""
+    """Per held symbol, the runs of refreshes in which it had no usable quote. A run that ends is queued
+    for its stop check."""
     spans = current.setdefault('spans', {})
     for s in missing_held:
         runs = spans.setdefault(s, [])
@@ -196,18 +199,18 @@ def _track(current, missing_held, at, checks):
     for s, runs in spans.items():
         if runs and runs[-1][1] is None and s not in missing_held:
             runs[-1][1] = at
-            checks.append((current['id'], s, runs[-1][0], at))
+            checks.append([current['id'], s, runs[-1][0], at])
 
 
 def _end(store, kind, current, end, at, checks):
-    """Close an event inside the caller's transaction. Stop checks need the network, so they run after it."""
+    """Close an event inside the caller's transaction; its held stocks' last stretches are queued for checks."""
     end = max(end, current['started_at'])  # two refreshers may report slightly out of order
     cross_day = []
     for s, runs in current.get('spans', {}).items():
         if runs and runs[-1][1] is None:
             runs[-1][1] = end
             if local(end).date() == local(at).date():
-                checks.append((current['id'], s, runs[-1][0], end))
+                checks.append([current['id'], s, runs[-1][0], end])
             else:
                 cross_day.append({'symbol': s, 'from': _hm(runs[-1][0]), 'to': _hm(end), 'error': '中断跨日后才核对，分时数据已无法补查'})
     row = store.db.execute('SELECT check_json FROM quote_health WHERE id=?', (current['id'],)).fetchone()
@@ -228,12 +231,36 @@ def _record_checks(store, eid, entries):
     _atomic(store, update)
 
 
+def _queue(store, checks):
+    """Inside the caller's transaction: stretches waiting for their stop check."""
+    if checks:
+        _put(store, 'quote_checks_pending', _state(store, 'quote_checks_pending', []) + checks)
+
+
+def _claim(store, at):
+    """Inside the caller's transaction: take the queued stretches of every stock not checked in the last minute."""
+    pending = _state(store, 'quote_checks_pending', [])
+    if not pending:
+        return []
+    last = _state(store, 'quote_check_at', {})
+    ready = {s for _, s, _, _ in pending if not last.get(s) or _seconds(last[s], at) >= CHECK_SECONDS}
+    claimed = [c for c in pending if c[1] in ready]
+    if claimed:
+        _put(store, 'quote_checks_pending', [c for c in pending if c[1] not in ready])
+        _put(store, 'quote_check_at', {**last, **{s: at for s in ready}})
+    return claimed
+
+
 def _run_checks(store, config, checks, fetch):
+    """One minute-series request per stock covers all of its claimed stretches."""
+    if not checks:
+        return
+    entries = gap_check(store, config, [(s, a, b) for _, s, a, b in checks], fetch=fetch)
     by_event = {}
-    for eid, symbol, start, end in checks:
-        by_event.setdefault(eid, []).append((symbol, start, end))
+    for (eid, _, _, _), entry in zip(checks, entries):
+        by_event.setdefault(eid, []).append(entry)
     for eid, items in by_event.items():
-        _record_checks(store, eid, gap_check(store, config, items, fetch=fetch))
+        _record_checks(store, eid, items)
 
 
 def observe(store, config, at, primary_failed, failed, detail='', fetch=None):
@@ -271,10 +298,10 @@ def observe(store, config, at, primary_failed, failed, detail='', fetch=None):
                 del open_events[kind]
                 changed.append(kind)
         _put(store, 'quote_health_open', open_events)
+        _queue(store, checks)
         _heal(store, open_events)
 
     _atomic(store, update)
-    _run_checks(store, config, checks, fetch)
     return changed
 
 
@@ -286,26 +313,30 @@ def _heal(store, open_events):
 
 
 def sweep(store, config, at=None, fetch=None):
-    """Outside continuous trading no refresh observes anything; end events idle past the gap now, while
-    the day's minute series is still there for the stop checks (lunch break, after the close)."""
-    if (config or {}).get('deployment_role') == 'research' or not _state(store, 'quote_health_open', {}):
+    """Run once a minute by the market monitor, apart from the quote refresh. Ends events idle past the gap
+    (lunch break, after the close, a stalled refresher) and runs the queued stop checks that are due, while
+    the day's minute series is still available. Returns the kinds of the events it ended."""
+    if (config or {}).get('deployment_role') == 'research':
+        return []
+    if not _state(store, 'quote_health_open', {}) and not _state(store, 'quote_checks_pending', []):
         return []
     at = normalize_time(at or now())
-    checks, ended = [], []
+    queued, ended = [], []
 
     def update():
         open_events = _state(store, 'quote_health_open', {})
         for kind in list(open_events):
             current = open_events[kind]
             if _seconds(current['last_seen'], at) > GAP_SECONDS:
-                _end(store, kind, current, current['last_seen'], at, checks)
+                _end(store, kind, current, current['last_seen'], at, queued)
                 del open_events[kind]
                 ended.append(kind)
         if ended:
             _put(store, 'quote_health_open', open_events)
+        _queue(store, queued)
+        return _claim(store, at)
 
-    _atomic(store, update)
-    _run_checks(store, config, checks, fetch)
+    _run_checks(store, config, _atomic(store, update), fetch)
     return ended
 
 

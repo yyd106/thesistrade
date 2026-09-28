@@ -85,11 +85,12 @@ def _store_quote(store, run_id, row, source, path):
 
 
 def collect_quotes(store, run_id, symbols, config=None, fetch_fn=None):
-    """One batch request to qt.gtimg.cn; its good quotes are stored at once. With a config that allows it, a
-    symbol the batch cannot supply (or, in continuous trading, supplies older than the usable age) is then
-    fetched from Tencent's minute endpoint: at most once a minute per symbol, a few at a time, within 20
-    seconds overall. Every outage is recorded by quote_health on the executing node. Raises when a symbol
-    is left without a usable quote."""
+    """One batch request to qt.gtimg.cn; its quotes are stored at once. With a config that allows it, a
+    symbol the batch cannot supply is then fetched from Tencent's minute endpoint: at most once a minute per
+    symbol, a few at a time, within 20 seconds overall. In settled continuous trading a batch whose newest
+    quote is older than the usable age has stopped updating, so all of it counts as missing; one stale stock
+    in a live batch is only an inactive stock and is stored as before. Every outage is recorded by
+    quote_health on the executing node. Raises when a symbol is left without a usable quote."""
     from . import quote_health as qh
     fetch_fn = fetch_fn or fetch
     at = now()
@@ -102,28 +103,27 @@ def collect_quotes(store, run_id, symbols, config=None, fetch_fn=None):
         path = store.raw(raw, ".txt")
     except Exception as exc:
         primary_error = exc
-    reasons, unpriced, primary_failed = {}, set(), []
-    for symbol in symbols:
-        reasons[symbol] = primary_error
-        if raw is None:
-            primary_failed.append(symbol)
-            continue
+    parsed, reasons, unpriced = {}, {s: primary_error for s in symbols}, set()
+    for symbol in symbols if raw is not None else ():
         try:
-            row = parse_quotes(raw, [symbol])[0]
-            if live and qh.age(row, at) > max_age:
-                raise ValueError(f"主接口报价已过时（{row['observed_at']}）")
+            parsed[symbol] = parse_quotes(raw, [symbol])[0]
         except qh.PriceUnavailable as exc:
             reasons[symbol] = exc
             unpriced.add(symbol)  # answered without a price (suspended): not an outage, no backup request
-            continue
         except Exception as exc:
             reasons[symbol] = exc
-            primary_failed.append(symbol)
-            continue
-        _store_quote(store, run_id, row, "tencent_public_research", path)
+    if live and parsed and min(qh.age(r, at) for r in parsed.values()) > max_age:
+        newest = max(r['observed_at'] for r in parsed.values())
+        for symbol in parsed:
+            reasons[symbol] = ValueError(f'主接口整批报价停止更新（最新 {newest}）')
+        parsed = {}
+    for symbol in symbols:
+        if symbol in parsed:
+            _store_quote(store, run_id, parsed[symbol], "tencent_public_research", path)
+    primary_failed = [s for s in symbols if s not in parsed and s not in unpriced]
     missing, used = list(primary_failed), 0
     if primary_failed and backup:
-        due, covered, failed_recently = qh.reserve_fallback(store, primary_failed, at)
+        due, covered, waiting = qh.reserve_fallback(store, primary_failed, at)
         results = {}
         for symbol, body in qh.fetch_many(due, fetch_fn).items():
             try:
@@ -139,9 +139,9 @@ def collect_quotes(store, run_id, symbols, config=None, fetch_fn=None):
                 reasons[symbol] = ValueError(f'{reasons[symbol]}；备用分时接口：{type(exc).__name__}: {str(exc)[:160]}')
                 results[symbol] = False
         qh.mark_fallback(store, results, at)
-        for symbol in failed_recently:
-            reasons[symbol] = ValueError(f'{reasons[symbol]}；备用分时接口一分钟内已失败，稍后重试')
-        # A symbol whose backup quote from under a minute ago is still usable (or is being fetched) is not missing.
+        for symbol in waiting:
+            reasons[symbol] = ValueError(f'{reasons[symbol]}；备用分时接口一分钟内已经问过，还没有可用报价')
+        # A symbol whose backup quote from under a minute ago is still usable is not missing.
         missing = [s for s in primary_failed if s not in covered and not results.get(s)]
     errors = [s for s in symbols if s in unpriced or s in missing]
     for symbol in errors:

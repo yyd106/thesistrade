@@ -156,7 +156,10 @@ class QuoteHealthTests(unittest.TestCase):
         qh.observe(self.store, self.cfg, start, [SYMBOL], [SYMBOL])
         qh.observe(self.store, self.cfg, '2026-09-15T02:01:00+00:00', [SYMBOL], [SYMBOL])
         orders = self.store.db.execute('SELECT count(*) FROM paper_orders').fetchone()[0]
-        qh.observe(self.store, self.cfg, end, [], [], fetch=lambda url, **kw: minute(SYMBOL))
+        net = Endpoints()
+        qh.observe(self.store, self.cfg, end, [], [], fetch=net)
+        self.assertEqual(net.calls, [])  # the check is queued, never run inside the quote refresh
+        qh.sweep(self.store, self.cfg, end, fetch=lambda url, **kw: minute(SYMBOL))
         no_quote = next(e for e in self.events() if e['kind'] == 'NO_QUOTE')
         (check,) = json.loads(no_quote['check_json'])
         self.assertEqual((check['low_cents'], check['cost_stop_cents'], check['plan_stop_cents']), (930, 940, 950))
@@ -219,7 +222,8 @@ class QuoteHealthTests(unittest.TestCase):
         start = datetime(2026, 9, 15, 1, 58, tzinfo=timezone.utc)  # 09:58 Beijing, refreshed every 10 seconds
         for i in range(36):
             qh.observe(self.store, self.cfg, (start + timedelta(seconds=10 * i)).isoformat(), [SYMBOL], [SYMBOL])
-        qh.observe(self.store, self.cfg, (start + timedelta(minutes=6)).isoformat(), [], [], fetch=lambda url, **kw: minute(SYMBOL))
+        qh.observe(self.store, self.cfg, (start + timedelta(minutes=6)).isoformat(), [], [])
+        qh.sweep(self.store, self.cfg, (start + timedelta(minutes=6)).isoformat(), fetch=lambda url, **kw: minute(SYMBOL))
         d = build(self.store, self.cfg, '2026-09-15')
         self.assertEqual((d['quotes']['held_minutes'], d['quotes']['minutes']['PRIMARY_DOWN']), (6, 6))
         self.assertIn('持仓股票有 6 分钟两个行情接口都没有可用报价，期间无法按止损卖出', d['flags'])
@@ -239,7 +243,8 @@ class QuoteHealthTests(unittest.TestCase):
             missing = [OTHER] + ([SYMBOL] if i == 179 else [])
             qh.observe(self.store, self.cfg, (t + timedelta(seconds=10 * i)).isoformat(), missing, missing)
         series = ['1000 9.95 1 1', '1005 9.30 1 1', '1010 9.90 1 1', '1029 9.95 1 1', '1030 9.96 1 1']
-        qh.observe(self.store, self.cfg, (t + timedelta(minutes=30)).isoformat(), [], [], fetch=lambda url, **kw: minute(SYMBOL, price='9.96', minutes=series))
+        qh.observe(self.store, self.cfg, (t + timedelta(minutes=30)).isoformat(), [], [])
+        qh.sweep(self.store, self.cfg, (t + timedelta(minutes=30)).isoformat(), fetch=lambda url, **kw: minute(SYMBOL, price='9.96', minutes=series))
         event = next(e for e in self.events() if e['kind'] == 'NO_QUOTE')
         self.assertEqual(json.loads(event['held_json']), {SYMBOL: [['2026-09-15T02:29:50+00:00', '2026-09-15T02:30:00+00:00']]})
         (check,) = json.loads(event['check_json'])
@@ -270,7 +275,7 @@ class QuoteHealthTests(unittest.TestCase):
         self.assertEqual((check['low_cents'], check['breached']), (945, ['plan_stop_cents']))  # the 9.40 cost stop was not reached
         self.assertEqual(qh.sweep(self.store, self.cfg, '2026-09-15T07:10:00+00:00'), [])
 
-    def test_in_live_trading_a_stale_main_quote_is_replaced_from_the_backup(self):
+    def test_in_live_trading_a_batch_that_stopped_updating_is_replaced_from_the_backup(self):
         self.live.stop()
         at = datetime.now(timezone.utc)
         stamp = lambda seconds: (at - timedelta(seconds=seconds)).astimezone(timezone(timedelta(hours=8))).strftime('%Y%m%d%H%M%S')
@@ -285,6 +290,33 @@ class QuoteHealthTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(dict(self.store.db.execute('SELECT symbol,source FROM quotes')), {SYMBOL: 'tencent_minute_fallback'})
         self.assertEqual([e['kind'] for e in self.events()], ['PRIMARY_DOWN'])
+
+    def test_one_quiet_stock_in_a_live_batch_is_not_an_outage(self):
+        self.live.stop()
+        now_bj = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
+        stamp = lambda seconds: (now_bj - timedelta(seconds=seconds)).strftime('%Y%m%d%H%M%S')
+        body = lambda old: ''.join('v_' + s + '="' + '~'.join(fields(s, stamp=stamp(old if s == SYMBOL else 3))) + '";' for s in (SYMBOL, OTHER)).encode('gb18030')
+        net = Endpoints(batch_body=body(300))
+        with patch('ashare.quote_health.live', return_value=True):
+            collect_quotes(self.store, 'r', [SYMBOL, OTHER], self.cfg, fetch_fn=net)  # SYMBOL has not traded for 5 minutes
+        self.assertEqual(net.minute_calls(), [])
+        self.assertEqual(self.events(), [])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM quotes').fetchone()[0], 2)
+
+    def test_stop_checks_for_one_stock_share_a_request_at_most_once_a_minute(self):
+        self.hold(stop=950)
+        t = datetime(2026, 9, 15, 2, 0, tzinfo=timezone.utc)
+        net = Endpoints(series=['1000 9.95 1 1', '1003 9.80 1 1'])
+        for i in range(60):  # the held stock misses every other refresh for ten minutes
+            at = (t + timedelta(seconds=10 * i)).isoformat()
+            missing = [SYMBOL] if i % 2 == 0 else []
+            qh.observe(self.store, self.cfg, at, missing, missing)
+            if i % 6 == 5:  # the monitor's sweep, once a minute
+                qh.sweep(self.store, self.cfg, at, fetch=net)
+        qh.sweep(self.store, self.cfg, (t + timedelta(minutes=11)).isoformat(), fetch=net)
+        checks = [c for e in self.events() if e['check_json'] for c in json.loads(e['check_json'])]
+        self.assertEqual(len(checks), 30)  # every stretch is checked
+        self.assertLessEqual(len(net.minute_calls()), 11)  # but with one request per minute at most
 
     def test_live_rule_starts_two_minutes_into_each_session(self):
         self.live.stop()
@@ -311,7 +343,8 @@ class QuoteHealthTests(unittest.TestCase):
     def test_a_backup_request_in_flight_is_not_repeated_by_a_second_refresher(self):
         due, covered, failed = qh.reserve_fallback(self.store, [SYMBOL, OTHER], '2026-09-15T02:00:00+00:00')
         self.assertEqual((due, covered, failed), ([SYMBOL, OTHER], set(), set()))
-        self.assertEqual(qh.reserve_fallback(self.store, [SYMBOL], '2026-09-15T02:00:05+00:00'), ([], {SYMBOL}, set()))
+        # Still being asked by the first refresher: not asked again, and not counted as having a quote.
+        self.assertEqual(qh.reserve_fallback(self.store, [SYMBOL], '2026-09-15T02:00:05+00:00'), ([], set(), {SYMBOL}))
         qh.mark_fallback(self.store, {SYMBOL: False, OTHER: True}, '2026-09-15T02:00:00+00:00')
         self.assertEqual(qh.reserve_fallback(self.store, [SYMBOL, OTHER], '2026-09-15T02:00:30+00:00'), ([], {OTHER}, {SYMBOL}))
         self.assertEqual(qh.reserve_fallback(self.store, [SYMBOL], '2026-09-15T02:01:00+00:00')[0], [SYMBOL])

@@ -135,6 +135,19 @@ class NoticeSyncTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM quote_health').fetchone()[0], 0)
         self.assertIn('字段不匹配', runtime.value(self.store, 'extras_error_quote_health')['error'])
 
+    def test_a_bad_cursor_costs_only_its_extra_on_the_cloud(self):
+        body = {'cursors': {}, 'protocol': 2, 'change_cursor': None, 'support_since': None,
+                'extras': {'quote_health': None, 'notices': {'since': 'not a time', 'known': []}}}
+        packet = self.transact(lambda: ledger.export_ledger(self.cloud, {}, self.at, body=body))
+        self.assertIn('notices_error', packet['extras'])
+        self.assertIn('quote_health', packet['extras'])
+        ledger.import_ledger(self.store, self.cfg, packet)
+        self.assertEqual(runtime.value(self.store, 'remote_ledger_version'), packet['ledger_version'])
+        self.assertTrue(runtime.value(self.store, 'extras_error_notices')['error'].startswith('云端：'))
+        from ashare.digest import build
+        flags = build(self.store, self.cfg, '2026-09-28')['flags']
+        self.assertTrue(any(f.startswith('通知与答复没有同步到本机') for f in flags))
+
     def test_outage_rows_travel_with_the_last_ledger_page_only_when_asked(self):
         cloud_cfg = self.cloud_cfg
         qh.observe(self.cloud, cloud_cfg, self.later(-600), ['sh600519'], [])

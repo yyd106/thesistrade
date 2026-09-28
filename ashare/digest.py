@@ -296,8 +296,13 @@ def execution(store, config, a, b):
 def quotes(store, a, b):
     """Quote-source outages recorded by the executing node (mirrored to the research node with the ledger)."""
     from .quote_health import summary
+    return summary(store, a, b)
+
+
+def extras_errors(store):
+    """On the research node: outage records or notice answers that failed to come over with the ledger."""
     from .cloud_runtime import value
-    return {**summary(store, a, b), 'sync_error': value(store, 'extras_error_quote_health')}
+    return {k: e for k in ('quote_health', 'notices') if (e := value(store, 'extras_error_' + k))}
 
 
 def review(store, a, b):
@@ -410,8 +415,8 @@ def flags(d, config, today):
                    + '、'.join(STOP_NAMES.get(k, k) for k in x['breached']) + f"（{x['from']}–{x['to']}），程序没有补单")
     if q['minutes']['PRIMARY_DOWN'] >= 30:
         out.append(f"主行情接口累计 {q['minutes']['PRIMARY_DOWN']} 分钟没有给出可用报价")
-    if q.get('sync_error'):
-        out.append(f"行情中断记录没有同步到本机：{q['sync_error'].get('error', '')}")
+    for key, e in (d.get('extras_errors') or {}).items():
+        out.append(f"{'行情中断记录' if key == 'quote_health' else '通知与答复'}没有同步到本机：{e.get('error', '')}")
     g = d['governance']
     strategy_changes = list(dict.fromkeys(x['key'] for x in g['config_changes'] if x.get('class') == 'STRATEGY'))
     if strategy_changes:
@@ -433,7 +438,7 @@ EMPTY = {'availability': {'spans': [], 'offline_minutes': 0, 'paused_minutes': 0
          'execution': {'fills': {}, 'orders_created': {}, 'equity_start_cents': None, 'equity_end_cents': None, 'cash_end_cents': None,
                        'marked_at': None, 'positions': [], 'risk': {}},
          'quotes': {'events': [], 'minutes': {'PRIMARY_DOWN': 0, 'NO_QUOTE': 0}, 'held_minutes': 0, 'breaches': [], 'exits_missed': [],
-                    'check_errors': 0, 'open': 0, 'sync_error': None},
+                    'check_errors': 0, 'open': 0},
          'review': {'status': 'NONE'},
          'governance': {'config_changes': [], 'proposals_new': [], 'proposals_decided': [], 'guidance_changes': [], 'issues_new': [],
                         'issues_recurring': 0, 'issues_resolved': [], 'issues_retitled': [], 'new_builds': [], 'agent_notes': []}}
@@ -466,6 +471,10 @@ def build(store, config, day):
                      ('governance', lambda: governance(store, a, b))):
         d[name] = _safe(name, fn)
     d['research']['model_studies'] = dict(d['research']['model_studies'])
+    try:
+        d['extras_errors'] = extras_errors(store)
+    except Exception:
+        d['extras_errors'] = {}
     d['flags'] = [f'日报的“{SECTION_TITLES[n]}”一节生成失败：{d[n]["error"]}' for n in SECTION_TITLES if d[n].get('error')]
     try:
         d['flags'] += flags(d, config, today)
