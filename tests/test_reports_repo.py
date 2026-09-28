@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -184,20 +185,52 @@ class ReportsRepoTests(unittest.TestCase):
         self.assertNotIn('120000', modes.values())
         self.assertEqual(reports.sync(self.store, self.cfg, AT)['pushed'], False)  # healed for good
 
-    def test_a_submodule_entry_or_an_odd_file_name_does_not_stop_publishing(self):
+    def weekly_page(self):
+        weekly = self.data / 'workflow' / 'evaluation' / 'weekly'
+        weekly.mkdir(parents=True)
+        (weekly / '2026-W40.md').write_text('# 周报\n', encoding='utf-8')
+
+    def test_a_submodule_entry_where_a_page_belongs_is_healed(self):
         reports.sync(self.store, self.cfg, AT)
         git('clone', '-q', str(self.bare), str(self.claude), cwd=self.tmp.name)
         commit = git('rev-parse', 'HEAD', cwd=self.claude).strip()
         git('update-index', '--add', '--cacheinfo', f'160000,{commit},weekly', cwd=self.claude)
-        (self.claude / 'checks').mkdir()
-        (self.claude / 'checks' / os.fsdecode(b'\xff\xfe.md')).write_text('x')
-        git('add', 'checks', cwd=self.claude);git('commit', '-q', '-m', 'odd', cwd=self.claude);git('push', '-q', 'origin', 'main', cwd=self.claude)
-        weekly = self.data / 'workflow' / 'evaluation' / 'weekly'
-        weekly.mkdir(parents=True)
-        (weekly / '2026-W40.md').write_text('# 周报\n', encoding='utf-8')
+        git('commit', '-q', '-m', 'submodule', cwd=self.claude);git('push', '-q', 'origin', 'main', cwd=self.claude)
+        self.weekly_page()
         result = reports.sync(self.store, self.cfg, AT)
         self.assertIn('weekly', result['healed'])
         self.assertTrue(result['pushed'])
+        self.assertIn('weekly/2026-W40.md', self.remote_files())
+
+    def test_healing_never_deletes_through_a_link_above_the_path(self):
+        reports.sync(self.store, self.cfg, AT)
+        outside = Path(self.tmp.name) / 'outside'
+        (outside / 'weekly').mkdir(parents=True)
+        (outside / 'weekly' / 'keep.md').write_text('keep', encoding='utf-8')
+        repo = reports.paths(self.cfg)['repo']
+        with patch('ashare.reports._git') as fake:
+            fake.return_value = subprocess.CompletedProcess([], 0, stdout='160000 abc 0\tlinked/weekly\0', stderr='')
+            (repo / 'linked').symlink_to(outside)
+            with patch('ashare.reports.OWNED_DIRS', ('linked',)):
+                with self.assertRaises(ValueError):
+                    reports._heal(repo, {})
+        self.assertTrue((outside / 'weekly' / 'keep.md').exists())
+        self.assertEqual([c.args[0][0] for c in fake.call_args_list], ['ls-files'])
+
+    @unittest.skipIf(sys.platform == 'darwin', 'APFS refuses file names that are not UTF-8')
+    def test_a_file_name_that_is_not_utf8_neither_stops_publishing_nor_hides_the_result(self):
+        reports.sync(self.store, self.cfg, AT)
+        git('clone', '-q', str(self.bare), str(self.claude), cwd=self.tmp.name)
+        (self.claude / 'checks').mkdir()
+        (self.claude / 'checks' / os.fsdecode(b'\xff\xfe.md')).write_text('x')
+        git('add', 'checks', cwd=self.claude);git('commit', '-q', '-m', 'odd', cwd=self.claude);git('push', '-q', 'origin', 'main', cwd=self.claude)
+        self.weekly_page()
+        result = reports.run_sync(self.cfg)
+        self.assertEqual((result['status'], result['pushed']), ('SYNCED', True))
+        json.dumps(result, ensure_ascii=False).encode('utf-8')  # printable by the CLI
+        state = json.loads(self.store.db.execute("SELECT value FROM service_state WHERE key='reports_sync'").fetchone()[0])
+        self.assertEqual(state['status'], 'SYNCED')
+        self.assertTrue(state['rejected'][0].startswith('checks/\ufffd\ufffd.md'))
         self.assertIn('weekly/2026-W40.md', self.remote_files())
 
     def test_a_push_the_remote_refuses_is_an_error_not_a_success(self):

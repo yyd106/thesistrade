@@ -181,8 +181,9 @@ def _heal(repo, env):
             continue
         owned = path in OWNED_FILES or any(path == d or path.startswith(d + '/') for d in OWNED_DIRS)
         if meta.split()[0] in ('120000', '160000') and owned:  # a link or a submodule where a page belongs
-            _git(['rm', '-q', '--cached', '--', path], repo, env)
             target = repo / path
+            _inside(repo, target.parent)  # a link placed by hand above it: refuse rather than delete through it
+            _git(['rm', '-q', '--cached', '--', path], repo, env)
             if target.is_dir() and not target.is_symlink():
                 shutil.rmtree(target)
             else:
@@ -329,6 +330,20 @@ def _ahead(repo, env, remote_main):
     return int(_git(['rev-list', '--count', span], repo, env).stdout.strip() or 0) > 0
 
 
+def _plain(value):
+    """Text that can be stored and printed: a file name that is not UTF-8 (carried as surrogates) shows as U+FFFD."""
+    if isinstance(value, str):
+        try:
+            return value.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
+        except UnicodeEncodeError:
+            return value.encode('utf-8', 'backslashreplace').decode('utf-8')
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if isinstance(value, dict):
+        return {_plain(k): _plain(v) for k, v in value.items()}
+    return value
+
+
 def run_sync(config):
     """Scheduler entry: one sync at a time, the outcome kept in service_state."""
     from .storage import Store
@@ -348,6 +363,7 @@ def run_sync(config):
             if str(exc).startswith('BUSY:'):
                 return {'status': 'BUSY'}
             result = state = {'at': now(), 'status': 'FAILED', 'error': f'{type(exc).__name__}: {str(exc)[:300]}'}
+        result, state = _plain(result), _plain(state)
         with store.db:
             store.db.execute("INSERT OR REPLACE INTO service_state VALUES('reports_sync',?)", (json.dumps(state, ensure_ascii=False),))
         return result
