@@ -435,7 +435,34 @@ function drawDailyReview(body,r) {
   const lessons=analysis.lessons||[];if(lessons.length){const d=details('本次经验（待验证）','lessons:'+r.id);lessons.forEach(l=>d.append(el('p',l.lesson)));body.append(d);}
   body.append(el('p','第 '+r.revision+' 版 · 生成于 '+shortTime(r.ready_at),'subtle'));
 }
+function supervisionLabel(item) {
+  const status={PENDING:'待审查',RUNNING:'审查中',DEFERRED:'待审查 · 等待重试',STALE:'材料已变化 · 旧结论仅供追溯'};
+  if(item.status!=='SUCCEEDED')return status[item.status]||'待审查';
+  const verdict={RECOMMEND:'建议通过',REVISE:'退回修改建议',INSUFFICIENT:'证据不足',REJECT:'建议驳回'};
+  return '已审查 · '+(verdict[item.verdict]||'已记录')+(item.approval==='WAITING_USER'?' · 等待你批准':'');
+}
+function drawSupervision(box,data) {
+  const items=data?.items||[];
+  if(!items.length)box.append(el('p','评估批次或完整提案形成后自动排队审查。','subtle'));
+  for(const error of data?.discovery?.errors||[])box.append(el('p','材料待核实：'+error,'caution'));
+  for(const item of items){
+    const row=el('article',null,'review');
+    row.append(el('h3',item.title),el('p',supervisionLabel(item),item.status==='DEFERRED'?'caution':'subtle'));
+    if(item.summary)row.append(el('p',item.summary));
+    if(item.error)row.append(el('p',item.error,'caution'));
+    if(item.status==='DEFERRED')row.append(el('p',item.attempts>=3?'自动重试已用完，待人工核查。':'下次重试不早于 '+shortTime(item.next_attempt_at),'subtle'));
+    row.append(el('p',({BATCH:'运行与评估',PROPOSAL:'方案审查',FOLLOWUP:'上线后复核'})[item.kind]+' · '+(item.reviewer==='chatgpt'?'ChatGPT':item.reviewer)+' · '+shortTime(item.finished_at||item.created_at),'subtle'));
+    const d=details('查看审查依据','supervision:'+item.id);
+    for(const c of item.result?.checks||[])d.append(el('p',({evidence:'证据',version:'版本对应',attribution:'效果归因',counterexamples:'反证',validation:'检验方案',risk:'风险边界'})[c.id]+'：'+c.reason));
+    for(const c of item.result?.counterexamples||[])d.append(el('p','可能推翻结论：'+c));
+    for(const step of item.result?.next_steps||[])d.append(el('p','后续：'+step));
+    d.append(el('p','审查 '+item.id+' · '+item.review_version+' · 材料 '+item.input_hash,'subtle'));
+    if(item.batch_id)d.append(el('p','评估批次 '+item.batch_id+' · 批次生成版本 '+item.build_id,'subtle'));
+    row.append(d);box.append(row);
+  }
+}
 function renderActivity(s) {
+  if($('supervision'))renderChanged('supervision',s.supervision||{items:[]},box=>drawSupervision(box,s.supervision));
   const market=s.market_phase==='CONTINUOUS';
   const nextSlot=s.next_runs.find(r=>r.kind==='slot');
   $('slot-timing').textContent=(market?'交易时段':'当前休市')+(nextSlot?' · 下次检查 '+shortTime(nextSlot.scheduled_at):'');
@@ -506,7 +533,7 @@ function render(s) {
 }
 // Notices for Dean: only matters that are his to decide, one at a time, oldest first. Guests never see them.
 const noticeKinds={DECISION:'需要你决定',VETO:'将自动上线 · 可以否决',INFO:'通知'};
-const noticeAuthors={agent:'运维助手',claude:'Claude',program:'程序'};
+const noticeAuthors={agent:'运维助手',claude:'Claude（历史审查）',program:'程序',reviewer:'外部审查员',chatgpt:'ChatGPT 审查'};
 const noticeLater=new Set(),noticeAnswered=new Set();
 let noticeShown=null,noticePending=null,noticeBusy=false;
 function noticeActions(kind) {

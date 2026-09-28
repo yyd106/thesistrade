@@ -37,7 +37,9 @@ DEFAULTS = {
  # Evaluation batches: a manual request needs this many new trading days (--force overrides);
  # one is also cut automatically every N trading days after the digest (0 disables).
  'evaluation_min_trading_days':3,'evaluation_auto_trading_days':5,
- # Private reports repository (digests, batches, notices) that Claude reads; set up with `./agent reports setup`.
+ # Local supervision uses separate subscription sessions and never changes production rules.
+ 'supervision_enabled':True,'supervision_timeout_seconds':180,
+ # Optional private summary backup and external reviewer exchange.
  'reports_sync_enabled':False,'reports_remote':None,'reports_repo_dir':None,'reports_ssh_key':None
 }
 
@@ -116,8 +118,10 @@ def validate_settings(config):
         if not isinstance(config[k],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',config[k]):raise ValueError(k+'格式错误')
     for k,lo,hi in (('evaluation_min_trading_days',1,10),('evaluation_auto_trading_days',0,20)):
         if type(config[k]) is not int or not lo<=config[k]<=hi:raise ValueError(f'{k}必须为{lo}到{hi}之间整数')
-    for k in ('quote_fallback_enabled','reports_sync_enabled'):
+    for k in ('quote_fallback_enabled','reports_sync_enabled','supervision_enabled'):
         if type(config[k]) is not bool:raise ValueError(k+'须为true或false')
+    if type(config['supervision_timeout_seconds']) is not int or not 60<=config['supervision_timeout_seconds']<=300:
+        raise ValueError('supervision_timeout_seconds须为60到300之间整数')
     if config['reports_remote'] is not None and (not isinstance(config['reports_remote'],str) or not re.fullmatch(r'git@github\.com:[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}\.git',config['reports_remote'])):
         raise ValueError('reports_remote须为 git@github.com:<owner>/<repo>.git')
     for k in ('reports_repo_dir','reports_ssh_key'):

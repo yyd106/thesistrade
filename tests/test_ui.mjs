@@ -50,6 +50,16 @@ class FakeElement {
 }
 context.document.createElement=tag=>new FakeElement(tag);
 const showFailures=vm.runInContext('renderFailures',context);
+const supervisionLabel=vm.runInContext('supervisionLabel',context);
+assert.match(supervisionLabel({status:'SUCCEEDED',verdict:'RECOMMEND',approval:'WAITING_USER'}),/建议通过.*等待你批准/);
+assert.match(supervisionLabel({status:'SUCCEEDED',verdict:'INSUFFICIENT'}),/证据不足/);
+assert.doesNotMatch(supervisionLabel({status:'STALE',verdict:'RECOMMEND',approval:'WAITING_USER'}),/建议通过|等待你批准/);
+assert.match(supervisionLabel({status:'DEFERRED'}),/等待重试/);
+const drawSupervision=vm.runInContext('drawSupervision',context);
+const supervisorCard=new FakeElement('div');
+drawSupervision(supervisorCard,{items:[{id:'SR-test',kind:'PROPOSAL',title:'<script>untrusted</script>',status:'SUCCEEDED',verdict:'INSUFFICIENT',reviewer:'chatgpt',created_at:'2026-09-28T08:00:00Z',input_hash:'hash',review_version:'v1',result:{counterexamples:['可能来自市场上涨'],checks:[],next_steps:[]}}]});
+assert.match(JSON.stringify(supervisorCard),/证据不足/);
+assert.match(JSON.stringify(supervisorCard),/可能来自市场上涨/);
 const item={name:'迈威生物',failures:[{label:'历史价格与均线',title:'',reason:'收到的数据格式无法正确读取。',impact:'暂时不能更新参考价。',last_failed_at:'2026-09-17T03:47:27Z'}]};
 let card=new FakeElement('article');showFailures(card,item);
 assert.equal(card.children[0].attrs['aria-label'],'迈威生物失败项');

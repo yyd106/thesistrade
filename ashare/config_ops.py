@@ -24,7 +24,7 @@ OPERATIONAL = {'collection_times', 'review_time', 'evaluation_time', 'weekly_rep
                'recovery_interval_seconds', 'recovery_daily_limit', 'research_attempts', 'backup_hourly_keep', 'backup_daily_keep',
                'disk_free_warn_gb', 'db_size_warn_gb', 'evaluation_enabled', 'shadow_books_enabled', 'model_timeout_seconds',
                'dynamic_model_timeout_seconds', 'scheduler_enabled', 'quote_fallback_enabled', 'evaluation_min_trading_days',
-               'evaluation_auto_trading_days', 'reports_sync_enabled'}
+               'evaluation_auto_trading_days', 'reports_sync_enabled', 'supervision_enabled', 'supervision_timeout_seconds'}
 STRATEGY = {'paper_entry_band_bps', 'paper_stop_loss_bps', 'paper_take_profit_bps', 'plan_max_age_hours', 'model_name',
             'model_reasoning_effort', 'watchlist', 'dynamic_enabled', 'max_packet_chars', 'max_news_packet_pct',
             'evaluation_horizon_days', 'shadow_risk_per_trade_bps', 'shadow_start_date', 'research_topics',

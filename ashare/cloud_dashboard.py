@@ -50,6 +50,7 @@ def status(store,config):
         p=active_plan(store,item['asset'],at)
         item['trade_plan']={**p,'payload':json.loads(p['payload_json'])} if p else None
     cache['reviews']=value(store,'display_reviews',cache['reviews'])
+    cache['supervision']=value(store,'display_supervision',cache.get('supervision',{'items':[]}))
     result={**cache,'version':__version__,'at':at,'mode':'paper','live_execution':False,'model_auth':'LOCAL_RESEARCH','deployment_role':'cloud',
       'research_lease':lease(store,config,at),'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,'market_phase':phase(at),
       'account':a,'portfolio':portfolio(store,config,a,at),'trade_effects':trade_effects(store,config,at),'portfolio_strategy':view(store,config,at),

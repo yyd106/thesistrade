@@ -1,13 +1,13 @@
-"""Private reports repository: how program-generated pages reach Claude, and how Claude's answers come back.
+"""Optional private summary backup and external reviewer exchange.
 
 The research node (or a standalone node) pushes, with a deploy key that can write to this one repository:
   digests/<day>.md                 daily digests of the last DIGEST_DAYS days
   weekly/<year-Wnn>.md             weekly evaluation reports
   evaluations/<batch id>/<file>    evaluation batches: the manifest, every file it lists, and notes.md
   notices/state.json               every notice raised for Dean and his answer
-and imports the two kinds of file Claude writes there:
+and imports the two kinds of file external reviewers write there:
   notices/outbox/<name>.md         a notice for Dean: front matter (id, kind, title, optional deadline), then the body
-  checks/<batch id>.md             Claude's check of an evaluation batch
+  checks/<batch id>.md             an external check of an evaluation batch
 Nothing else is read from the repository and nothing in it is executed. Code never travels this way: the
 program repository and its deployment are separate. The node's database, raw documents, settings and
 secrets are never copied; only the pages listed above. Links are checked out as plain files and no path is
@@ -46,7 +46,7 @@ UNREACHABLE = ('Connection timed out', 'Connection refused', 'Network is unreach
                'Could not resolve hostname', 'port 22')
 README = """# ThesisTrade 报告仓库
 
-本仓库由研究端程序自动推送，供 Claude 检查评估批次。只存程序生成的页面，不存数据库、原始资料、设置或密钥。
+本仓库由研究端程序自动推送，用于报告摘要备份和可选外部审查。本机 ChatGPT 监督审查直接读本地报告，不依赖本仓库。这里不存数据库、原始资料、设置或密钥。
 
 | 目录 | 写入方 | 内容 |
 |---|---|---|
@@ -54,16 +54,17 @@ README = """# ThesisTrade 报告仓库
 | `weekly/` | 研究端 | 周度评估报告 |
 | `evaluations/<批次编号>/` | 研究端 | 评估批次：`manifest.json` 列出程序生成的文件和 SHA-256；`notes.md` 是桌面 agent 的小结 |
 | `notices/state.json` | 研究端 | 给 Dean 的通知和他的答复 |
-| `notices/outbox/*.md` | Claude | 给 Dean 的新通知，研究端导入后在网页弹窗 |
-| `checks/<批次编号>.md` | Claude | Claude 对该批次的检查结论，研究端导入后放进批次目录 |
+| `notices/outbox/*.md` | 外部审查员 | 给 Dean 的新通知，研究端导入后在网页弹窗 |
+| `checks/<批次编号>.md` | 外部审查员 | 检查结论，可在头部注明 reviewer、model、review_version；历史无头部文件按 Claude 兼容 |
+| `supervision/summary.json` | 本机 | 最近审查的摘要、版本和状态；不包含模型输入或日志 |
 
-Claude 写入的文件（`notices/outbox/`、`checks/`）文件名只用英文字母、数字和连字符，扩展名为 `.md`。
+外部写入文件（`notices/outbox/`、`checks/`）文件名只用英文字母、数字和连字符，扩展名为 `.md`。历史 Claude 文件保留。
 
 通知文件格式（`kind` 取 DECISION 需要决定、VETO 可否决、INFO 通知；`deadline` 可省略）：
 
 ```
 ---
-id: N-20261009-claude-feed
+id: N-20261009-reviewer-feed
 kind: DECISION
 title: 建议购买稳定的行情数据源
 deadline: 2026-10-12T12:00:00+08:00
@@ -157,7 +158,7 @@ def _write(repo, path, data):
 
 
 def _read(repo, path):
-    """Read a small regular file Claude wrote; links, devices and oversized files are refused."""
+    """Read a small external summary; links, devices and oversized files are refused."""
     target = _inside(repo, path)
     if not target.is_file():
         raise ValueError('不是普通文件')
@@ -169,7 +170,7 @@ def _read(repo, path):
 
 
 OWNED_FILES = ('README.md', 'notices/state.json')
-OWNED_DIRS = ('digests', 'weekly', 'evaluations', 'notices')
+OWNED_DIRS = ('digests', 'weekly', 'evaluations', 'notices', 'supervision')
 
 
 def _heal(repo, env):
@@ -229,21 +230,23 @@ def export(store, repo, at):
             if (folder / name).is_file():
                 changed += _copy(repo, folder / name, repo / 'evaluations' / folder.name / name, skipped)
     changed += _write(repo, repo / 'notices' / 'state.json', (json.dumps(notice_log(store), ensure_ascii=False, indent=2) + '\n').encode('utf-8'))
+    from .supervision import view
+    changed += _write(repo, repo / 'supervision' / 'summary.json', (json.dumps(view(store),ensure_ascii=False,indent=2)+'\n').encode('utf-8'))
     return changed, skipped
 
 
 def import_from(store, repo, at):
-    """Notices and batch checks Claude wrote. Bad files are listed and skipped; nothing else is read."""
+    """External notices and checks. Bad files are listed and skipped; nothing else is read."""
     from . import notices
     from .evaluation_batches import ID, record_check
     done = {'notices': [], 'checks': [], 'rejected': []}
     for f in sorted((repo / 'notices' / 'outbox').glob('*.md')):
         try:
             n = notices.parse_markdown(_read(repo, f))
-            nid = n['id'] or 'N-claude-' + re.sub(r'[^0-9A-Za-z._-]', '-', f.stem)[:60]
+            nid = n['id'] or 'N-reviewer-' + re.sub(r'[^0-9A-Za-z._-]', '-', f.stem)[:60]
             if notices.get(store, nid):
                 continue
-            notices.create(store, title=n['title'], body=n['body'], kind=n['kind'], author='claude', at=at, notice_id=nid,
+            notices.create(store, title=n['title'], body=n['body'], kind=n['kind'], author='claude' if nid.startswith('N-claude-') else 'reviewer', at=at, notice_id=nid,
                            payload={'source': 'reports:notices/outbox/' + f.name, **({'deadline': n['deadline']} if n['deadline'] else {})})
             done['notices'].append(nid)
         except Exception as exc:
@@ -252,7 +255,17 @@ def import_from(store, repo, at):
         try:
             if not ID.fullmatch(f.stem):
                 raise ValueError('文件名须为批次编号')
-            if record_check(store, f.stem, _read(repo, f), 'reports:checks/' + f.name, at):
+            text=_read(repo,f);identity={}
+            if text.startswith('---\n'):
+                header,separator,body=text[4:].partition('\n---\n')
+                if not separator:raise ValueError('审查头部未结束')
+                for line in header.splitlines():
+                    key,_,val=line.partition(':')
+                    if key.strip() in ('reviewer','model','review_version'):
+                        if not re.fullmatch(r'[A-Za-z0-9._/ -]{1,80}',val.strip()):raise ValueError('审查身份格式无效')
+                        identity[key.strip()]=val.strip()
+                identity.setdefault('reviewer','external');text=body
+            if record_check(store, f.stem, text, 'reports:checks/' + f.name, at, **identity):
                 done['checks'].append(f.stem)
         except Exception as exc:
             done['rejected'].append(f'checks/{f.name}: {str(exc)[:120]}')
@@ -278,7 +291,7 @@ def _fetch(repo, env, config, store):
 
 
 def sync(store, config, at=None):
-    """Bring the working tree to origin/main, import Claude's files, write this node's pages, push."""
+    """Bring the working tree to origin/main, import external summaries, write this node's pages, push."""
     at = normalize_time(at or now())
     if not config.get('reports_sync_enabled') or not config.get('reports_remote'):
         return {'status': 'DISABLED'}
@@ -320,7 +333,7 @@ def sync(store, config, at=None):
             raise RuntimeError('部署密钥没有写权限：在报告仓库的 Deploy keys 里重新添加，并勾选 Allow write access')
         if attempt:
             raise RuntimeError('git push 失败：' + text[-400:])
-        # Someone (Claude) pushed in between: start again from the new origin/main.
+        # Another reviewer pushed in between: start again from the new origin/main.
     return result
 
 

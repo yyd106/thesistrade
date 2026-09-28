@@ -100,7 +100,12 @@ def main():
     evb.add_argument('--force', action='store_true', help='start：交易日不足时仍生成（批次清单会注明）')
     evb.add_argument('--file', help='note：小结文件（UTF-8）');evb.add_argument('--text', help='note：小结正文')
     evb.add_argument('--replace', action='store_true', help='note：替换已有小结')
-    rp = sub.add_parser('reports', help='私有报告仓库：setup/sync/status（推送日报与评估批次，导入 Claude 的通知与检查）')
+    sp = sub.add_parser('supervision', help='本机监督审查：list/show只读；request排队；run调用独立订阅会话；retry重新排队')
+    sp.add_argument('action', choices=['list', 'show', 'request', 'run', 'retry'])
+    sp.add_argument('id', nargs='?')
+    sp.add_argument('--kind', choices=['BATCH', 'PROPOSAL', 'FOLLOWUP'], default='BATCH')
+    sp.add_argument('--batch', help='提案或上线后复核所用的固定评估批次')
+    rp = sub.add_parser('reports', help='私有报告仓库：setup/sync/status（摘要备份及外部审查交换）')
     rp.add_argument('action', choices=['setup', 'sync', 'status']);rp.add_argument('--remote', help='setup：git@github.com:<owner>/<repo>.git')
     cfgp = sub.add_parser('config', help='查看或修改设置（按类别校验并留痕）')
     cfgp.add_argument('action', choices=['show', 'set'])
@@ -250,6 +255,22 @@ def extended(args, config):
             return _store_command(args, config, store)
         finally:
             store.close()
+    if command == 'supervision':
+        from . import supervision
+        store = Store(config['data_dir'])
+        try:
+            if args.action == 'list':return supervision.view(store)
+            if not args.id:raise ValueError('需要批次、提案或审查编号')
+            if args.action == 'show':
+                row=store.db.execute('SELECT * FROM supervision_reviews WHERE id=?',(args.id,)).fetchone()
+                if not row:raise ValueError('没有该审查')
+                return dict(row)
+            if config.get('deployment_role')=='cloud':raise ValueError('监督审查只在本机研究端运行')
+            if args.action == 'request':
+                return {'status':'QUEUED','id':supervision.request(store,config,args.kind,args.id,bid=args.batch)}
+            if args.action == 'retry':return supervision.retry(store,args.id)
+            return supervision.run(store,config,args.id)
+        finally:store.close()
     if command == 'notices':
         from . import notices
         from .cloud_protocol import role

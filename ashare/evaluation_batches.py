@@ -1,6 +1,6 @@
 """Evaluation batches: numbered bundles of what the program recorded over a stretch of trading days.
 
-A batch is what the desktop agent summarizes and Claude checks, so both read exactly the same material.
+A batch is what the desktop agent summarizes and the supervisor checks against the same frozen material.
 It covers the time since the previous batch (the first one: the last seven days) and holds only
 program-generated files:
   report.md / report.json   evaluation over the period: signal registry, shadow books, builds, model use,
@@ -12,7 +12,8 @@ program-generated files:
   manifest.json             id, trigger, period, trading days, build and the SHA-256 of every file above
 Added later without touching those files:
   notes.md                  the desktop agent's summary (`./agent evaluation note`)
-  claude-check.md           Claude's check, imported from the reports repository
+  review-check.md           optional external check; historical claude-check.md stays readable
+Local subscription supervision is versioned separately under workflow/supervision/.
 
 Ids read EV-YYYYMMDD-HHMM (Beijing time of the cut). A trading day counts once its close falls inside the
 period. A request with fewer than evaluation_min_trading_days new trading days is refused unless forced
@@ -185,24 +186,47 @@ def note(store, bid, text, *, replace=False, at=None):
     return {'status': 'CHECKED' if 'check' in annex else 'NOTED', 'id': bid, 'notes': str(path.relative_to(store.root))}
 
 
-def record_check(store, bid, text, source, at=None):
-    """Claude's check, imported from the reports repository. The same text twice changes nothing."""
+def record_check(store, bid, text, source, at=None, *, reviewer='claude', model=None, review_version='legacy'):
+    """External review, with historical Claude records retained. Imports never approve proposals."""
     row = get(store, bid)
     if not row:
         return None
     sha = hashlib.sha256(text.encode('utf-8')).hexdigest()
-    if (row['annex'].get('check') or {}).get('sha256') == sha:
+    identity = {'reviewer': reviewer, 'model': model, 'review_version': review_version}
+    previous = row['annex'].get('check') or {}
+    if previous.get('sha256') == sha and all(previous.get(k, 'claude' if k=='reviewer' else 'legacy' if k=='review_version' else None)==v for k,v in identity.items()):
         return None
-    path = folder(store, bid) / 'claude-check.md'
+    out = folder(store, bid)
+    # Archive the previous imported revision, including pre-upgrade files, before updating the pointer.
+    history = out / 'check-history';history.mkdir(exist_ok=True)
+    old = out / ('claude-check.md' if previous.get('reviewer','claude')=='claude' else 'review-check.md')
+    if previous and old.exists():
+        old_sha = hashlib.sha256(old.read_bytes()+json.dumps(previous,sort_keys=True).encode()).hexdigest()
+        archived = history / (old_sha + '.md')
+        if not archived.exists():archived.write_bytes(old.read_bytes())
+        if not (history / (old_sha + '.json')).exists():json_write(history / (old_sha + '.json'), previous)
+    path = out / ('claude-check.md' if reviewer=='claude' else 'review-check.md')
     path.write_text(text, encoding='utf-8')
-    _annex(store, bid, 'check', {'sha256': sha, 'at': normalize_time(at or now()), 'source': source}, 'CHECKED')
+    metadata={'sha256': sha, 'at': normalize_time(at or now()), 'source': source, **identity}
+    revision=hashlib.sha256(text.encode()+json.dumps(metadata,sort_keys=True).encode()).hexdigest()
+    if not (history / (revision + '.md')).exists():(history / (revision + '.md')).write_text(text,encoding='utf-8')
+    if not (history / (revision + '.json')).exists():json_write(history / (revision + '.json'),metadata)
+    _annex(store, bid, 'check', metadata, 'CHECKED')
     return bid
 
 
 def listing(store, limit=30):
+    from .supervision import listing as review_listing
+    local = {}
+    for review in review_listing(store,limit=100):
+        if review['kind']=='BATCH':
+            local.setdefault(review['subject_id'],{k:review[k] for k in ('id','status','verdict','reviewer','model','review_version')})
     return [{'id': r['id'], 'created_at': r['created_at'], 'trigger': r['trigger'], 'trading_days': r['trading_days'],
              'status': r['status'], 'forced': r['manifest'].get('forced'), 'notes': bool(r['annex'].get('notes')),
-             'claude_check': bool(r['annex'].get('check'))}
+             'local_review': local.get(r['id']),
+             'review_check': bool(r['annex'].get('check')),
+             'reviewer': (r['annex'].get('check') or {}).get('reviewer','claude') if r['annex'].get('check') else None,
+             'claude_check': bool(r['annex'].get('check')) and (r['annex'].get('check') or {}).get('reviewer','claude')=='claude'}
             for r in map(_row, store.db.execute('SELECT * FROM evaluation_batches ORDER BY created_at DESC LIMIT ?', (limit,)))]
 
 
@@ -215,5 +239,7 @@ def show(store, bid):
     for name, meta in row['manifest']['files'].items():
         path = out / name
         files[name] = 'OK' if path.exists() and _sha(path) == meta['sha256'] else ('CHANGED' if path.exists() else 'MISSING')
-    return {**row, 'folder': str(out.relative_to(store.root)), 'integrity': files,
-            'notes_file': (out / 'notes.md').exists(), 'check_file': (out / 'claude-check.md').exists()}
+    from .supervision import listing as review_listing
+    local=next((r for r in review_listing(store,limit=100) if r['kind']=='BATCH' and r['subject_id']==bid),None)
+    return {**row, 'folder': str(out.relative_to(store.root)), 'integrity': files, 'local_review':local,
+            'notes_file': (out / 'notes.md').exists(), 'check_file': (out / 'review-check.md').exists() or (out / 'claude-check.md').exists()}

@@ -4,9 +4,9 @@ Under the authorization letter only matters that are his to decide reach him: it
 (DECISION), second-class changes about to go live that he may veto (VETO), and information he should see
 but need not act on, such as a drawdown halt (INFO). A recommendation to buy a stable data source is a
 DECISION. Outages, failed jobs and the like stay in the digest and the evaluation batches for the program,
-the desktop agent and Claude to handle.
+the desktop agent and supervisor to handle.
 
-Notices are written on the research node (`./agent notices new`, or imported from Claude's reports
+Notices are written on the research node (`./agent notices new`, or imported from the reports
 repository) and delivered to the cloud, which shows them and records Dean's answer; the research node
 mirrors the answer. A standalone node shows its own notices. A decision is a record only: nothing here
 carries out what was approved.
@@ -17,7 +17,7 @@ from .storage import digest, normalize_time, now
 from .calendar import local
 
 KINDS = {'DECISION': '需要你决定', 'VETO': '将自动上线，可否决', 'INFO': '通知'}
-AUTHORS = ('agent', 'claude', 'program')
+AUTHORS = ('agent', 'claude', 'program', 'reviewer', 'chatgpt')
 # Answers each kind accepts, and the status each answer leaves.
 ACTIONS = {'INFO': {'ACK': 'ACKED'}, 'DECISION': {'APPROVE': 'APPROVED', 'REJECT': 'REJECTED'},
            'VETO': {'VETO': 'VETOED', 'ACK': 'ACKED'}}
@@ -218,7 +218,7 @@ def export(store):
 
 
 def parse_markdown(text):
-    """Front matter (id, kind, title, optional deadline) plus body: the format Claude writes into
+    """Front matter (id, kind, title, optional deadline) plus body: the format a reviewer writes into
     notices/outbox/ in the reports repository."""
     m = re.match(r'\A---\n(.*?)\n---\n(.*)\Z', text.replace('\r\n', '\n'), re.S)
     if not m:

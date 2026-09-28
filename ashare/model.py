@@ -206,10 +206,15 @@ def auth_status():
         return 'UNAVAILABLE'
 
 
-def run_json(prompt, schema, folder, timeout=240):
+class ModelYield(RuntimeError):
+    """A low-priority model call yielded its own process to research; not a model failure."""
+
+
+def run_json(prompt, schema, folder, timeout=240, *, cancel_event=None):
     import os
     if os.environ.get('THESISTRADE_ROLE')=='cloud':raise RuntimeError('云端不允许调用大模型')
     if _stopping.is_set():raise RuntimeError('服务正在停止，未启动新的模型任务')
+    if cancel_event and cancel_event.is_set():raise ModelYield('让位于研究任务')
     executable = codex_executable()
     env = dict(os.environ)
     for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "CODEX_ACCESS_TOKEN"):
@@ -261,7 +266,26 @@ def run_json(prompt, schema, folder, timeout=240):
                 _processes.add(proc)
                 if _stopping.is_set():_signal(proc,signal.SIGTERM)
             try:
-                proc.communicate(prompt, timeout=timeout)
+                if cancel_event is None:
+                    proc.communicate(prompt, timeout=timeout)
+                else:
+                    deadline = time.monotonic() + timeout
+                    first = True
+                    while True:
+                        if cancel_event.is_set():
+                            _signal(proc, signal.SIGTERM)
+                            try:proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                _signal(proc, signal.SIGKILL);proc.wait()
+                            finish(exit_code=proc.returncode, yielded=True)
+                            raise ModelYield('让位于研究任务，保留本次尝试')
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:raise subprocess.TimeoutExpired(command, timeout)
+                        try:
+                            proc.communicate(prompt if first else None, timeout=min(1, remaining))
+                            break
+                        except subprocess.TimeoutExpired:
+                            first = False
             except subprocess.TimeoutExpired:
                 _signal(proc, signal.SIGTERM)
                 try:

@@ -145,6 +145,8 @@ class Scheduler:
         self.global_futures={}
         # Reports repository pushes run apart from jobs: git over the network must never delay research.
         self.reports_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='reports');self.reports_future=None;self.last_reports=None
+        self.supervision_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='supervision')
+        self.supervision_future=None;self.supervision_cancel=Event();self.last_supervision_scan=None
         self.poll_seconds=10
         from .monitor import MarketMonitor
         self.monitor=MarketMonitor()
@@ -163,6 +165,9 @@ class Scheduler:
             for r in store.db.execute("SELECT * FROM jobs WHERE status='INTERRUPTED' AND kind IN ('cycle','research','review','dynamic_cycle','global_research','portfolio_strategy')").fetchall():
                 recovery='recover:'+r['id']
                 enqueue(store,r['kind'],r['scheduled_at'],recovery)
+            if role(config)!='cloud':
+                from .supervision import recover
+                recover(store)
         finally:store.close()
 
     def work(self,job):
@@ -243,6 +248,11 @@ class Scheduler:
                 schedule_review_retry(store,config,stamp)
             from .portfolio_strategy import request
             if role(config)!='cloud':request(store,config,stamp)
+            # Research wins immediately; only the supervision subprocess is cancelled.
+            if role(config)!='cloud':
+                from .supervision import busy
+                if busy(store) or offline or not config['scheduler_enabled'] or not config.get('supervision_enabled',True):
+                    self.supervision_cancel.set()
             with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('heartbeat',?)",(stamp,))
             # Process report queues and trading Slots in separate workers; slow PDF/model calls cannot stall the clock.
             active_kinds={r[0] for r in store.db.execute("SELECT kind FROM jobs WHERE status='RUNNING'")}
@@ -301,6 +311,7 @@ class Scheduler:
                 if self.reports_future is None and (requested or self.last_reports is None or time.monotonic()-self.last_reports>=3600):
                     from .reports import run_sync
                     self.reports_future=self.reports_pool.submit(run_sync,dict(config));self.last_reports=time.monotonic()
+            if role(config)!='cloud':self.supervision_tick(store,config,stamp,offline)
             if role(config)!='cloud' and time.monotonic()-self.last_followups>=60:
                 from .followups import reconcile
                 try:
@@ -310,6 +321,26 @@ class Scheduler:
                     with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('followups_error',?)",(stamp+' '+type(exc).__name__,))
                 self.last_followups=time.monotonic()
         finally:store.close()
+
+    def supervision_tick(self,store,config,stamp,offline=None):
+        from . import supervision
+        if self.supervision_future and self.supervision_future.done():
+            try:self.supervision_future.result()
+            except Exception as exc:
+                with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('supervision_worker_error',?)",(str(exc)[:200],))
+            self.supervision_future=None
+        if offline or not config['scheduler_enabled'] or not config.get('supervision_enabled',True) or not config['model_enabled']:
+            self.supervision_cancel.set();return
+        if self.last_supervision_scan is None or time.monotonic()-self.last_supervision_scan>=60:
+            try:supervision.discover(store,config,stamp)
+            except Exception as exc:
+                with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('supervision_worker_error',?)",(str(exc)[:200],))
+            self.last_supervision_scan=time.monotonic()
+        if self.supervision_future is not None or supervision.busy(store):return
+        pending=supervision.next_pending(store,stamp)
+        if pending:
+            self.supervision_cancel=Event()
+            self.supervision_future=self.supervision_pool.submit(supervision.worker,dict(config),pending['id'],self.supervision_cancel)
 
     def credit_dividends(self,store,config,stamp):
         """Credit due cash dividends. A failure is recorded in service_state and never stops the clock."""
@@ -339,4 +370,7 @@ class Scheduler:
             self.stop.wait(self.poll_seconds)
 
     def close(self):
+        self.stop.set()
+        self.supervision_cancel.set()
+        self.supervision_pool.shutdown(wait=True,cancel_futures=True)
         self.stop.set();self.pool.shutdown(wait=True,cancel_futures=True);self.dynamic_pool.shutdown(wait=True,cancel_futures=True);self.global_pool.shutdown(wait=True,cancel_futures=True);self.monitor.close();self.sync_pool.shutdown(wait=True,cancel_futures=True);self.reports_pool.shutdown(wait=True,cancel_futures=True)

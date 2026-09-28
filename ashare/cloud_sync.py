@@ -73,7 +73,7 @@ def display_packet(config):
     from .dashboard import status
     s=status(config,overview=False)
     # UI summaries only; account, credentials, jobs, raw documents and model files are excluded.
-    keep=('watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds')
+    keep=('watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds','supervision')
     result={k:s[k] for k in keep};previews={}
     from .storage import Store
     local=Store(config['data_dir'])
@@ -284,7 +284,13 @@ def handle(store,config,path,body,at):
         return receive(store,body,at)
     if path=='/api/sync/reviews':
         for t in ('reviews','lessons','research_methods','research_improvements'):ledger.upsert(store,t,body.get(t,[]),immutable=True)
-        put(store,'display_reviews',body.get('display',[]));return {'status':'ACCEPTED'}
+        if 'display' in body:put(store,'display_reviews',body['display'])
+        if 'supervision' in body:
+            summary=body['supervision']
+            if not isinstance(summary,dict) or not isinstance(summary.get('items'),list) or len(summary['items'])>30 or len(canonical(summary))>1_000_000:
+                raise ValueError('监督摘要格式或大小无效')
+            put(store,'display_supervision',summary)
+        return {'status':'ACCEPTED'}
     raise ValueError('未知同步接口')
 
 
@@ -317,6 +323,10 @@ def sync_once(config):
             except Exception as exc:
                 # Notices wait for the next minute's sync; they never hold up the ledger or strategy.
                 with store.db:put(store,'notices_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
+            try:
+                deliver_supervision(store,config)
+            except Exception as exc:
+                with store.db:put(store,'supervision_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
             return answer or {'status':'SYNCED'}
     except Exception as exc:
         if str(exc).startswith('BUSY:'):return {'status':'BUSY'}
@@ -325,3 +335,17 @@ def sync_once(config):
             put(store,'last_sync',{'at':now(),'status':'FAILED','phase':phase,'error':str(exc)[:500]})
         raise
     finally:store.close()
+
+
+def deliver_supervision(store,config):
+    """Display-only publication. This endpoint never writes research_completed_at or a strategy."""
+    if not remote_supports(store,'supervision_summary'):return None
+    from .supervision import view
+    summary=view(store);fingerprint=digest(canonical(summary))
+    if value(store,'supervision_sent_hash')==fingerprint:return None
+    answer=request(config,'/api/sync/reviews',{'supervision':summary})
+    if answer.get('status')!='ACCEPTED':raise ValueError('云端未确认监督摘要')
+    with store.db:
+        put(store,'supervision_sent_hash',fingerprint)
+        put(store,'supervision_sync',{'at':now(),'status':'OK'})
+    return answer

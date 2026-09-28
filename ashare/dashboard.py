@@ -95,11 +95,13 @@ def status(config, *, overview=False):
         from .dynamic import view as dynamic_view
         from .observation import view as observation_view
         from .cloud_dashboard import add_strategy_times
+        from .supervision import view as supervision_view
         return add_strategy_times(store,{'deployment_role':config.get('deployment_role','standalone'),'version':__version__,'at':at,'mode':config['mode'],'live_execution':False,'model_auth':'CHATGPT_SUBSCRIPTION',
             'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,
             'market_phase':phase(at),'quote_max_age_seconds':config['quote_max_age_seconds'],'schedule':{'collection':config['collection_times'],'slots':config['slot_times'],'review':config['review_time'],
                                                'execution_mode':config['slot_execution_mode']},
             'watchlist':plans,'observation':observation_view(store,at,config),'dynamic':dynamic_view(store,config,at),'account':a,'reviews':reviews,'followups':followup_view(store,at),
+            'supervision':supervision_view(store),
             'next_runs':next_runs(config,at),'portfolio':portfolio(store,config,a,at),
             'trade_effects':trade_effects(store,config,at),'portfolio_strategy':portfolio_strategy_view(store,config,at),
             'active_jobs':[dict(r) for r in store.db.execute("SELECT * FROM jobs WHERE status IN ('PENDING','RUNNING') ORDER BY scheduled_at")],
