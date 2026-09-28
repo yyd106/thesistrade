@@ -55,6 +55,13 @@ def evaluate_inside(store, config, at, account=None):
         result['trigger_equity_cents'] = a['equity_cents']
         store.db.execute('INSERT INTO portfolio_risk_events VALUES(?,?,?)',
                          (digest('risk:'+at), at, json.dumps(result)))
+        if config.get('deployment_role') != 'research':
+            # The one risk event Dean is told about directly; the research replica never raises it twice.
+            from .notices import insert as notice
+            notice(store, kind='INFO', author='program', at=at, notice_id='N-risk-'+digest('risk:'+at)[:16],
+                   title='账户回撤触发 25% 风控',
+                   body=f'模拟账户回撤 {drawdown/100:.2f}%，达到 25% 阈值。程序已停止新买入、撤销未成交的买单，并在市场允许时逐步减仓。'
+                        '恢复买入需要你确认。这条是通知，现在不需要操作。')
     if result['halted']:
         for table in ('paper_orders', 'dynamic_orders', 'global_orders'):
             store.db.execute("UPDATE "+table+" SET status='CANCELLED',reserved_cents=0 WHERE side='BUY' AND status IN ('OPEN','PARTIAL')")

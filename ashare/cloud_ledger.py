@@ -9,7 +9,7 @@ APPEND=('quotes','dynamic_quotes','global_quotes','slots','decisions','paper_ord
 SUPPORT=('snapshots','studies','plans','global_plans','dynamic_news','dynamic_cases')
 BOOT=SUPPORT+APPEND+MUTABLE+('portfolio_runs','portfolio_decisions','reviews','lessons','research_methods','research_improvements','app_users')
 # Advertised by the cloud so a newer research node only uses what the deployed cloud understands.
-FEATURES=('ledger_v2','targeted_invalidation','display_delta','cash_dividend_credit')
+FEATURES=('ledger_v2','targeted_invalidation','display_delta','cash_dividend_credit','quote_health','notices')
 PRIMARY={'latest_trade_checks':'symbol'}
 # Appended rows the cloud later updates in place; their updates travel through the change log.
 UPDATED_APPEND=('slots',)
@@ -145,8 +145,22 @@ def export_ledger_v2(store,body,at,limit=1500):
         # Latest quotes let the replica value holdings immediately.
         existing={r['id'] for r in tables[q]}
         tables[q]+=[projection(q,r) for r in rows(store,q,'WHERE rowid IN (SELECT max(rowid) FROM '+q+' GROUP BY symbol)') if r['id'] not in existing]
-    return {'protocol':2,'at':at,'ledger_version':version(store),'tables':tables,'updated':changes,'mutable':mutable,'support':support,
+    packet={'protocol':2,'at':at,'ledger_version':version(store),'tables':tables,'updated':changes,'mutable':mutable,'support':support,
             'cursors':updated,'change_cursor':high,'full_mutable':full,'support_since':at,'more':more,'features':list(FEATURES)}
+    extras=body.get('extras')
+    if isinstance(extras,dict) and not more:
+        # Only asked for by 0.15.6+ research nodes, and only on the last page; older nodes never see the key.
+        from .quote_health import changed_since
+        from .notices import for_replica
+        packet['extras']={}
+        for key,build in (('quote_health',lambda:changed_since(store,extras['quote_health'],at)),
+                          ('notices',lambda:for_replica(store,extras['notices']))):
+            if key not in extras:continue
+            try:packet['extras'][key]=build()
+            except Exception as exc:
+                # A bad cursor costs only this extra; the ledger itself is always answered.
+                packet['extras'][key+'_error']=f'{type(exc).__name__}: {str(exc)[:200]}'
+    return packet
 
 
 def export_ledger(store,cursors,at,limit=1500,body=None):
@@ -186,12 +200,44 @@ def import_ledger_v2(store,config,packet):
         for t,records in packet['tables'].items():upsert(store,t,records,immutable=t not in UPDATED_APPEND)
         for t,records in packet['updated'].items():upsert(store,t,records)
         for t,records in packet['mutable'].items():upsert(store,t,records)
+        import_extras(store,config,packet.get('extras'))
         put(store,'ledger_cursors',packet['cursors']);put(store,'ledger_change_cursor',packet['change_cursor'])
         put(store,'ledger_support_since',packet['support_since']);put(store,'remote_features',packet.get('features',[]))
         if not packet['more']:
             put(store,'remote_ledger_version',packet['ledger_version']);put(store,'remote_ledger_at',packet['at'])
         store.db.commit()
     except BaseException:store.db.rollback();raise
+
+
+def import_extras(store,config,extras):
+    """Outage records and notices that ride on the last ledger page. Inside the import transaction, but a
+    savepoint keeps a bad extra from rolling back the ledger itself; the error is kept for the digest."""
+    if not isinstance(extras,dict):return
+    from datetime import datetime,timezone
+    stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
+    for key,apply in (('quote_health',_mirror_health),('notices',_mirror_notices)):
+        if key+'_error' in extras:
+            put(store,'extras_error_'+key,{'at':stamp,'error':'云端：'+str(extras[key+'_error'])[:200]});continue
+        if key not in extras:continue
+        store.db.execute('SAVEPOINT ledger_extra')
+        try:
+            apply(store,extras[key]);store.db.execute('RELEASE ledger_extra')
+            put(store,'extras_error_'+key,None)
+        except Exception as exc:
+            store.db.execute('ROLLBACK TO ledger_extra');store.db.execute('RELEASE ledger_extra')
+            put(store,'extras_error_'+key,{'at':stamp,'error':f'{type(exc).__name__}: {str(exc)[:200]}'})
+
+
+def _mirror_health(store,rows):
+    from .quote_health import upsert
+    upsert(store,rows)
+    if rows:put(store,'quote_health_since',max(r['updated_at'] for r in rows))
+
+
+def _mirror_notices(store,data):
+    from .notices import mirror
+    since=mirror(store,data)
+    if since:put(store,'cloud_notices_since',since)
 
 
 def import_ledger(store,config,packet):

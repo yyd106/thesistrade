@@ -7,12 +7,19 @@ from .cloud_runtime import value,put,contract
 from . import cloud_ledger as ledger
 
 
+def notices_unresolved(store):
+    from .notices import unresolved
+    return unresolved(store)
+
+
 def pull(store,config):
     if role(config)!='research':return None
     for _ in range(200):
         # An older cloud ignores the v2 fields and answers with the v1 full-table packet.
         packet=request(config,'/api/sync/ledger',{'cursors':value(store,'ledger_cursors',{}),'protocol':2,
-            'change_cursor':value(store,'ledger_change_cursor'),'support_since':value(store,'ledger_support_since')})
+            'change_cursor':value(store,'ledger_change_cursor'),'support_since':value(store,'ledger_support_since'),
+            'extras':{'quote_health':value(store,'quote_health_since'),
+                      'notices':{'since':value(store,'cloud_notices_since'),'known':notices_unresolved(store)}}})
         ledger.import_ledger(store,config,packet)
         if not packet['more']:return packet
     raise RuntimeError('账本仍在分页同步，完成前不进行组合决策或复盘')
@@ -20,6 +27,22 @@ def pull(store,config):
 
 def remote_supports(store,feature):
     return feature in (value(store,'remote_features') or [])
+
+
+def deliver_notices(store,config):
+    """Send notices written here to the cloud. Dean's answers, and notices the cloud raised itself, come
+    back with every ledger pull."""
+    from . import notices
+    if role(config)!='research' or not remote_supports(store,'notices'):return None
+    new=notices.pending(store)
+    if not new:return None
+    at=now()
+    answer=request(config,'/api/sync/notices',{'notices':[notices.outgoing(n) for n in new],'known':[]})
+    states=answer.get('states') or {}
+    with store.db:
+        notices.mark_delivered(store,[n['id'] for n in new if n['id'] in states],at)
+        notices.apply_states(store,states)
+    return {'delivered':sum(1 for n in new if n['id'] in states)}
 
 
 def source_records(store,decisions):
@@ -256,6 +279,9 @@ def handle(store,config,path,body,at):
             from .portfolio_strategy import cancel_incompatible_buys
             cancel_incompatible_buys(store,config,at,'research-invalidation')
         return {'status':'ACCEPTED','scope':'KEYS' if isinstance(keys,list) and keys and '*' not in keys else 'ALL'}
+    if path=='/api/sync/notices':
+        from .notices import receive
+        return receive(store,body,at)
     if path=='/api/sync/reviews':
         for t in ('reviews','lessons','research_methods','research_improvements'):ledger.upsert(store,t,body.get(t,[]),immutable=True)
         put(store,'display_reviews',body.get('display',[]));return {'status':'ACCEPTED'}
@@ -284,6 +310,13 @@ def sync_once(config):
                     log_interval(store.root,'offline',offline_since,recovered_at,cause='NETWORK' if local_network_error(failure) else 'CLOUD')
             phase='publish';answer=flush(store,config)
             with store.db:put(store,'last_sync',{'at':now(),'status':'OK','ledger_version':packet['ledger_version']})
+            try:
+                delivered=deliver_notices(store,config)
+                if delivered is not None:
+                    with store.db:put(store,'notices_sync',{'at':now(),'status':'OK',**delivered})
+            except Exception as exc:
+                # Notices wait for the next minute's sync; they never hold up the ledger or strategy.
+                with store.db:put(store,'notices_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
             return answer or {'status':'SYNCED'}
     except Exception as exc:
         if str(exc).startswith('BUSY:'):return {'status':'BUSY'}

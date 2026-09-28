@@ -84,6 +84,9 @@ class InvestmentTests(unittest.TestCase):
         with self.store.db:self.store.db.execute('UPDATE paper_accounts SET cash_cents=11000000')
         self.assertTrue(portfolio_risk.refresh(self.store,self.cfg,self.later(2))['halted'])
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM portfolio_risk_events').fetchone()[0],1)
+        # Dean is told once, as information; the latch staying on raises nothing more.
+        notices=[dict(r) for r in self.store.db.execute('SELECT kind,author,status,body FROM notices')]
+        self.assertEqual([(n['kind'],n['author'],n['status']) for n in notices],[('INFO','program','OPEN')]);self.assertIn('25.00%',notices[0]['body'])
         q=self.quote('ETH',at=self.later(3));p,i=self.plan('ETH',self.later(3))
         self.assertEqual(global_paper.submit(self.store,self.cfg,'ETH','BUY',q,p,i,self.later(3))['reason'],'ACCOUNT_DRAWDOWN_HALT')
     def test_withdrawal_does_not_create_drawdown_and_future_loss_uses_unit_nav(self):

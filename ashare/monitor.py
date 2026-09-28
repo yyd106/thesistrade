@@ -26,7 +26,7 @@ def refresh(config, kind):
         status='OK'
         if kind=='quotes':
             try:
-                sources.collect_quotes(store,rid,symbols)
+                sources.collect_quotes(store,rid,symbols,config)
                 if store.db.execute("SELECT 1 FROM source_checks WHERE run_id=? AND source='tencent_quotes' AND status!='OK' LIMIT 1",(rid,)).fetchone():status='PARTIAL'
             except Exception as exc:
                 status='FAILED';store.check(rid,'tencent_quotes',None,'FAILED',str(exc)[:300],track=False)
@@ -62,6 +62,19 @@ def refresh(config, kind):
     finally:store.close()
 
 
+def sweep_health(config):
+    """Outside continuous trading: end outage events that went idle and check held stocks' stops while the
+    day's minute series is still available. Never raises into the scheduler."""
+    from . import quote_health
+    store=Store(config['data_dir'])
+    try:
+        return quote_health.sweep(store,config)
+    except Exception as exc:
+        with store.db:store.db.execute('INSERT OR REPLACE INTO service_state VALUES(?,?)',('quote_health_error',now()+' '+str(exc)[:300]))
+        return None
+    finally:store.close()
+
+
 def cached_checks(store, config, events=True):
     """Only a complete, recent check is usable; neither failure nor old cache is success."""
     stamp=now();states={}
@@ -76,7 +89,7 @@ def cached_checks(store, config, events=True):
 
 class MarketMonitor:
     def __init__(self):
-        self.pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='market-data')
+        self.pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix='market-data')
         self.pending={};self.due={'quotes':0,'events':0}
 
     def tick(self,config):
@@ -85,8 +98,13 @@ class MarketMonitor:
             if future.done():
                 try:future.result()
                 finally:del self.pending[kind]
-        if not config['scheduler_enabled'] or not config['background_market_enabled'] or phase(now())!='CONTINUOUS':return
+        if not config['scheduler_enabled']:return
         stamp=time.monotonic()
+        # Once a minute, in every phase and apart from the quote refresh: end idle outage events and run
+        # the queued stop checks for held stocks.
+        if 'health' not in self.pending and stamp>=self.due.get('health',0):
+            self.pending['health']=self.pool.submit(sweep_health,dict(config));self.due['health']=stamp+60
+        if not config['background_market_enabled'] or phase(now())!='CONTINUOUS':return
         for kind,interval in (('quotes',config['quote_poll_seconds']),('events',config['announcement_poll_seconds'])):
             if kind not in self.pending and stamp>=self.due[kind]:
                 self.pending[kind]=self.pool.submit(refresh,dict(config),kind)

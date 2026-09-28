@@ -89,6 +89,19 @@ def main():
     bt.add_argument('--universe', help='CSV: symbol,start,end（当时的成分股区间）')
     bt.add_argument('--start', default='2015-01-01');bt.add_argument('--end', default=None)
     bt.add_argument('--variant', action='append', help='只跑指定变体，可重复')
+    nt = sub.add_parser('notices', help='给 Dean 的网页弹窗通知：list/new。只用于需要他决定、可以否决或必须知道的事项')
+    nt.add_argument('action', choices=['list', 'new'])
+    nt.add_argument('--status', help='list：OPEN/ACKED/APPROVED/REJECTED/VETOED')
+    nt.add_argument('--kind', choices=['DECISION', 'VETO', 'INFO'], default='DECISION', help='new：DECISION 需要决定，VETO 将自动上线可否决，INFO 通知')
+    nt.add_argument('--title', help='new：一句话标题');nt.add_argument('--body', help='new：正文')
+    nt.add_argument('--body-file', help='new：正文文件（UTF-8）');nt.add_argument('--deadline', help='new：请他在此时间前处理（ISO8601，含时区）')
+    evb = sub.add_parser('evaluation', help='评估批次：start/note/list/show（程序生成，编号 EV-YYYYMMDD-HHMM，北京时间）')
+    evb.add_argument('action', choices=['start', 'note', 'list', 'show']);evb.add_argument('id', nargs='?')
+    evb.add_argument('--force', action='store_true', help='start：交易日不足时仍生成（批次清单会注明）')
+    evb.add_argument('--file', help='note：小结文件（UTF-8）');evb.add_argument('--text', help='note：小结正文')
+    evb.add_argument('--replace', action='store_true', help='note：替换已有小结')
+    rp = sub.add_parser('reports', help='私有报告仓库：setup/sync/status（推送日报与评估批次，导入 Claude 的通知与检查）')
+    rp.add_argument('action', choices=['setup', 'sync', 'status']);rp.add_argument('--remote', help='setup：git@github.com:<owner>/<repo>.git')
     cfgp = sub.add_parser('config', help='查看或修改设置（按类别校验并留痕）')
     cfgp.add_argument('action', choices=['show', 'set'])
     cfgp.add_argument('pairs', nargs='*', help='set：key=value，value 按JSON解析')
@@ -125,6 +138,7 @@ def main():
         from .model import auth_status,codex_executable,pinned
         from .calendar import CALENDAR_VERSION,trading_day,local,next_year_warning,supported_years
         from .build import info
+        from .reports import paths as reports_paths
         executable=os.path.realpath(sys.executable)
         result = {"python": platform.python_version(), "sqlite": sqlite3.sqlite_version,
                   'python_executable':executable,
@@ -134,7 +148,10 @@ def main():
                   'calendar':CALENDAR_VERSION,'calendar_years':supported_years(),
                   'calendar_current_year_supported':trading_day(local(now()).date()) is not None,
                   'calendar_next_year_warning':next_year_warning(now()),
-                  'scheduler_enabled_in_config':config['scheduler_enabled'],'ui_url':'http://127.0.0.1:'+str(config['ui_port'])}
+                  'scheduler_enabled_in_config':config['scheduler_enabled'],'ui_url':'http://127.0.0.1:'+str(config['ui_port']),
+                  'reports_repo':{'enabled':config['reports_sync_enabled'],'remote':config['reports_remote'],
+                                  'key_exists':reports_paths(config)['key'].exists()},
+                  'quote_fallback_enabled':config['quote_fallback_enabled']}
     elif args.command == "run":
         result = run(config, kind=args.kind, job_key=args.job_key, use_model=not args.without_model, collect_data=not args.cache_only)
     else:
@@ -233,6 +250,63 @@ def extended(args, config):
             return _store_command(args, config, store)
         finally:
             store.close()
+    if command == 'notices':
+        from . import notices
+        from .cloud_protocol import role
+        store = Store(config['data_dir'])
+        try:
+            if args.action == 'list':
+                return notices.listing(store, args.status)
+            body = Path(args.body_file).read_text(encoding='utf-8') if args.body_file else args.body
+            row = notices.create(store, title=args.title, body=body, kind=args.kind, author='agent',
+                                 payload={'deadline': args.deadline} if args.deadline else None)
+            return {'status': row['status'], 'id': row['id'], 'kind': row['kind'],
+                    'delivery': '约1分钟内随云端同步送达，在云端网页弹窗' if role(config) == 'research' else '网页刷新后弹窗'}
+        finally:store.close()
+    if command == 'evaluation':
+        from . import evaluation_batches as batches
+        from .reports import request_sync, run_sync
+        store = Store(config['data_dir'])
+        try:
+            if args.action == 'start':
+                result = batches.start(store, config, trigger='manual', force=args.force)
+                if result['status'] == 'READY' and config.get('reports_sync_enabled'):
+                    pushed = run_sync(config)
+                    if pushed.get('status') in ('BUSY', 'FAILED'):
+                        request_sync(store)
+                    result['reports'] = {k: pushed.get(k) for k in ('status', 'pushed', 'error') if k in pushed}
+                return result
+            if args.action == 'list':
+                return batches.listing(store)
+            if not args.id:
+                raise ValueError('需要批次编号，例如 EV-20261009-1530')
+            if args.action == 'show':
+                return batches.show(store, args.id)
+            text = Path(args.file).read_text(encoding='utf-8') if args.file else args.text
+            result = batches.note(store, args.id, text, replace=args.replace)
+            if config.get('reports_sync_enabled'):
+                request_sync(store)
+            return result
+        finally:store.close()
+    if command == 'reports':
+        from . import reports
+        if args.action == 'setup':
+            from .config_ops import apply
+            result = reports.setup(config, args.remote)
+            result['settings'] = apply(config['config_path'], {'reports_remote': args.remote, 'reports_sync_enabled': True},
+                                       reason='设置私有报告仓库（./agent reports setup）', setup=True)['changes']
+            return result
+        if args.action == 'sync':
+            return reports.run_sync(config)
+        store = Store(config['data_dir'])
+        try:
+            p = reports.paths(config)
+            state = store.db.execute("SELECT value FROM service_state WHERE key='reports_sync'").fetchone()
+            key = Path(str(p['key']) + '.pub')
+            return {'enabled': config.get('reports_sync_enabled'), 'remote': config.get('reports_remote'),
+                    'public_key': key.read_text().strip() if key.exists() else None, 'repo_dir': str(p['repo']),
+                    'last_sync': json.loads(state[0]) if state else None}
+        finally:store.close()
     if command == 'config':
         from .config_ops import apply, classify
         if args.action == 'show':

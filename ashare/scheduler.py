@@ -143,6 +143,8 @@ class Scheduler:
         self.dynamic_futures={}
         self.global_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='global-paper')
         self.global_futures={}
+        # Reports repository pushes run apart from jobs: git over the network must never delay research.
+        self.reports_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='reports');self.reports_future=None;self.last_reports=None
         self.poll_seconds=10
         from .monitor import MarketMonitor
         self.monitor=MarketMonitor()
@@ -290,6 +292,15 @@ class Scheduler:
                 except Exception as exc:
                     with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('maintenance_error',?)",(stamp+' '+str(exc)[:300],))
                 self.last_maintenance=time.monotonic()
+            if role(config)!='cloud' and config.get('reports_sync_enabled'):
+                if self.reports_future and self.reports_future.done():
+                    try:self.reports_future.result()
+                    except Exception:pass  # run_sync records its own failures in service_state
+                    self.reports_future=None
+                requested=store.db.execute("SELECT 1 FROM service_state WHERE key='reports_sync_requested'").fetchone()
+                if self.reports_future is None and (requested or self.last_reports is None or time.monotonic()-self.last_reports>=3600):
+                    from .reports import run_sync
+                    self.reports_future=self.reports_pool.submit(run_sync,dict(config));self.last_reports=time.monotonic()
             if role(config)!='cloud' and time.monotonic()-self.last_followups>=60:
                 from .followups import reconcile
                 try:
@@ -328,4 +339,4 @@ class Scheduler:
             self.stop.wait(self.poll_seconds)
 
     def close(self):
-        self.stop.set();self.pool.shutdown(wait=True,cancel_futures=True);self.dynamic_pool.shutdown(wait=True,cancel_futures=True);self.global_pool.shutdown(wait=True,cancel_futures=True);self.monitor.close();self.sync_pool.shutdown(wait=True,cancel_futures=True)
+        self.stop.set();self.pool.shutdown(wait=True,cancel_futures=True);self.dynamic_pool.shutdown(wait=True,cancel_futures=True);self.global_pool.shutdown(wait=True,cancel_futures=True);self.monitor.close();self.sync_pool.shutdown(wait=True,cancel_futures=True);self.reports_pool.shutdown(wait=True,cancel_futures=True)

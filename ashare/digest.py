@@ -293,6 +293,18 @@ def execution(store, config, a, b):
             'positions': positions[:8], 'risk': {k: risk.get(k) for k in ('status', 'halted', 'drawdown_bps', 'peak_equity_cents') if k in risk}}
 
 
+def quotes(store, a, b):
+    """Quote-source outages recorded by the executing node (mirrored to the research node with the ledger)."""
+    from .quote_health import summary
+    return summary(store, a, b)
+
+
+def extras_errors(store):
+    """On the research node: outage records or notice answers that failed to come over with the ledger."""
+    from .cloud_runtime import value
+    return {k: e for k in ('quote_health', 'notices') if (e := value(store, 'extras_error_' + k))}
+
+
 def review(store, a, b):
     rows = _rows(store, 'SELECT r.window_end,r.revision,r.model_status,r.payload_json FROM reviews r WHERE r.window_end>? AND r.window_end<=? '
                  'ORDER BY r.window_end DESC,r.revision DESC LIMIT 1', (a, b))
@@ -393,6 +405,18 @@ def flags(d, config, today):
         out.append('复盘程序检查未通过：' + '、'.join(CHECK_NAMES.get(c, c) for c in d['review']['checks_failed']))
     if d['execution']['risk'].get('halted'):
         out.append('风控已触发暂停')
+    q = d.get('quotes') or EMPTY['quotes']
+    if q['held_minutes'] >= 5:
+        out.append(f"持仓股票有 {q['held_minutes']} 分钟两个行情接口都没有可用报价，期间无法按止损卖出")
+    elif q['minutes']['NO_QUOTE'] >= 30:
+        out.append(f"自选股累计 {q['minutes']['NO_QUOTE']} 分钟没有可用报价，期间不会买入")
+    for x in q['breaches']:
+        out.append(f"行情中断时 {x['symbol']} 的分时最低价 {_yuan(x['low_cents'])} 元触及"
+                   + '、'.join(STOP_NAMES.get(k, k) for k in x['breached']) + f"（{x['from']}–{x['to']}），程序没有补单")
+    if q['minutes']['PRIMARY_DOWN'] >= 30:
+        out.append(f"主行情接口累计 {q['minutes']['PRIMARY_DOWN']} 分钟没有给出可用报价")
+    for key, e in (d.get('extras_errors') or {}).items():
+        out.append(f"{'行情中断记录' if key == 'quote_health' else '通知与答复'}没有同步到本机：{e.get('error', '')}")
     g = d['governance']
     strategy_changes = list(dict.fromkeys(x['key'] for x in g['config_changes'] if x.get('class') == 'STRATEGY'))
     if strategy_changes:
@@ -413,11 +437,15 @@ EMPTY = {'availability': {'spans': [], 'offline_minutes': 0, 'paused_minutes': 0
                        'changes': [], 'publications': {}, 'publication_bytes': {'max': None, 'last': None}, 'longest_gap_hours': None},
          'execution': {'fills': {}, 'orders_created': {}, 'equity_start_cents': None, 'equity_end_cents': None, 'cash_end_cents': None,
                        'marked_at': None, 'positions': [], 'risk': {}},
+         'quotes': {'events': [], 'minutes': {'PRIMARY_DOWN': 0, 'NO_QUOTE': 0}, 'held_minutes': 0, 'breaches': [], 'exits_missed': [],
+                    'check_errors': 0, 'open': 0},
          'review': {'status': 'NONE'},
          'governance': {'config_changes': [], 'proposals_new': [], 'proposals_decided': [], 'guidance_changes': [], 'issues_new': [],
                         'issues_recurring': 0, 'issues_resolved': [], 'issues_retitled': [], 'new_builds': [], 'agent_notes': []}}
 SECTION_TITLES = {'availability': '本机在线', 'jobs': '任务运行', 'collection': '抓取', 'research': '研究', 'portfolio': '组合策略',
-                  'execution': '云端执行', 'review': '复盘', 'governance': '调整与治理'}
+                  'execution': '云端执行', 'quotes': '行情源', 'review': '复盘', 'governance': '调整与治理'}
+STOP_NAMES = {'cost_stop_cents': '成本止损价', 'plan_stop_cents': '计划止损价'}
+QUOTE_EVENT_NAMES = {'PRIMARY_DOWN': '主接口没有可用报价', 'NO_QUOTE': '两个接口都没有可用报价'}
 
 
 def _safe(name, fn):
@@ -438,10 +466,15 @@ def build(store, config, day):
     spans = d['availability']['spans']
     for name, fn in (('jobs', lambda: jobs(store, a, b)), ('collection', lambda: collection(store, a, b, spans)),
                      ('research', lambda: research(store, config, a, b, spans)), ('portfolio', lambda: portfolio(store, a, b)),
-                     ('execution', lambda: execution(store, config, a, b)), ('review', lambda: review(store, a, b)),
+                     ('execution', lambda: execution(store, config, a, b)), ('quotes', lambda: quotes(store, a, b)),
+                     ('review', lambda: review(store, a, b)),
                      ('governance', lambda: governance(store, a, b))):
         d[name] = _safe(name, fn)
     d['research']['model_studies'] = dict(d['research']['model_studies'])
+    try:
+        d['extras_errors'] = extras_errors(store)
+    except Exception:
+        d['extras_errors'] = {}
     d['flags'] = [f'日报的“{SECTION_TITLES[n]}”一节生成失败：{d[n]["error"]}' for n in SECTION_TITLES if d[n].get('error')]
     try:
         d['flags'] += flags(d, config, today)
@@ -530,6 +563,22 @@ def markdown(d):
         L.append('- 持仓：' + '、'.join(f"{x['name']} {x['weight_pct']}%" for x in e['positions']) + '。')
     if e['risk']:
         L.append('- 风控：' + json.dumps(e['risk'], ensure_ascii=False))
+    q = d['quotes']
+    L += ['', '## 行情源', ''] + _failed(q)
+    if q['events']:
+        L.append(f"- 主接口没有可用报价 {q['minutes']['PRIMARY_DOWN']} 分钟，两个接口都没有可用报价 {q['minutes']['NO_QUOTE']} 分钟"
+                 + (f"（其中涉及持仓 {q['held_minutes']} 分钟）" if q['held_minutes'] else '') + '。')
+        L.append('- 中断：' + '；'.join(f"{_hm(x['started_at'])}–{_hm(x['ended_at']) if x['ended_at'] else '进行中'} {QUOTE_EVENT_NAMES.get(x['kind'], x['kind'])}"
+                                         f"（{x['symbols']} 只{'，持仓 ' + '、'.join(x['held']) if x['held'] else ''}）" for x in q['events'][:12])
+                 + (f"；另有 {len(q['events']) - 12} 次" if len(q['events']) > 12 else '') + '。')
+        checked = [x for x in q['breaches']] + [x for x in q['exits_missed']]
+        if checked or q['check_errors']:
+            L.append('- 中断期间按分时补查：' + ('；'.join(
+                [f"{x['symbol']} 最低 {_yuan(x['low_cents'])} 元触及" + '、'.join(STOP_NAMES.get(k, k) for k in x['breached']) + f"（{x['from']}–{x['to']}）" for x in q['breaches']]
+                + [f"{x['symbol']} 最高 {_yuan(x['high_cents'])} 元到过计划退出价（{x['from']}–{x['to']}）" for x in q['exits_missed']]) or '没有触及止损或退出价')
+                     + (f"；{q['check_errors']} 只无法补查" if q['check_errors'] else '') + '。程序只记录，不补单。')
+    else:
+        L.append('- 没有行情中断记录。')
     v = d['review']
     L += ['', '## 复盘', ''] + _failed(v)
     if v['status'] == 'NONE':
@@ -571,8 +620,9 @@ def write(store, config, day=None):
     return {'status': 'SUCCEEDED', 'day': day, 'report': str((folder / (day + '.md')).relative_to(store.root)), 'flags': d['flags']}
 
 
-def rollup(store, config, since, until=None):
-    """One page over several days for a supervisor's periodic check."""
+def rollup(store, config, since, until=None, folder=None, stem=None):
+    """One page over several days for a supervisor's periodic check (evaluation batches write it into
+    their own folder)."""
     until = until or local(now()).date().isoformat()
     start, finish = datetime.fromisoformat(since).date(), datetime.fromisoformat(until).date()
     if finish < start:
@@ -618,8 +668,8 @@ def rollup(store, config, since, until=None):
     if last['execution']['positions']:
         L.append('- 持仓：' + '、'.join(f"{x['name']} {x['weight_pct']}%" for x in last['execution']['positions']) + '。')
     text = '\n'.join(L) + '\n'
-    folder = store.root / 'workflow' / 'digests'
-    stem = f'rollup-{since}_{until}'
+    folder = folder or store.root / 'workflow' / 'digests'
+    stem = stem or f'rollup-{since}_{until}'
     json_write(folder / (stem + '.json'), {'since': since, 'until': until, 'days': days})
     (folder / (stem + '.md')).write_text(text, encoding='utf-8')
     return {'status': 'SUCCEEDED', 'report': str((folder / (stem + '.md')).relative_to(store.root)), 'days': len(days),

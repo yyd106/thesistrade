@@ -18,6 +18,7 @@ from .workflow import task_lock
 from .reporting import next_runs,portfolio,trade_effects
 from .presentation import outstanding_failures,trader_report
 from .guidance import trade_guidance
+from .notices import open_for_display as open_notices
 from . import auth,__version__
 
 
@@ -109,7 +110,9 @@ def status(config, *, overview=False):
             'background_failures':outstanding_failures(store,'MARKET'),
             'state':dict(store.db.execute('SELECT key,value FROM service_state')),
             'documents':store.db.execute('SELECT count(*) FROM documents').fetchone()[0],
-            'snapshots':store.db.execute('SELECT count(*) FROM snapshots').fetchone()[0]})
+            'snapshots':store.db.execute('SELECT count(*) FROM snapshots').fetchone()[0],
+            # A research node delivers its notices to the cloud, where Dean answers them.
+            'notices':open_notices(store) if config.get('deployment_role','standalone')=='standalone' else []})
     finally:store.close()
 
 
@@ -197,7 +200,7 @@ def make_handler(config_path,token,port):
                 elif path.path=='/api/status':
                     value=status(cfg,overview=True)
                     if user['role']!='ADMIN':
-                        for key in ('jobs','active_jobs','source_checks','background_failures'):value[key]=[]
+                        for key in ('jobs','active_jobs','source_checks','background_failures','notices'):value[key]=[]
                         value['state']={k:v for k,v in value['state'].items() if k=='heartbeat'}
                     self.send(200,value)
                 elif path.path=='/api/observations':
@@ -321,6 +324,15 @@ def make_handler(config_path,token,port):
                         jid=busy[0] if busy else enqueue(store,kind,when,payload={'symbol':symbol} if kind=='repair' else None)
                         store.db.commit()
                         self.send(202,{'job_id':jid,'status':'QUEUED','reused':bool(busy)})
+                    finally:store.close()
+                elif self.path=='/api/notices/decide':
+                    from .notices import decide
+                    if cfg.get('deployment_role')=='research':raise auth.AuthError('通知在云端网页处理',403)
+                    if not isinstance(body.get('id'),str) or not isinstance(body.get('action'),str):raise ValueError('请求内容无效。')
+                    store=Store(cfg['data_dir'])
+                    try:
+                        row=decide(store,body['id'],body['action'],user['username'])
+                        self.send(200,{'id':row['id'],'status':row['status'],'answered_at':row['acked_at']})
                     finally:store.close()
                 elif self.path=='/api/settings':
                     if cfg.get('deployment_role')=='cloud':raise auth.AuthError('交易配置由本地研究端管理',403)

@@ -58,10 +58,10 @@ def closed_proposals(store):
                              for p in proposals(store, 'SUPERSEDED')][:30]}
 
 
-def markdown(report):
-    lines = [f"# 周度评估报告（{report['window']['from'][:10]} 至 {report['window']['to'][:10]}）", '',
+def markdown(report, title=None, period='本周'):
+    lines = [f"# {title or '周度评估报告'}（{report['window']['from'][:10]} 至 {report['window']['to'][:10]}）", '',
              '本报告由程序生成，不含模型判断。结论前先看样本量：持有期不重叠的独立样本少于30个时，差异只能当线索，不能作为改动依据。', '']
-    lines += ['## 结论注册表', '', f"评估期限：{report['horizon_days']}个交易日；本周新完成打分 {report['registry']['scored_this_week']} 条。", '',
+    lines += ['## 结论注册表', '', f"评估期限：{report['horizon_days']}个交易日；{period}新完成打分 {report['registry']['scored_this_week']} 条。", '',
               '| 比较项 | 分组 | 每日样本数 | 平均超额 | 独立样本数 | 独立样本平均超额 | 95%区间（独立） |', '|---|---|---|---|---|---|---|']
     names = {'trend_filter': '趋势过滤是否有效', 'research_veto': '研究否决是否有效（仅趋势成立样本）',
              'portfolio_allow': '组合放行是否有效（有选择余地的样本）', 'global_stance': '全球资产做多判断是否有效'}
@@ -80,7 +80,7 @@ def markdown(report):
                      f"{s['max_drawdown_pct']}% | {s['avg_exposure_pct']}% | {s['closed_trades']} | {s['win_rate'] if s['win_rate'] is not None else '—'} | "
                      f"{s['avg_held_days'] if s['avg_held_days'] is not None else '—'} |")
     lines += ['', '## 版本变化', '']
-    lines += [f"- {b['first_seen_at']}：build {b['build_id']}（代码 {b['code']}，配置 {b['config']}，模型 {b['model']}，采纳规则 {b['guidance']}）" for b in report['builds_this_week']] or ['- 本周没有新版本上线。']
+    lines += [f"- {b['first_seen_at']}：build {b['build_id']}（代码 {b['code']}，配置 {b['config']}，模型 {b['model']}，采纳规则 {b['guidance']}）" for b in report['builds_this_week']] or [f'- {period}没有新版本上线。']
     usage = report['model_usage']
     lines += ['', '## 模型调用', '', f"- 研究：{json.dumps(usage['attempts'], ensure_ascii=False)}",
               f"- 组合决策运行：{json.dumps(usage['portfolio_runs'], ensure_ascii=False)}",
