@@ -1,30 +1,33 @@
 """Quote-source health on the executing node.
 
-The batch quote request (qt.gtimg.cn) is the only A-share price source. When it fails or leaves a symbol
-out, each missing symbol is fetched from Tencent's minute endpoint instead (at most once a minute per
-symbol, whether or not the last attempt worked; a quote stays usable for 90 seconds). That protects
-against one endpoint failing or changing its format, not against Tencent blocking this server entirely.
+The batch quote request (qt.gtimg.cn) is the only A-share price source. When it fails, leaves a symbol out
+or (in continuous trading) returns a quote older than the usable age, that symbol is fetched from Tencent's
+minute endpoint instead: at most once a minute per symbol, whether or not the last attempt worked, a few
+at a time and within an overall deadline. That protects against one endpoint failing or changing its
+format, not against Tencent blocking this server entirely.
 
 Every outage is recorded as an event so the daily digest, evaluation batches and the LLM reviews can judge
-whether a paid, stable feed is needed; nothing here alerts the user. When no quote at all was available
-for held shares, the minute series is checked afterwards for a stop that would have triggered during the
-gap. That check only records what happened: it never places or back-dates an order.
+whether a paid, stable feed is needed; nothing here alerts the user. For each held stock the stretch with
+no usable quote is tracked on its own, and afterwards the minute series is checked for a stop that would
+have triggered during that stretch. The check only records what happened: it never places or back-dates
+an order.
 """
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
-from .storage import digest, normalize_time
+from .storage import digest, normalize_time, now
 from .calendar import SH, local
 
 MINUTE_URL = 'https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={symbol}'
 FALLBACK_SECONDS = 60
 FALLBACK_WORKERS = 4
+FALLBACK_DEADLINE = 20  # seconds for all backup requests of one refresh together
 # Refreshes only run in continuous trading, so a longer silence (lunch break, close, restart) ends an
 # event at its last observation instead of stretching it across the pause.
 GAP_SECONDS = 300
-KINDS = {'PRIMARY_DOWN': '主行情接口失败，已改用分时接口', 'NO_QUOTE': '两个接口都没有取到报价'}
-KEEP_DAYS = 8  # rows a research replica pulls; older ones stay on the executing node
-COLUMNS = ('id', 'kind', 'started_at', 'last_seen_at', 'ended_at', 'symbols_json', 'held_json', 'detail', 'check_json')
+KINDS = {'PRIMARY_DOWN': '主行情接口没有给出可用报价', 'NO_QUOTE': '主接口和备用接口都没有可用报价'}
+KEEP_DAYS = 8  # how far back a research replica is sent rows; older ones stay on the executing node
+COLUMNS = ('id', 'kind', 'started_at', 'last_seen_at', 'ended_at', 'symbols_json', 'held_json', 'detail', 'check_json', 'updated_at')
 
 
 class PriceUnavailable(ValueError):
@@ -77,17 +80,26 @@ def fetch_minute(symbol, fetch=None):
     return (fetch or sources.fetch)(MINUTE_URL.format(symbol=symbol), max_bytes=400000)
 
 
-def fetch_many(symbols, fetch=None):
-    """{symbol: body or exception}, a few requests at a time so a slow endpoint cannot stall the refresh."""
-    def one(symbol):
-        try:
-            return symbol, fetch_minute(symbol, fetch)
-        except Exception as exc:
-            return symbol, exc
-    if len(symbols) <= 1:
-        return dict(one(s) for s in symbols)
-    with ThreadPoolExecutor(max_workers=FALLBACK_WORKERS, thread_name_prefix='quote-fallback') as pool:
-        return dict(pool.map(one, symbols))
+def fetch_many(symbols, fetch=None, deadline=FALLBACK_DEADLINE):
+    """{symbol: body or exception}. A request still running at the deadline counts as failed; its thread
+    finishes on its own (the fetch has its own timeouts) without holding up the caller."""
+    if not symbols:
+        return {}
+    pool = ThreadPoolExecutor(max_workers=min(FALLBACK_WORKERS, len(symbols)), thread_name_prefix='quote-fallback')
+    try:
+        futures = {pool.submit(fetch_minute, s, fetch): s for s in symbols}
+        done, _ = wait(futures, timeout=deadline)
+        out = {}
+        for future, symbol in futures.items():
+            if future not in done:
+                out[symbol] = TimeoutError(f'备用分时接口超过 {deadline} 秒未返回')
+            elif future.exception() is not None:
+                out[symbol] = future.exception()
+            else:
+                out[symbol] = future.result()
+        return out
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _state(store, key, default):
@@ -103,12 +115,19 @@ def _seconds(a, b):
     return (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds()
 
 
-def fallback_due(store, symbol, at):
-    """(due, last_ok): whether the minute endpoint may be asked now, and whether its last answer worked."""
-    last = _state(store, 'quote_fallback_at', {}).get(symbol)
-    if not isinstance(last, dict):
-        return True, None
-    return _seconds(last['at'], at) >= FALLBACK_SECONDS, bool(last.get('ok'))
+def age(row, at):
+    return _seconds(row['observed_at'], at)
+
+
+def live(at):
+    """Continuous trading past the first two minutes of each session. Only then does a quote older than the
+    usable age mean the source is not updating; just after 09:30 and 13:00 the auction or pre-lunch price
+    is still the latest one."""
+    from .calendar import phase
+    if phase(at) != 'CONTINUOUS':
+        return False
+    hm = local(at).strftime('%H:%M')
+    return '09:32' <= hm < '11:30' or '13:02' <= hm < '14:57'
 
 
 def _atomic(store, fn):
@@ -126,8 +145,30 @@ def _atomic(store, fn):
         raise
 
 
+def reserve_fallback(store, symbols, at):
+    """Split symbols the batch could not supply into (due, covered, failed_recently).
+    due: ask the minute endpoint now (reserved, so a concurrent refresher does not ask as well);
+    covered: asked under a minute ago with success, or being asked right now;
+    failed_recently: asked under a minute ago without success."""
+    def update():
+        marks = _state(store, 'quote_fallback_at', {})
+        due, covered, failed = [], set(), set()
+        for s in symbols:
+            last = marks.get(s) if isinstance(marks.get(s), dict) else None
+            if last is None or _seconds(last['at'], at) >= FALLBACK_SECONDS:
+                due.append(s)
+                marks[s] = {'at': at, 'ok': bool(last and last.get('ok')), 'pending': True}
+            elif last.get('ok') or last.get('pending'):
+                covered.add(s)
+            else:
+                failed.add(s)
+        _put(store, 'quote_fallback_at', marks)
+        return due, covered, failed
+    return _atomic(store, update)
+
+
 def mark_fallback(store, results, at):
-    """results: {symbol: True when the minute endpoint supplied a quote}."""
+    """results: {symbol: True when the minute endpoint supplied a usable quote}."""
     if not results:
         return
     def update():
@@ -141,18 +182,58 @@ def held_symbols(store):
     return sorted(r[0] for r in store.db.execute('SELECT DISTINCT symbol FROM paper_lots WHERE qty>0'))
 
 
+def _hm(stamp):
+    return local(stamp).strftime('%H:%M')
+
+
+def _track(current, missing_held, at, checks):
+    """Per held symbol, the runs of refreshes in which it had no usable quote. A run that ends is checked."""
+    spans = current.setdefault('spans', {})
+    for s in missing_held:
+        runs = spans.setdefault(s, [])
+        if not runs or runs[-1][1] is not None:
+            runs.append([at, None])
+    for s, runs in spans.items():
+        if runs and runs[-1][1] is None and s not in missing_held:
+            runs[-1][1] = at
+            checks.append((current['id'], s, runs[-1][0], at))
+
+
 def _end(store, kind, current, end, at, checks):
-    """Close an event inside the caller's transaction. A NO_QUOTE gap with held shares is checked afterwards,
-    outside the transaction, because it needs the network."""
+    """Close an event inside the caller's transaction. Stop checks need the network, so they run after it."""
     end = max(end, current['started_at'])  # two refreshers may report slightly out of order
-    check = None
-    if kind == 'NO_QUOTE' and current['held']:
-        if local(end).date() != local(at).date():
-            check = [{'symbol': s, 'error': '中断跨日后才恢复，分时数据已无法补查'} for s in current['held']]
-        else:
-            checks.append((current['id'], current['started_at'], end, current['held']))
-    store.db.execute('UPDATE quote_health SET ended_at=?,last_seen_at=?,check_json=? WHERE id=?',
-                     (end, max(current['last_seen'], end), json.dumps(check, ensure_ascii=False) if check is not None else None, current['id']))
+    cross_day = []
+    for s, runs in current.get('spans', {}).items():
+        if runs and runs[-1][1] is None:
+            runs[-1][1] = end
+            if local(end).date() == local(at).date():
+                checks.append((current['id'], s, runs[-1][0], end))
+            else:
+                cross_day.append({'symbol': s, 'from': _hm(runs[-1][0]), 'to': _hm(end), 'error': '中断跨日后才核对，分时数据已无法补查'})
+    row = store.db.execute('SELECT check_json FROM quote_health WHERE id=?', (current['id'],)).fetchone()
+    existing = json.loads(row[0]) if row and row[0] else []
+    store.db.execute('UPDATE quote_health SET ended_at=?,last_seen_at=?,held_json=?,check_json=?,updated_at=? WHERE id=?',
+                     (end, max(current['last_seen'], end), json.dumps(current.get('spans', {})),
+                      json.dumps(existing + cross_day, ensure_ascii=False) if existing or cross_day else None, now(), current['id']))
+
+
+def _record_checks(store, eid, entries):
+    def update():
+        row = store.db.execute('SELECT check_json FROM quote_health WHERE id=?', (eid,)).fetchone()
+        if row is None:
+            return
+        existing = json.loads(row[0]) if row[0] else []
+        store.db.execute('UPDATE quote_health SET check_json=?,updated_at=? WHERE id=?',
+                         (json.dumps(existing + entries, ensure_ascii=False), now(), eid))
+    _atomic(store, update)
+
+
+def _run_checks(store, config, checks, fetch):
+    by_event = {}
+    for eid, symbol, start, end in checks:
+        by_event.setdefault(eid, []).append((symbol, start, end))
+    for eid, items in by_event.items():
+        _record_checks(store, eid, gap_check(store, config, items, fetch=fetch))
 
 
 def observe(store, config, at, primary_failed, failed, detail='', fetch=None):
@@ -173,35 +254,59 @@ def observe(store, config, at, primary_failed, failed, detail='', fetch=None):
                 current = None
                 changed.append(kind)
             if symbols:
-                if current:
-                    current.update(symbols=sorted(set(current['symbols']) | symbols),
-                                   held=sorted(set(current['held']) | (symbols & held)), last_seen=at)
-                    store.db.execute('UPDATE quote_health SET symbols_json=?,held_json=?,last_seen_at=? WHERE id=?',
-                                     (json.dumps(current['symbols']), json.dumps(current['held']), at, current['id']))
-                else:
-                    eid = digest(kind + ':' + at)[:24]
-                    current = {'id': eid, 'started_at': at, 'last_seen': at, 'symbols': sorted(symbols), 'held': sorted(symbols & held)}
-                    store.db.execute('INSERT OR IGNORE INTO quote_health VALUES(?,?,?,?,?,?,?,?,?)',
-                                     (eid, kind, at, at, None, json.dumps(current['symbols']), json.dumps(current['held']),
-                                      (detail or KINDS[kind])[:300], None))
+                if not current:
+                    current = {'id': digest(kind + ':' + at)[:24], 'started_at': at, 'last_seen': at, 'symbols': [], 'spans': {}}
+                    store.db.execute('INSERT OR IGNORE INTO quote_health VALUES(?,?,?,?,?,?,?,?,?,?)',
+                                     (current['id'], kind, at, at, None, '[]', '{}', (detail or KINDS[kind])[:300], None, now()))
                     open_events[kind] = current
+                current['symbols'] = sorted(set(current['symbols']) | symbols)
+                current['last_seen'] = max(current['last_seen'], at)
+                if kind == 'NO_QUOTE':
+                    _track(current, symbols & held, at, checks)
+                store.db.execute('UPDATE quote_health SET symbols_json=?,held_json=?,last_seen_at=?,updated_at=? WHERE id=?',
+                                 (json.dumps(current['symbols']), json.dumps(current.get('spans', {})), current['last_seen'], now(), current['id']))
                 changed.append(kind)
             elif current:
                 _end(store, kind, current, at, at, checks)
                 del open_events[kind]
                 changed.append(kind)
         _put(store, 'quote_health_open', open_events)
-        # Any other row left open (a crash between writes) ends at its last observation.
-        ids = [e['id'] for e in open_events.values()]
-        store.db.execute('UPDATE quote_health SET ended_at=last_seen_at WHERE ended_at IS NULL'
-                         + (' AND id NOT IN (' + ','.join('?' * len(ids)) + ')' if ids else ''), ids)
+        _heal(store, open_events)
 
     _atomic(store, update)
-    for eid, start, end, symbols in checks:
-        result = gap_check(store, config, start, end, symbols, fetch=fetch)
-        with store.db:
-            store.db.execute('UPDATE quote_health SET check_json=? WHERE id=?', (json.dumps(result, ensure_ascii=False), eid))
+    _run_checks(store, config, checks, fetch)
     return changed
+
+
+def _heal(store, open_events):
+    """Any other row left open (a crash between writes) ends at its last observation."""
+    ids = [e['id'] for e in open_events.values()]
+    store.db.execute('UPDATE quote_health SET ended_at=last_seen_at,updated_at=? WHERE ended_at IS NULL'
+                     + (' AND id NOT IN (' + ','.join('?' * len(ids)) + ')' if ids else ''), [now(), *ids])
+
+
+def sweep(store, config, at=None, fetch=None):
+    """Outside continuous trading no refresh observes anything; end events idle past the gap now, while
+    the day's minute series is still there for the stop checks (lunch break, after the close)."""
+    if (config or {}).get('deployment_role') == 'research' or not _state(store, 'quote_health_open', {}):
+        return []
+    at = normalize_time(at or now())
+    checks, ended = [], []
+
+    def update():
+        open_events = _state(store, 'quote_health_open', {})
+        for kind in list(open_events):
+            current = open_events[kind]
+            if _seconds(current['last_seen'], at) > GAP_SECONDS:
+                _end(store, kind, current, current['last_seen'], at, checks)
+                del open_events[kind]
+                ended.append(kind)
+        if ended:
+            _put(store, 'quote_health_open', open_events)
+
+    _atomic(store, update)
+    _run_checks(store, config, checks, fetch)
+    return ended
 
 
 def stop_levels(store, config, symbol, at):
@@ -224,13 +329,14 @@ def stop_levels(store, config, symbol, at):
     return levels
 
 
-def gap_check(store, config, start, end, symbols, fetch=None):
-    """For each held symbol, the lowest and highest minute price while no quote was available, against its
-    stops (breached) and its take-profit exit (exit_crossed)."""
-    a, b = local(start), local(end)
+def gap_check(store, config, items, fetch=None):
+    """items: [(symbol, start, end)], each a stretch in which that held symbol had no usable quote. For each,
+    the lowest and highest minute price inside the stretch, against its stops (breached) and its take-profit
+    exit (exit_crossed)."""
+    bodies = fetch_many(sorted({s for s, _, _ in items}), fetch)
     result = []
-    bodies = fetch_many(list(symbols), fetch)
-    for symbol in symbols:
+    for symbol, start, end in items:
+        a, b = local(start), local(end)
         entry = {'symbol': symbol, 'from': a.strftime('%H:%M'), 'to': b.strftime('%H:%M')}
         try:
             body = bodies[symbol]
@@ -254,39 +360,58 @@ def gap_check(store, config, start, end, symbols, fetch=None):
 
 
 def changed_since(store, since, at, limit=500):
-    """Rows a research replica has not seen yet: everything observed at or after `since`, never older than
-    KEEP_DAYS. An event still open is sent again each time, because it keeps changing."""
+    """Rows a research replica has not seen yet: every row written at or after `since` (updated_at is the
+    executing node's clock at each write), never older than KEEP_DAYS."""
     floor = normalize_time((datetime.fromisoformat(normalize_time(at)) - timedelta(days=KEEP_DAYS)).isoformat())
     since = max(normalize_time(since), floor) if isinstance(since, str) else floor
-    return [dict(r) for r in store.db.execute('SELECT * FROM quote_health WHERE last_seen_at>=? ORDER BY last_seen_at LIMIT ?', (since, limit))]
+    return [dict(r) for r in store.db.execute('SELECT * FROM quote_health WHERE updated_at>=? ORDER BY updated_at LIMIT ?', (since, limit))]
 
 
 def upsert(store, rows):
-    """Research replica: mirror the executing node's events (they change while open)."""
+    """Research replica: mirror the executing node's events (they change while open and when checked)."""
     for r in rows or []:
         if not isinstance(r, dict) or set(r) != set(COLUMNS) or r['kind'] not in KINDS:
             raise ValueError('行情健康记录字段不匹配')
-        store.db.execute('INSERT OR REPLACE INTO quote_health VALUES(?,?,?,?,?,?,?,?,?)', tuple(r[c] for c in COLUMNS))
+        store.db.execute('INSERT OR REPLACE INTO quote_health VALUES(?,?,?,?,?,?,?,?,?,?)', tuple(r[c] for c in COLUMNS))
+
+
+def _union_seconds(intervals):
+    total, cur = 0.0, None
+    for a, b in sorted(intervals):
+        if cur and a <= cur[1]:
+            cur[1] = max(cur[1], b)
+            continue
+        if cur:
+            total += _seconds(*cur)
+        cur = [a, b]
+    if cur:
+        total += _seconds(*cur)
+    return total
 
 
 def summary(store, a, b):
-    """Events overlapping [a, b]. Minutes run to the end, or for an event still open to its last
-    observation, so a pause in trading is never counted as outage."""
+    """Events overlapping [a, b]. Durations run to the end, or for an event still open to its last
+    observation, so a pause in trading is never counted as outage. Seconds are added up before rounding,
+    so many short outages still count; held minutes are the time at least one held stock had no quote."""
     rows = [dict(r) for r in store.db.execute(
         'SELECT * FROM quote_health WHERE started_at<? AND COALESCE(ended_at,last_seen_at)>=? ORDER BY started_at', (b, a))]
-    out = {'events': [], 'minutes': {k: 0 for k in KINDS}, 'held_minutes': 0, 'breaches': [], 'exits_missed': [],
-           'check_errors': 0, 'open': 0}
+    seconds = {k: 0.0 for k in KINDS}
+    held = []
+    out = {'events': [], 'breaches': [], 'exits_missed': [], 'check_errors': 0, 'open': 0}
     for r in rows:
         start, end = max(r['started_at'], a), min(r['ended_at'] or r['last_seen_at'], b)
-        minutes = max(0, round(_seconds(start, end) / 60))
-        held = json.loads(r['held_json'])
-        check = json.loads(r['check_json']) if r['check_json'] else None
-        out['minutes'][r['kind']] += minutes
-        if r['kind'] == 'NO_QUOTE' and held:
-            out['held_minutes'] += minutes
+        secs = max(0.0, _seconds(start, end))
+        seconds[r['kind']] += secs
+        spans = json.loads(r['held_json'] or '{}')
+        if r['kind'] == 'NO_QUOTE':
+            for runs in spans.values():
+                for f, t in runs:
+                    f, t = max(f, a), min(t or r['last_seen_at'], b)
+                    if t > f:
+                        held.append((f, t))
         if not r['ended_at']:
             out['open'] += 1
-        for c in check or []:
+        for c in json.loads(r['check_json']) if r['check_json'] else []:
             if c.get('error'):
                 out['check_errors'] += 1
                 continue
@@ -295,6 +420,8 @@ def summary(store, a, b):
                                         'from': c['from'], 'to': c['to']})
             if c.get('exit_crossed'):
                 out['exits_missed'].append({'symbol': c['symbol'], 'high_cents': c['high_cents'], 'from': c['from'], 'to': c['to']})
-        out['events'].append({'kind': r['kind'], 'started_at': r['started_at'], 'ended_at': r['ended_at'], 'minutes': minutes,
-                              'symbols': len(json.loads(r['symbols_json'])), 'held': held})
+        out['events'].append({'kind': r['kind'], 'started_at': r['started_at'], 'ended_at': r['ended_at'], 'minutes': round(secs / 60),
+                              'symbols': len(json.loads(r['symbols_json'])), 'held': sorted(spans)})
+    out['minutes'] = {k: round(v / 60) for k, v in seconds.items()}
+    out['held_minutes'] = round(_union_seconds(held) / 60)
     return out

@@ -62,6 +62,11 @@ class EvaluationBatchTests(unittest.TestCase):
         self.assertEqual((made['status'], made['trading_days']), ('READY', 5))
         self.assertEqual(batches.get(self.store, made['id'])['trigger'], 'auto')
         self.assertIsNone(batches.auto(self.store, {**self.cfg, 'evaluation_auto_trading_days': 0}, bj('2026-10-30T23:50:00')))
+        self.assertFalse(batches.get(self.store, made['id'])['manifest']['forced'])
+        # The cadence is decided again inside the lock: a manual batch cut just before leaves nothing to cut.
+        batches.start(self.store, self.cfg, force=True, at=bj('2026-10-20T23:49:00'))
+        self.assertIsNone(batches.start(self.store, self.cfg, trigger='auto', at=bj('2026-10-20T23:50:00')))
+        self.assertEqual(len(batches.listing(self.store)), 3)
 
     def test_agent_notes_and_claude_check_sit_beside_unchanged_program_files(self):
         bid = batches.start(self.store, self.cfg, at=bj('2026-09-28T16:00:00'))['id']

@@ -507,16 +507,18 @@ function render(s) {
 // Notices for Dean: only matters that are his to decide, one at a time, oldest first. Guests never see them.
 const noticeKinds={DECISION:'需要你决定',VETO:'将自动上线 · 可以否决',INFO:'通知'};
 const noticeAuthors={agent:'运维助手',claude:'Claude',program:'程序'};
-const noticeLater=new Set();
+const noticeLater=new Set(),noticeAnswered=new Set();
 let noticeShown=null,noticePending=null,noticeBusy=false;
 function noticeActions(kind) {
   return ({DECISION:[{action:'APPROVE',label:'批准',confirm:'确认批准',primary:true},{action:'REJECT',label:'不批准',confirm:'确认不批准'}],
     VETO:[{action:'VETO',label:'否决这项改动',confirm:'确认否决',primary:true},{action:'ACK',label:'不否决'}],
     INFO:[{action:'ACK',label:'我知道了',primary:true}]})[kind]||[{action:'ACK',label:'我知道了',primary:true}];
 }
-function nextNotice(s,later=noticeLater,role=currentUser?.role) {
+function nextNotice(s,later=noticeLater,role=currentUser?.role,showing=noticeShown,answered=noticeAnswered) {
   if(role!=='ADMIN')return null;
-  return (s?.notices||[]).find(n=>n.status==='OPEN'&&!later.has(n.id))||null;
+  const open=(s?.notices||[]).filter(n=>n.status==='OPEN'&&!later.has(n.id)&&!answered.has(n.id));
+  // Keep the notice on screen while it is still open, so a click never lands on a different one.
+  return open.find(n=>n.id===showing)||open[0]||null;
 }
 function drawNoticeActions(n) {
   const box=$('notice-actions');box.replaceChildren();
@@ -540,6 +542,8 @@ function renderNotice(s) {
   $('notice-body').textContent=n.body;
   feedback('notice-feedback','');drawNoticeActions(n);
   if(!dialog.open){if(dialog.showModal)dialog.showModal();else dialog.setAttribute('open','');}
+  // Focus the title, not a button: a key pressed while typing elsewhere must not answer an unread notice.
+  $('notice-title').focus();
 }
 async function answerNotice(n,a,button) {
   if(noticeBusy)return;
@@ -550,7 +554,7 @@ async function answerNotice(n,a,button) {
   noticeBusy=true;button.disabled=true;feedback('notice-feedback','正在提交…','pending');
   try{
     await api.post('/api/notices/decide',{id:n.id,action:a.action});
-    noticeBusy=false;noticeShown=null;$('notice-dialog').close();await refresh();
+    noticeAnswered.add(n.id);noticeBusy=false;noticeShown=null;$('notice-dialog').close();renderNotice(state);await refresh();
   }catch(error){feedback('notice-feedback',error.message,'error');}
   finally{noticeBusy=false;button.disabled=false;}
 }

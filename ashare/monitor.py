@@ -62,6 +62,19 @@ def refresh(config, kind):
     finally:store.close()
 
 
+def sweep_health(config):
+    """Outside continuous trading: end outage events that went idle and check held stocks' stops while the
+    day's minute series is still available. Never raises into the scheduler."""
+    from . import quote_health
+    store=Store(config['data_dir'])
+    try:
+        return quote_health.sweep(store,config)
+    except Exception as exc:
+        with store.db:store.db.execute('INSERT OR REPLACE INTO service_state VALUES(?,?)',('quote_health_error',now()+' '+str(exc)[:300]))
+        return None
+    finally:store.close()
+
+
 def cached_checks(store, config, events=True):
     """Only a complete, recent check is usable; neither failure nor old cache is success."""
     stamp=now();states={}
@@ -85,8 +98,12 @@ class MarketMonitor:
             if future.done():
                 try:future.result()
                 finally:del self.pending[kind]
-        if not config['scheduler_enabled'] or not config['background_market_enabled'] or phase(now())!='CONTINUOUS':return
+        if not config['scheduler_enabled'] or not config['background_market_enabled']:return
         stamp=time.monotonic()
+        if phase(now())!='CONTINUOUS':
+            if 'sweep' not in self.pending and stamp>=self.due.get('sweep',0):
+                self.pending['sweep']=self.pool.submit(sweep_health,dict(config));self.due['sweep']=stamp+60
+            return
         for kind,interval in (('quotes',config['quote_poll_seconds']),('events',config['announcement_poll_seconds'])):
             if kind not in self.pending and stamp>=self.due[kind]:
                 self.pending[kind]=self.pool.submit(refresh,dict(config),kind)

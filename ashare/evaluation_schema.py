@@ -29,9 +29,9 @@ CREATE TABLE IF NOT EXISTS shadow_trades(
 CREATE INDEX IF NOT EXISTS shadow_trades_book ON shadow_trades(book,day);
 CREATE TABLE IF NOT EXISTS quote_health(
  id TEXT PRIMARY KEY, kind TEXT NOT NULL, started_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, ended_at TEXT,
- symbols_json TEXT NOT NULL, held_json TEXT NOT NULL, detail TEXT NOT NULL, check_json TEXT);
+ symbols_json TEXT NOT NULL, held_json TEXT NOT NULL, detail TEXT NOT NULL, check_json TEXT, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS quote_health_time ON quote_health(started_at);
-CREATE INDEX IF NOT EXISTS quote_health_seen ON quote_health(last_seen_at);
+CREATE INDEX IF NOT EXISTS quote_health_updated ON quote_health(updated_at);
 CREATE TABLE IF NOT EXISTS notices(
  id TEXT PRIMARY KEY, created_at TEXT NOT NULL, author TEXT NOT NULL, kind TEXT NOT NULL,
  title TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, acked_at TEXT, delivered_at TEXT,

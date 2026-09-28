@@ -140,6 +140,53 @@ class ReportsRepoTests(unittest.TestCase):
         self.assertIn('reports setup', state['error'])
         self.assertEqual(reports.sync(self.store, {**self.cfg, 'reports_sync_enabled': False}, AT), {'status': 'DISABLED'})
 
+    def test_links_committed_to_the_repository_reach_nothing_outside_it(self):
+        victim = Path(self.tmp.name) / 'victim.txt'
+        victim.write_text('untouched')
+        bid = batches.start(self.store, self.cfg, at=AT)['id']
+        reports.sync(self.store, self.cfg, AT)
+        git('clone', '-q', str(self.bare), str(self.claude), cwd=self.tmp.name)
+        for name, target in (('notices/state.json', str(victim)), ('digests/2026-09-28.md', str(self.data / 'agent.sqlite3')),
+                             (f'checks/{bid}.md', '/etc/hostname'), ('notices/outbox/link.md', '/etc/passwd')):
+            path = self.claude / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.unlink(missing_ok=True)
+            os.symlink(target, path)
+        git('add', '-A', cwd=self.claude);git('commit', '-q', '-m', 'links', cwd=self.claude);git('push', '-q', 'origin', 'main', cwd=self.claude)
+        digests = self.data / 'workflow' / 'digests'
+        digests.mkdir(parents=True, exist_ok=True)
+        (digests / '2026-09-28.md').write_text('# 运行日报\n', encoding='utf-8')
+        result = reports.sync(self.store, self.cfg, AT)
+        self.assertEqual(victim.read_text(), 'untouched')
+        self.assertEqual(self.store.db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+        checked = (self.data / 'workflow' / 'evaluations' / bid / 'claude-check.md')
+        self.assertFalse(checked.exists() and 'root:' in checked.read_text())  # a link arrives as a plain file holding its target path
+        self.assertNotIn('root:x', json.dumps(result, ensure_ascii=False))
+        repo = reports.paths(self.cfg)['repo']
+        self.assertFalse(any(p.is_symlink() for p in repo.rglob('*')))
+
+    def test_a_push_the_remote_refuses_is_an_error_not_a_success(self):
+        real = reports._git
+        def refusing(args, cwd, env, check=True):
+            if args[0] == 'push':
+                return subprocess.CompletedProcess(args, 1, '', 'ERROR: The key you are authenticating with has been marked as read only.')
+            return real(args, cwd, env, check)
+        with patch('ashare.reports._git', side_effect=refusing):
+            with self.assertRaisesRegex(RuntimeError, '没有写权限'):
+                reports.sync(self.store, self.cfg, AT)
+            with self.assertRaisesRegex(RuntimeError, '没有写权限'):  # the unpushed commit is still there: still an error
+                reports.sync(self.store, self.cfg, AT)
+        self.assertTrue(reports.sync(self.store, self.cfg, AT)['pushed'])
+        self.assertEqual(self.remote_files()[:1], ['README.md'])
+
+    def test_the_notice_example_in_the_readme_is_accepted(self):
+        example = reports.README.split('```')[1].strip('\n') + '\n'
+        n = notices.parse_markdown(example)
+        self.assertEqual((n['kind'], n['deadline']), ('DECISION', '2026-10-12T12:00:00+08:00'))
+        commented = example.replace('kind: DECISION', 'kind: DECISION   # 需要决定')
+        self.assertEqual(notices.parse_markdown(commented)['kind'], 'DECISION')
+        self.assertEqual(notices.parse_markdown(example.replace('title: 建议', 'title: C# 与 #1 建议'))['title'], 'C# 与 #1 建议购买稳定的行情数据源')
+
 
 if __name__ == '__main__':
     unittest.main()

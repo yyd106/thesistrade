@@ -97,7 +97,12 @@ def _start(store, config, *, trigger, force, at):
     at = normalize_time(at or now())
     d = due(store, config, at)
     n = len(d['trading_days'])
-    if n < d['minimum'] and not force:
+    if trigger == 'auto':
+        # Decided inside the lock, so a manual batch cut a moment earlier resets the count.
+        if not d['auto_every'] or n < d['auto_every']:
+            return None
+        force = False
+    elif n < d['minimum'] and not force:
         prev = d['previous']
         return {'status': 'TOO_SOON', 'trading_days': n, 'minimum': d['minimum'], 'previous': prev,
                 'message': (f"距离上一批 {prev}（{local(d['since']).strftime('%m-%d %H:%M')}）只收盘了 {n} 个交易日，至少需要 {d['minimum']} 个。"
@@ -125,7 +130,7 @@ def _start(store, config, *, trigger, force, at):
     json_write(out / 'governance.json', governance(store, since, at))
     json_write(out / 'quotes-health.json', quote_health.summary(store, since, at))
     json_write(out / 'notices.json', _notices(store, since))
-    manifest = {'id': bid, 'created_at': at, 'trigger': trigger, 'forced': bool(force and n < d['minimum']),
+    manifest = {'id': bid, 'created_at': at, 'trigger': trigger, 'forced': bool(trigger == 'manual' and force and n < d['minimum']),
                 'previous': d['previous'], 'period': {'from': since, 'to': at}, 'trading_days': d['trading_days'],
                 'minimum_trading_days': d['minimum'], 'version': __version__, 'build_id': info(config, store)['build_id'],
                 'rollup_from': first_day.isoformat(),
@@ -139,23 +144,28 @@ def _start(store, config, *, trigger, force, at):
 
 
 def auto(store, config, at=None):
-    """Called after the daily digest: cut a batch once enough trading days have closed."""
-    every = config.get('evaluation_auto_trading_days', 5)
-    if not every or not config.get('evaluation_enabled', True):
+    """Called after the daily digest: cut a batch once evaluation_auto_trading_days trading days have closed
+    since the previous one (0 turns this off). Returns None when no batch is due."""
+    if not config.get('evaluation_auto_trading_days'):
         return None
     at = normalize_time(at or now())
-    if len(due(store, config, at)['trading_days']) < every:
-        return None
-    return start(store, config, trigger='auto', force=True, at=at)
+    if len(due(store, config, at)['trading_days']) < config['evaluation_auto_trading_days']:
+        return None  # the common case, without taking the lock
+    return start(store, config, trigger='auto', at=at)
 
 
-def _annex(store, bid, key, value, status):
-    row = get(store, bid)
-    annex = {**row['annex'], key: value}
-    with store.db:
+def _annex(store, bid, key, value, status=None):
+    """Add one entry to a batch's annex; read and written in one transaction, so a note and a check
+    imported at the same moment cannot drop each other. A checked batch stays CHECKED."""
+    from .quote_health import _atomic
+    def update():
+        row = get(store, bid)
+        annex = {**row['annex'], key: value}
+        new_status = 'CHECKED' if 'check' in annex else (status or row['status'])
         store.db.execute('UPDATE evaluation_batches SET annex_json=?,status=? WHERE id=?',
-                         (json.dumps(annex, ensure_ascii=False, sort_keys=True), status, bid))
-    return annex
+                         (json.dumps(annex, ensure_ascii=False, sort_keys=True), new_status, bid))
+        return annex
+    return _atomic(store, update)
 
 
 def note(store, bid, text, *, replace=False, at=None):
@@ -171,9 +181,8 @@ def note(store, bid, text, *, replace=False, at=None):
     if existed and not replace:
         raise ValueError('这个批次已有小结；要替换时加 --replace')
     path.write_text(text + '\n', encoding='utf-8')
-    status = 'CHECKED' if row['status'] == 'CHECKED' else 'NOTED'
-    _annex(store, bid, 'notes', {'sha256': _sha(path), 'at': normalize_time(at or now()), 'replaced': existed}, status)
-    return {'status': status, 'id': bid, 'notes': str(path.relative_to(store.root))}
+    annex = _annex(store, bid, 'notes', {'sha256': _sha(path), 'at': normalize_time(at or now()), 'replaced': existed}, 'NOTED')
+    return {'status': 'CHECKED' if 'check' in annex else 'NOTED', 'id': bid, 'notes': str(path.relative_to(store.root))}
 
 
 def record_check(store, bid, text, source, at=None):

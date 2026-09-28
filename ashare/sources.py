@@ -77,76 +77,83 @@ def parse_quotes(raw, expected):
     return rows
 
 
+def _store_quote(store, run_id, row, source, path):
+    with store.db:
+        store.db.execute("INSERT OR IGNORE INTO quotes VALUES(?,?,?,?,?,?,?,?,?)",
+                         (digest(json.dumps(row, sort_keys=True))[:24], row["symbol"], row["name"], row["price_cents"], row["prev_close_cents"], row["observed_at"], now(), source, path))
+    store.record_attempt('tencent_quotes', row["symbol"], 'OK', run_id=run_id)
+
+
 def collect_quotes(store, run_id, symbols, config=None, fetch_fn=None):
-    """One batch request to qt.gtimg.cn. With a config that allows it, a symbol the batch cannot supply is
-    fetched from Tencent's minute endpoint instead (at most once a minute per symbol, a few at a time), and
-    every outage is recorded by quote_health on the executing node. Raises when a symbol is left without a
-    usable quote."""
+    """One batch request to qt.gtimg.cn; its good quotes are stored at once. With a config that allows it, a
+    symbol the batch cannot supply (or, in continuous trading, supplies older than the usable age) is then
+    fetched from Tencent's minute endpoint: at most once a minute per symbol, a few at a time, within 20
+    seconds overall. Every outage is recorded by quote_health on the executing node. Raises when a symbol
+    is left without a usable quote."""
     from . import quote_health as qh
     fetch_fn = fetch_fn or fetch
     at = now()
+    live = bool(config) and qh.live(at)
+    max_age = (config or {}).get('quote_max_age_seconds', 90)
+    backup = bool(config) and config.get('quote_fallback_enabled', True)
     raw = path = primary_error = None
     try:
         raw = fetch_fn("https://qt.gtimg.cn/q=" + ",".join(symbols), max_bytes=100000)
         path = store.raw(raw, ".txt")
     except Exception as exc:
         primary_error = exc
-    rows, reasons, unpriced = {}, {}, set()
+    reasons, unpriced, primary_failed = {}, set(), []
     for symbol in symbols:
         reasons[symbol] = primary_error
-        if raw is not None:
-            try:
-                rows[symbol] = parse_quotes(raw, [symbol])[0]
-            except qh.PriceUnavailable as exc:
-                reasons[symbol] = exc
-                unpriced.add(symbol)  # answered without a price (suspended): not an outage, no backup request
-            except Exception as exc:
-                reasons[symbol] = exc
-    primary_failed = [s for s in symbols if s not in rows and s not in unpriced]
-    fresh, due = set(), []
-    if bool(config) and config.get('quote_fallback_enabled', True):
-        for symbol in primary_failed:
-            is_due, last_ok = qh.fallback_due(store, symbol, at)
-            if is_due:
-                due.append(symbol)
-            elif last_ok:
-                fresh.add(symbol)  # the backup quote fetched under a minute ago is still usable
-            else:
-                reasons[symbol] = ValueError(f'{reasons[symbol]}；备用分时接口一分钟内已失败，稍后重试')
-    tried, backup_paths = {}, {}
-    for symbol, body in qh.fetch_many(due, fetch_fn).items():
+        if raw is None:
+            primary_failed.append(symbol)
+            continue
         try:
-            if isinstance(body, Exception):
-                raise body
-            row, _ = qh.parse_minute(body, symbol)
-            backup_paths[symbol] = store.raw(body, ".json")
-            rows[symbol] = row
+            row = parse_quotes(raw, [symbol])[0]
+            if live and qh.age(row, at) > max_age:
+                raise ValueError(f"主接口报价已过时（{row['observed_at']}）")
+        except qh.PriceUnavailable as exc:
+            reasons[symbol] = exc
+            unpriced.add(symbol)  # answered without a price (suspended): not an outage, no backup request
+            continue
         except Exception as exc:
-            reasons[symbol] = ValueError(f'{reasons[symbol]}；备用分时接口：{type(exc).__name__}: {str(exc)[:160]}')
-        tried[symbol] = symbol in rows
-    errors = []
-    for symbol in symbols:
-        if symbol in fresh:
+            reasons[symbol] = exc
+            primary_failed.append(symbol)
             continue
-        row = rows.get(symbol)
-        if row is None:
-            store.record_attempt('tencent_quotes', symbol, 'FAILED', str(reasons[symbol])[:300], run_id=run_id)
-            errors.append(symbol)
-            continue
-        source = "tencent_minute_fallback" if symbol in backup_paths else "tencent_public_research"
-        with store.db:
-            store.db.execute("INSERT OR IGNORE INTO quotes VALUES(?,?,?,?,?,?,?,?,?)",
-                             (digest(json.dumps(row, sort_keys=True))[:24], row["symbol"], row["name"], row["price_cents"], row["prev_close_cents"], row["observed_at"], now(), source, backup_paths.get(symbol, path)))
-        store.record_attempt('tencent_quotes', symbol, 'OK', run_id=run_id)
-    qh.mark_fallback(store, tried, at)
+        _store_quote(store, run_id, row, "tencent_public_research", path)
+    missing, used = list(primary_failed), 0
+    if primary_failed and backup:
+        due, covered, failed_recently = qh.reserve_fallback(store, primary_failed, at)
+        results = {}
+        for symbol, body in qh.fetch_many(due, fetch_fn).items():
+            try:
+                if isinstance(body, Exception):
+                    raise body
+                row, _ = qh.parse_minute(body, symbol)
+                if live and qh.age(row, at) > max_age:
+                    raise ValueError(f"报价已过时（{row['observed_at']}）")
+                _store_quote(store, run_id, row, "tencent_minute_fallback", store.raw(body, ".json"))
+                results[symbol] = True
+                used += 1
+            except Exception as exc:
+                reasons[symbol] = ValueError(f'{reasons[symbol]}；备用分时接口：{type(exc).__name__}: {str(exc)[:160]}')
+                results[symbol] = False
+        qh.mark_fallback(store, results, at)
+        for symbol in failed_recently:
+            reasons[symbol] = ValueError(f'{reasons[symbol]}；备用分时接口一分钟内已失败，稍后重试')
+        # A symbol whose backup quote from under a minute ago is still usable (or is being fetched) is not missing.
+        missing = [s for s in primary_failed if s not in covered and not results.get(s)]
+    errors = [s for s in symbols if s in unpriced or s in missing]
+    for symbol in errors:
+        store.record_attempt('tencent_quotes', symbol, 'FAILED', str(reasons[symbol])[:300], run_id=run_id)
     if config:
+        cause = f'{type(primary_error).__name__}: {primary_error}' if primary_error else ''
         qh.observe(store, config, at, primary_failed, [s for s in errors if s not in unpriced],
-                   detail=(f'{type(primary_error).__name__}: {primary_error}' if primary_error else ''))
+                   detail=(cause + '；' if cause else '') + ('备用分时接口已开启' if backup else '备用分时接口已关闭'))
     if errors:
         if primary_error is not None and len(errors) == len(symbols):
             raise primary_error
         raise ValueError('部分股票行情无法读取：'+','.join(errors))
-    used = len(backup_paths)
     note = f"；{used}只改用分时接口" if used else ''
     store.check(run_id, "tencent_quotes", None, "OK", f"{len(symbols)}只；公开研究行情，延迟与商用授权未验证，不能用于实盘执行{note}")
 

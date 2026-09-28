@@ -7,13 +7,19 @@ from .cloud_runtime import value,put,contract
 from . import cloud_ledger as ledger
 
 
+def notices_unresolved(store):
+    from .notices import unresolved
+    return unresolved(store)
+
+
 def pull(store,config):
     if role(config)!='research':return None
     for _ in range(200):
         # An older cloud ignores the v2 fields and answers with the v1 full-table packet.
         packet=request(config,'/api/sync/ledger',{'cursors':value(store,'ledger_cursors',{}),'protocol':2,
             'change_cursor':value(store,'ledger_change_cursor'),'support_since':value(store,'ledger_support_since'),
-            'extras':{'quote_health':value(store,'quote_health_since')}})
+            'extras':{'quote_health':value(store,'quote_health_since'),
+                      'notices':{'since':value(store,'cloud_notices_since'),'known':notices_unresolved(store)}}})
         ledger.import_ledger(store,config,packet)
         if not packet['more']:return packet
     raise RuntimeError('账本仍在分页同步，完成前不进行组合决策或复盘')
@@ -24,18 +30,19 @@ def remote_supports(store,feature):
 
 
 def deliver_notices(store,config):
-    """Send undelivered notices to the cloud and mirror the answers Dean gave there."""
+    """Send notices written here to the cloud. Dean's answers, and notices the cloud raised itself, come
+    back with every ledger pull."""
     from . import notices
     if role(config)!='research' or not remote_supports(store,'notices'):return None
-    new=notices.pending(store);known=notices.unresolved(store)
-    if not new and not known:return None
+    new=notices.pending(store)
+    if not new:return None
     at=now()
-    answer=request(config,'/api/sync/notices',{'notices':[notices.outgoing(n) for n in new],'known':known})
+    answer=request(config,'/api/sync/notices',{'notices':[notices.outgoing(n) for n in new],'known':[]})
     states=answer.get('states') or {}
     with store.db:
         notices.mark_delivered(store,[n['id'] for n in new if n['id'] in states],at)
         notices.apply_states(store,states)
-    return {'delivered':sum(1 for n in new if n['id'] in states),'answered':sum(1 for k in known if (states.get(k) or {}).get('status') not in (None,'OPEN'))}
+    return {'delivered':sum(1 for n in new if n['id'] in states)}
 
 
 def source_records(store,decisions):

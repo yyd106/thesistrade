@@ -428,8 +428,11 @@ console.log('Per-asset strategy timestamp and missing-publication state passed.'
 // Notices: only an admin sees them, oldest open first, one deferred with "稍后再看" stays hidden until reload.
 const nextNotice=vm.runInContext('nextNotice',context),noticeActions=vm.runInContext('noticeActions',context);
 const noticeState={notices:[{id:'N-1',status:'OPEN',kind:'DECISION'},{id:'N-2',status:'OPEN',kind:'INFO'}]};
-assert.equal(nextNotice(noticeState,new Set(),'ADMIN').id,'N-1');
-assert.equal(nextNotice(noticeState,new Set(['N-1']),'ADMIN').id,'N-2');
+assert.equal(nextNotice(noticeState,new Set(),'ADMIN',null,new Set()).id,'N-1');
+assert.equal(nextNotice(noticeState,new Set(['N-1']),'ADMIN',null,new Set()).id,'N-2');
+// The one on screen stays while open, even when an older one arrives; an answered one never comes back.
+assert.equal(nextNotice(noticeState,new Set(),'ADMIN','N-2',new Set()).id,'N-2');
+assert.equal(nextNotice(noticeState,new Set(),'ADMIN','N-9',new Set(['N-1'])).id,'N-2');
 assert.equal(nextNotice(noticeState,new Set(),'GUEST'),null);
 assert.equal(nextNotice({notices:[{id:'N-3',status:'ACKED',kind:'INFO'}]},new Set(),'ADMIN'),null);
 assert.equal(nextNotice({},new Set(),'ADMIN'),null);

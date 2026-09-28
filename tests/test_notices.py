@@ -92,21 +92,48 @@ class NoticeSyncTests(unittest.TestCase):
     def cloud_request(self, cfg, path, body):
         return self.transact(lambda: sync.handle(self.cloud, self.cloud_cfg, path, body, self.at))
 
+    def pull(self):
+        with patch('ashare.cloud_sync.request', side_effect=self.cloud_request):
+            return sync.pull(self.store, self.cfg)
+
     def test_notices_wait_for_a_cloud_that_supports_them_then_answers_come_back(self):
         n = notices.create(self.store, title='购买行情源', body=BODY, kind='DECISION', at=self.at)
         with patch('ashare.cloud_sync.request', side_effect=self.cloud_request) as sent:
             self.assertIsNone(sync.deliver_notices(self.store, self.cfg))  # an older cloud: nothing is sent
             self.assertEqual(sent.call_count, 0)
-            with self.store.db:
-                runtime.put(self.store, 'remote_features', list(ledger.FEATURES))
-            self.assertEqual(sync.deliver_notices(self.store, self.cfg), {'delivered': 1, 'answered': 0})
-            self.assertIsNotNone(notices.get(self.store, n['id'])['delivered_at'])
-            self.assertEqual(notices.get(self.cloud, n['id'])['status'], 'OPEN')
-            notices.decide(self.cloud, n['id'], 'APPROVE', 'dean')
-            self.assertEqual(sync.deliver_notices(self.store, self.cfg), {'delivered': 0, 'answered': 1})
-            self.assertEqual(notices.get(self.store, n['id'])['status'], 'APPROVED')
-            self.assertIsNone(sync.deliver_notices(self.store, self.cfg))  # nothing open or new: no request
-            self.assertEqual(sent.call_count, 2)
+        self.pull()  # the cloud advertises its features on every ledger page
+        self.assertTrue(sync.remote_supports(self.store, 'notices'))
+        with patch('ashare.cloud_sync.request', side_effect=self.cloud_request) as sent:
+            self.assertEqual(sync.deliver_notices(self.store, self.cfg), {'delivered': 1})
+            self.assertIsNone(sync.deliver_notices(self.store, self.cfg))  # nothing new: no request
+            self.assertEqual(sent.call_count, 1)
+        self.assertIsNotNone(notices.get(self.store, n['id'])['delivered_at'])
+        notices.decide(self.cloud, n['id'], 'APPROVE', 'dean')
+        self.pull()  # the answer rides on the next ledger pull
+        mirrored = notices.get(self.store, n['id'])
+        self.assertEqual((mirrored['status'], json.loads(mirrored['payload_json'])['decided_by']), ('APPROVED', 'dean'))
+
+    def test_a_notice_raised_on_the_cloud_reaches_the_research_node(self):
+        raised = notices.create(self.cloud, title='账户回撤触发 25% 风控', body=BODY, kind='INFO', author='program', at=self.at)
+        self.pull()
+        mine = notices.get(self.store, raised['id'])
+        self.assertEqual((mine['author'], mine['status']), ('program', 'OPEN'))
+        self.assertIsNotNone(mine['delivered_at'])
+        self.assertEqual(notices.pending(self.store), [])  # never sent back
+        notices.decide(self.cloud, raised['id'], 'ACK', 'dean')
+        self.pull()
+        self.assertEqual(notices.get(self.store, raised['id'])['status'], 'ACKED')
+        self.assertEqual(runtime.value(self.store, 'cloud_notices_since'), raised['created_at'])
+
+    def test_a_bad_extra_never_rolls_back_the_ledger(self):
+        body = {'cursors': {}, 'protocol': 2, 'change_cursor': None, 'support_since': None, 'extras': {'quote_health': None}}
+        qh.observe(self.cloud, self.cloud_cfg, self.later(-60), ['sh600519'], [])
+        packet = self.transact(lambda: ledger.export_ledger(self.cloud, {}, self.at, body=body))
+        packet['extras']['quote_health'][0]['unexpected'] = 1
+        ledger.import_ledger(self.store, self.cfg, packet)
+        self.assertEqual(runtime.value(self.store, 'remote_ledger_version'), packet['ledger_version'])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM quote_health').fetchone()[0], 0)
+        self.assertIn('字段不匹配', runtime.value(self.store, 'extras_error_quote_health')['error'])
 
     def test_outage_rows_travel_with_the_last_ledger_page_only_when_asked(self):
         cloud_cfg = self.cloud_cfg
@@ -121,12 +148,15 @@ class NoticeSyncTests(unittest.TestCase):
             self.assertNotIn('extras', paged)
         packet = self.transact(lambda: ledger.export_ledger(self.cloud, {}, self.at, body={**body, 'extras': {'quote_health': None}}))
         self.assertFalse(packet['more'])
-        self.assertEqual(len(packet['extras']['quote_health']), 3)
+        rows = packet['extras']['quote_health']
+        self.assertEqual(len(rows), 3)
         ledger.import_ledger(self.store, self.cfg, packet)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM quote_health').fetchone()[0], 3)
         since = runtime.value(self.store, 'quote_health_since')
-        self.assertEqual(since, self.later(-60))
+        self.assertEqual(since, max(r['updated_at'] for r in rows))
+        with self.cloud.db:  # a later write on the cloud, e.g. a stop check, moves the row's updated_at
+            self.cloud.db.execute("UPDATE quote_health SET updated_at='2999-01-01T00:00:00+00:00',check_json='[]' WHERE kind='NO_QUOTE'")
         again = self.transact(lambda: ledger.export_ledger(self.cloud, {}, self.at, body={**body, 'extras': {'quote_health': since}}))
-        self.assertEqual({r['kind'] for r in again['extras']['quote_health']}, {'PRIMARY_DOWN', 'NO_QUOTE'})  # only the open events
+        self.assertIn('[]', [r['check_json'] for r in again['extras']['quote_health']])
         summary = qh.summary(self.store, self.later(-3600), self.at)
         self.assertEqual((summary['minutes']['PRIMARY_DOWN'], summary['open']), (1, 2))

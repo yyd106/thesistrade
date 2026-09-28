@@ -87,6 +87,44 @@ def outgoing(row):
     return {k: row[k] for k in FIELDS}
 
 
+def for_replica(store, request):
+    """Cloud side, on the last ledger page: answers to the notices the research node is waiting on, and the
+    notices this node raised itself (such as a drawdown halt), which the research node has never seen.
+    A notice received from the research node has delivered_at set here; one raised here does not."""
+    known = request.get('known') or []
+    since = request.get('since')
+    if not isinstance(known, list) or len(known) > 200:
+        raise ValueError('通知编号数量超限')
+    since = normalize_time(since) if isinstance(since, str) else '0000'
+    raised = [{**outgoing(r), **_state(r)} for r in store.db.execute(
+        'SELECT * FROM notices WHERE delivered_at IS NULL AND created_at>=? ORDER BY created_at LIMIT 50', (since,))]
+    states = {}
+    for nid in known:
+        row = get(store, nid) if isinstance(nid, str) else None
+        if row:
+            states[nid] = _state(row)
+    return {'raised': raised, 'states': states}
+
+
+def mirror(store, data):
+    """Research side of for_replica, inside the ledger import. Returns the newest raised time, the next cursor."""
+    if not isinstance(data, dict):
+        raise ValueError('通知同步格式错误')
+    newest = None
+    for n in data.get('raised') or []:
+        if not isinstance(n, dict) or set(n) != set(FIELDS) | {'status', 'acked_at', 'decided_by'} or not ID.fullmatch(str(n['id'])):
+            raise ValueError('通知字段不匹配')
+        _check(n['title'], n['body'], n['kind'], n['author'])
+        created = normalize_time(n['created_at'])
+        store.db.execute('INSERT OR IGNORE INTO notices VALUES(?,?,?,?,?,?,?,?,?,?)',
+                         (n['id'], created, n['author'], n['kind'], n['title'].strip(), n['body'].strip(), 'OPEN', None, now(),
+                          _payload(json.loads(n['payload_json']))))
+        apply_states(store, {n['id']: n})
+        newest = max(newest or created, created)
+    apply_states(store, data.get('states'))
+    return newest
+
+
 def mark_delivered(store, ids, at):
     for nid in ids:
         store.db.execute('UPDATE notices SET delivered_at=? WHERE id=? AND delivered_at IS NULL', (at, nid))
@@ -159,7 +197,7 @@ def decide(store, nid, action, user, at=None):
     return get(store, nid)
 
 
-def open_for_display(store, limit=5):
+def open_for_display(store, limit=20):
     out = []
     for r in store.db.execute("SELECT * FROM notices WHERE status='OPEN' ORDER BY created_at LIMIT ?", (limit,)):
         item = {k: r[k] for k in DISPLAY if k != 'deadline'}
@@ -189,6 +227,8 @@ def parse_markdown(text):
     for line in m.group(1).splitlines():
         key, sep, value = line.partition(':')
         if sep:
-            meta[key.strip()] = value.strip()
+            key = key.strip()
+            # A trailing "# comment" is allowed on the fixed-form fields; a title keeps every character.
+            meta[key] = re.sub(r'\s+#.*$', '', value).strip() if key in ('id', 'kind', 'deadline') else value.strip()
     return {'id': meta.get('id', ''), 'kind': meta.get('kind', 'DECISION'), 'title': meta.get('title', ''),
             'deadline': meta.get('deadline') or None, 'body': m.group(2).strip()}

@@ -148,10 +148,15 @@ def export_ledger_v2(store,body,at,limit=1500):
     packet={'protocol':2,'at':at,'ledger_version':version(store),'tables':tables,'updated':changes,'mutable':mutable,'support':support,
             'cursors':updated,'change_cursor':high,'full_mutable':full,'support_since':at,'more':more,'features':list(FEATURES)}
     extras=body.get('extras')
-    if isinstance(extras,dict) and 'quote_health' in extras and not more:
+    if isinstance(extras,dict) and not more:
         # Only asked for by 0.15.6+ research nodes, and only on the last page; older nodes never see the key.
-        from .quote_health import changed_since
-        packet['extras']={'quote_health':changed_since(store,extras['quote_health'],at)}
+        packet['extras']={}
+        if 'quote_health' in extras:
+            from .quote_health import changed_since
+            packet['extras']['quote_health']=changed_since(store,extras['quote_health'],at)
+        if isinstance(extras.get('notices'),dict):
+            from .notices import for_replica
+            packet['extras']['notices']=for_replica(store,extras['notices'])
     return packet
 
 
@@ -192,16 +197,41 @@ def import_ledger_v2(store,config,packet):
         for t,records in packet['tables'].items():upsert(store,t,records,immutable=t not in UPDATED_APPEND)
         for t,records in packet['updated'].items():upsert(store,t,records)
         for t,records in packet['mutable'].items():upsert(store,t,records)
-        health=(packet.get('extras') or {}).get('quote_health')
-        if health:
-            from .quote_health import upsert as mirror_health
-            mirror_health(store,health);put(store,'quote_health_since',max(r['last_seen_at'] for r in health))
+        import_extras(store,config,packet.get('extras'))
         put(store,'ledger_cursors',packet['cursors']);put(store,'ledger_change_cursor',packet['change_cursor'])
         put(store,'ledger_support_since',packet['support_since']);put(store,'remote_features',packet.get('features',[]))
         if not packet['more']:
             put(store,'remote_ledger_version',packet['ledger_version']);put(store,'remote_ledger_at',packet['at'])
         store.db.commit()
     except BaseException:store.db.rollback();raise
+
+
+def import_extras(store,config,extras):
+    """Outage records and notices that ride on the last ledger page. Inside the import transaction, but a
+    savepoint keeps a bad extra from rolling back the ledger itself; the error is kept for the digest."""
+    if not isinstance(extras,dict):return
+    from datetime import datetime,timezone
+    for key,apply in (('quote_health',_mirror_health),('notices',_mirror_notices)):
+        if key not in extras:continue
+        store.db.execute('SAVEPOINT ledger_extra')
+        try:
+            apply(store,extras[key]);store.db.execute('RELEASE ledger_extra')
+            put(store,'extras_error_'+key,None)
+        except Exception as exc:
+            store.db.execute('ROLLBACK TO ledger_extra');store.db.execute('RELEASE ledger_extra')
+            put(store,'extras_error_'+key,{'at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'error':f'{type(exc).__name__}: {str(exc)[:200]}'})
+
+
+def _mirror_health(store,rows):
+    from .quote_health import upsert
+    upsert(store,rows)
+    if rows:put(store,'quote_health_since',max(r['updated_at'] for r in rows))
+
+
+def _mirror_notices(store,data):
+    from .notices import mirror
+    since=mirror(store,data)
+    if since:put(store,'cloud_notices_since',since)
 
 
 def import_ledger(store,config,packet):

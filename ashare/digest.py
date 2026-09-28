@@ -296,7 +296,8 @@ def execution(store, config, a, b):
 def quotes(store, a, b):
     """Quote-source outages recorded by the executing node (mirrored to the research node with the ledger)."""
     from .quote_health import summary
-    return summary(store, a, b)
+    from .cloud_runtime import value
+    return {**summary(store, a, b), 'sync_error': value(store, 'extras_error_quote_health')}
 
 
 def review(store, a, b):
@@ -401,14 +402,16 @@ def flags(d, config, today):
         out.append('风控已触发暂停')
     q = d.get('quotes') or EMPTY['quotes']
     if q['held_minutes'] >= 5:
-        out.append(f"持仓股票有 {q['held_minutes']} 分钟两个行情接口都没有报价，期间无法按止损卖出")
+        out.append(f"持仓股票有 {q['held_minutes']} 分钟两个行情接口都没有可用报价，期间无法按止损卖出")
     elif q['minutes']['NO_QUOTE'] >= 30:
-        out.append(f"自选股累计 {q['minutes']['NO_QUOTE']} 分钟没有报价，期间不会买入")
+        out.append(f"自选股累计 {q['minutes']['NO_QUOTE']} 分钟没有可用报价，期间不会买入")
     for x in q['breaches']:
         out.append(f"行情中断时 {x['symbol']} 的分时最低价 {_yuan(x['low_cents'])} 元触及"
                    + '、'.join(STOP_NAMES.get(k, k) for k in x['breached']) + f"（{x['from']}–{x['to']}），程序没有补单")
     if q['minutes']['PRIMARY_DOWN'] >= 30:
-        out.append(f"主行情接口累计失败 {q['minutes']['PRIMARY_DOWN']} 分钟（已改用分时接口）")
+        out.append(f"主行情接口累计 {q['minutes']['PRIMARY_DOWN']} 分钟没有给出可用报价")
+    if q.get('sync_error'):
+        out.append(f"行情中断记录没有同步到本机：{q['sync_error'].get('error', '')}")
     g = d['governance']
     strategy_changes = list(dict.fromkeys(x['key'] for x in g['config_changes'] if x.get('class') == 'STRATEGY'))
     if strategy_changes:
@@ -430,14 +433,14 @@ EMPTY = {'availability': {'spans': [], 'offline_minutes': 0, 'paused_minutes': 0
          'execution': {'fills': {}, 'orders_created': {}, 'equity_start_cents': None, 'equity_end_cents': None, 'cash_end_cents': None,
                        'marked_at': None, 'positions': [], 'risk': {}},
          'quotes': {'events': [], 'minutes': {'PRIMARY_DOWN': 0, 'NO_QUOTE': 0}, 'held_minutes': 0, 'breaches': [], 'exits_missed': [],
-                    'check_errors': 0, 'open': 0},
+                    'check_errors': 0, 'open': 0, 'sync_error': None},
          'review': {'status': 'NONE'},
          'governance': {'config_changes': [], 'proposals_new': [], 'proposals_decided': [], 'guidance_changes': [], 'issues_new': [],
                         'issues_recurring': 0, 'issues_resolved': [], 'issues_retitled': [], 'new_builds': [], 'agent_notes': []}}
 SECTION_TITLES = {'availability': '本机在线', 'jobs': '任务运行', 'collection': '抓取', 'research': '研究', 'portfolio': '组合策略',
                   'execution': '云端执行', 'quotes': '行情源', 'review': '复盘', 'governance': '调整与治理'}
 STOP_NAMES = {'cost_stop_cents': '成本止损价', 'plan_stop_cents': '计划止损价'}
-QUOTE_EVENT_NAMES = {'PRIMARY_DOWN': '主接口失败、改用分时接口', 'NO_QUOTE': '两个接口都没有报价'}
+QUOTE_EVENT_NAMES = {'PRIMARY_DOWN': '主接口没有可用报价', 'NO_QUOTE': '两个接口都没有可用报价'}
 
 
 def _safe(name, fn):
@@ -554,7 +557,7 @@ def markdown(d):
     q = d['quotes']
     L += ['', '## 行情源', ''] + _failed(q)
     if q['events']:
-        L.append(f"- 主接口失败 {q['minutes']['PRIMARY_DOWN']} 分钟（改用分时接口），两个接口都没有报价 {q['minutes']['NO_QUOTE']} 分钟"
+        L.append(f"- 主接口没有可用报价 {q['minutes']['PRIMARY_DOWN']} 分钟，两个接口都没有可用报价 {q['minutes']['NO_QUOTE']} 分钟"
                  + (f"（其中涉及持仓 {q['held_minutes']} 分钟）" if q['held_minutes'] else '') + '。')
         L.append('- 中断：' + '；'.join(f"{_hm(x['started_at'])}–{_hm(x['ended_at']) if x['ended_at'] else '进行中'} {QUOTE_EVENT_NAMES.get(x['kind'], x['kind'])}"
                                          f"（{x['symbols']} 只{'，持仓 ' + '、'.join(x['held']) if x['held'] else ''}）" for x in q['events'][:12])
