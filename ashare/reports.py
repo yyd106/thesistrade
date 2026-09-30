@@ -221,6 +221,9 @@ def export(store, repo, at):
                 changed += _copy(repo, f, repo / 'digests' / f.name, skipped)
     for f in sorted((store.root / 'workflow' / 'evaluation' / 'weekly').glob('*.md')):
         changed += _copy(repo, f, repo / 'weekly' / f.name, skipped)
+    from .evaluation import SCORE_METHOD
+    for f in sorted((store.root / 'workflow' / 'evaluation' / SCORE_METHOD / 'weekly').glob('*.md')):
+        changed += _copy(repo, f, repo / 'weekly' / SCORE_METHOD / f.name, skipped)
     from .evaluation_batches import ID
     for folder in sorted((store.root / 'workflow' / 'evaluations').glob('EV-*')):
         if not (folder.is_dir() and ID.fullmatch(folder.name) and (folder / 'manifest.json').exists()):

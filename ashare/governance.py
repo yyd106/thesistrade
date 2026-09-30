@@ -28,6 +28,7 @@ ISSUE_KEYS = {
     'CHECK_BUY_WITHOUT_PORTFOLIO_ALLOW': ('EXECUTION', '没有组合授权时发生买入'),
     'CHECK_BUY_WHILE_HALTED': ('EXECUTION', '回撤熔断期间发生买入'),
     'CHECK_SELL_WITHOUT_REASON': ('EXECUTION', '卖出缺少退出依据'),
+    'CHECK_EXECUTION_EVIDENCE': ('EXECUTION', '成交核验缺少原始依据'),
     'CHECK_LATE_QUOTE_IN_REVIEW': ('DATA', '复盘期内持仓收盘报价事后补齐'),
     'CHECK_SYNC_STALE': ('SYSTEM', '云端账本同步超过10分钟未成功'),
     'CHECK_OUTBOX_BACKLOG': ('SYSTEM', '策略发布积压'),

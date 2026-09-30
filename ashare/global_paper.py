@@ -133,7 +133,7 @@ def submit(store, config, symbol, side, q, plan, item, at):
         expiry = normalize_time((datetime.fromisoformat(at)+timedelta(seconds=config['paper_order_ttl_seconds'])).isoformat())
         if side == 'BUY':
             expiry = min(expiry, plan['valid_until'])
-        terms.update(portfolio_decision=ps.order_context(store,config,'global',symbol,at),portfolio_exit=side=='SELL' and portfolio_exit,reason=reason, currency='USD', qty_scale=SCALE, quote_id=q['id'], plan_id=plan['id'] if plan else None,
+        terms.update(portfolio_strategy=config.get('portfolio_strategy'),portfolio_decision=ps.order_context(store,config,'global',symbol,at),portfolio_exit=side=='SELL' and portfolio_exit,reason=reason, currency='USD', qty_scale=SCALE, quote_id=q['id'], plan_id=plan['id'] if plan else None,
                      fx_age_seconds=round(fx_age(q, at)), fx_stale=fx_age(q, at) > FX_BUY_MAX_AGE)
         store.db.execute('INSERT INTO global_orders VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?)',
                          (oid, intent, plan['id'] if plan else None, symbol, side, qty, limit, reserved, at, expiry, 'OPEN', json.dumps(terms)))

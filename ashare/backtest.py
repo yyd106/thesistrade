@@ -155,9 +155,11 @@ def _close_open(trades, pos, bars, end):
 
 
 def simulate_global(bars, variant, start='0000', end='9999'):
+    from .strategy_math import global_trend
     trades, pos = [], None
     closes = [b[2] for b in bars]
-    for i in range(21, len(bars)):
+    micros = [int(round(c * 1_000_000)) for c in closes]
+    for i in range(20, len(bars)):
         d, o, c, h, l = bars[i]
         if d < start or d > end:
             continue
@@ -179,7 +181,7 @@ def simulate_global(bars, variant, start='0000', end='9999'):
                 pos = None
             continue
         prev = closes[i - 1]
-        if prev > sum(closes[i - 21:i - 1]) / 20 and prev > closes[i - 6]:
+        if global_trend(micros[:i]):
             price = _touch(prev * 0.99, prev * 1.01, o, h, l)
             if price:
                 pos = {'entry_date': d, 'entry': price, 'index': i}
@@ -253,7 +255,11 @@ def run_global(root, config, start, end, variants=None):
             if payload:
                 trades += [{**t, 'symbol': asset} for t in simulate_global(payload['bars'], GLOBAL_VARIANTS[name], start, end)]
         results[name] = evaluate(trades, cost)
-    return {'kind': 'global', 'start': start, 'end': end, 'cost_bps': round(cost, 1), 'variants': results}
+    return {'kind': 'global', 'start': start, 'end': end, 'cost_bps': round(cost, 1), 'variants': results,
+            'method': 'global-trend-v2', 'limitations': [
+                '趋势输入与生产共用公式；金银历史使用期货代理，不能视为现货模拟账户收益。',
+                '美元计价，未计人民币汇率、最低佣金及盘中流动性；费用按固定基点近似。',
+                '离线持有期按日观测数量，生产按自然时间；不重放模型与组合授权。']}
 
 
 def _pct(v):
@@ -265,6 +271,7 @@ def markdown(result):
              f"往返成本按 {result['cost_bps'] / 100:.2f}% 计入。每笔交易收益为扣费后收益；超额收益相对沪深300同区间。", '']
     if result['kind'] == 'ma':
         lines += [f"股票池 {result['universe_size']} 个区间；缺数据 {len(result['missing_data'])} 只。{UNIVERSE_HELP}", '']
+    lines += [f'- {s}' for s in result.get('limitations', [])] + ['']
     lines += ['| 规则变体 | 交易笔数 | 平均扣费收益 | t值 | 平均超额 | 超额95%区间 | 胜率 | 平均持有天数 |', '|---|---|---|---|---|---|---|---|']
     for name, r in result['variants'].items():
         n, e = r['net'], r['excess']

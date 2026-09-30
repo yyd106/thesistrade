@@ -190,7 +190,7 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
                 store.db.execute('UPDATE slots SET input_json=? WHERE id=?',(slot_input_json,decision_record['slot_id']))
         store.db.execute('INSERT INTO paper_orders VALUES(?,?,?,?,?,?,0,?,?,?,?,?)',
             (oid,decision_id,pid,symbol,side,qty,limit,reserve,at,expires,'OPEN'))
-        store.db.execute('INSERT INTO paper_order_terms VALUES(?,?)',(oid,json.dumps({**{k:v for k,v in config.items() if k.startswith('paper_')},'portfolio_decision':ps.order_context(store,config,'watchlist',symbol,at),'portfolio_exit':bool(portfolio_exit)},sort_keys=True)))
+        store.db.execute('INSERT INTO paper_order_terms VALUES(?,?)',(oid,json.dumps({**{k:v for k,v in config.items() if k.startswith('paper_')},'portfolio_strategy':config.get('portfolio_strategy'),'portfolio_decision':ps.order_context(store,config,'watchlist',symbol,at),'portfolio_exit':bool(portfolio_exit)},sort_keys=True)))
         store.db.commit()
         return dict(store.db.execute('SELECT * FROM paper_orders WHERE id=?',(oid,)).fetchone())
     except ValueError as exc:

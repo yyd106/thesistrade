@@ -19,6 +19,22 @@ CREATE TABLE IF NOT EXISTS signal_registry(
  benchmark TEXT, status TEXT NOT NULL, judgment_json TEXT NOT NULL, score_json TEXT, scored_at TEXT);
 CREATE INDEX IF NOT EXISTS signal_registry_open ON signal_registry(status,route);
 CREATE INDEX IF NOT EXISTS signal_registry_symbol ON signal_registry(symbol,created_at);
+CREATE TABLE IF NOT EXISTS signal_scores(
+ signal_id TEXT NOT NULL, method TEXT NOT NULL, status TEXT NOT NULL,
+ score_json TEXT NOT NULL, scored_at TEXT NOT NULL,
+ PRIMARY KEY(signal_id,method));
+CREATE TABLE IF NOT EXISTS shadow_evaluations(
+ id TEXT PRIMARY KEY, method TEXT NOT NULL, computed_at TEXT NOT NULL,
+ payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS shadow_days_v2(
+ run_id TEXT NOT NULL, book TEXT NOT NULL, day TEXT NOT NULL, payload_json TEXT NOT NULL,
+ PRIMARY KEY(run_id,book,day));
+CREATE TABLE IF NOT EXISTS shadow_trades_v2(
+ run_id TEXT NOT NULL, id TEXT NOT NULL, book TEXT NOT NULL, day TEXT NOT NULL,
+ symbol TEXT NOT NULL, side TEXT NOT NULL, qty REAL NOT NULL, price_cents INTEGER NOT NULL,
+ fee_cents INTEGER NOT NULL, reason TEXT NOT NULL, payload_json TEXT NOT NULL,
+ PRIMARY KEY(run_id,id));
+CREATE INDEX IF NOT EXISTS shadow_trades_v2_book ON shadow_trades_v2(run_id,book,day);
 CREATE TABLE IF NOT EXISTS shadow_book_days(
  book TEXT NOT NULL, day TEXT NOT NULL, computed_at TEXT NOT NULL, payload_json TEXT NOT NULL,
  PRIMARY KEY(book,day));

@@ -22,6 +22,7 @@ from .paper import fee, lot_rules
 BOOKS = ('A', 'B', 'C', 'D')
 VARIANTS = ('lot', 'frac')
 INITIAL_CENTS = 10_000_000
+METHOD = 'opening-evidence-v2'
 
 
 def encode(value):
@@ -29,18 +30,18 @@ def encode(value):
 
 
 def bars_for(store, symbol):
-    """Unadjusted daily OHLC in cents from the newest collection: {date: (open, close, high, low)}."""
+    """Merge retained history; the newest collection wins for revised dates."""
     if not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='market_features'").fetchone():
         return {}
-    row = store.db.execute('SELECT payload FROM market_features WHERE symbol=? ORDER BY created_at DESC,rowid DESC LIMIT 1', (symbol,)).fetchone()
-    if not row:
-        return {}
     out = {}
-    for b in (json.loads(row[0]).get('unadjusted') or {}).get('bars', []):
-        try:
-            out[b[0]] = tuple(int(round(float(x) * 100)) for x in (b[1], b[2], b[3], b[4]))
-        except (IndexError, ValueError, TypeError):
-            continue
+    for row in store.db.execute('SELECT payload FROM market_features WHERE symbol=? ORDER BY created_at,rowid', (symbol,)):
+        for b in (json.loads(row[0]).get('unadjusted') or {}).get('bars', []):
+            try:
+                prices = tuple(int(round(float(x) * 100)) for x in (b[1], b[2], b[3], b[4]))
+                if min(prices) > 0 and prices[2] >= max(prices[0:2]) and prices[3] <= min(prices[0:2]):
+                    out[b[0]] = prices
+            except (IndexError, ValueError, TypeError, OverflowError):
+                continue
     return out
 
 
@@ -49,6 +50,8 @@ def indicators(bars, day, config):
     dates = sorted(d for d in bars if d < day)
     if len(dates) < 60:
         return None
+    if days_between(dates[-60], day)[:-1] != dates[-60:]:
+        return None  # Missing history cannot silently change the MA/ATR window.
     closes = [bars[d][1] for d in dates]
     ma20, ma60, close = sum(closes[-20:]) // 20, sum(closes[-60:]) // 60, closes[-1]
     band = config.get('paper_entry_band_bps', 200)
@@ -65,14 +68,14 @@ def indicators(bars, day, config):
 
 
 def plan_at(store, symbol, at):
-    row = store.db.execute('''SELECT * FROM plans WHERE symbol=? AND activated_at<=? AND valid_until>? AND status!='DRAFT'
+    row = store.db.execute('''SELECT * FROM plans WHERE symbol=? AND activated_at<? AND valid_until>? AND status!='DRAFT'
         AND json_extract(payload_json,'$.kind')!='RISK_EXIT_ONLY' ORDER BY activated_at DESC,rowid DESC LIMIT 1''', (symbol, at, at)).fetchone()
     return {**dict(row), 'payload': json.loads(row['payload_json'])} if row else None
 
 
 def decision_at(store, at):
-    row = store.db.execute('SELECT * FROM portfolio_decisions WHERE created_at<=? AND valid_until>? ORDER BY created_at DESC,rowid DESC LIMIT 1', (at, at)).fetchone()
-    return {d['key']: d for d in json.loads(row['payload_json']).get('decisions', [])} if row else None
+    row = store.db.execute('SELECT * FROM portfolio_decisions WHERE created_at<? AND valid_until>? ORDER BY created_at DESC,rowid DESC LIMIT 1', (at, at)).fetchone()
+    return {d['key']: {**d, '_valid_until': row['valid_until'], '_id': row['id']} for d in json.loads(row['payload_json']).get('decisions', [])} if row else None
 
 
 def entry_price(levels, o, h, l):
@@ -123,8 +126,8 @@ def days_between(first, last):
     return out
 
 
-def previous_state(store, book, day):
-    row = store.db.execute('SELECT payload_json FROM shadow_book_days WHERE book=? AND day<? ORDER BY day DESC LIMIT 1', (book, day)).fetchone()
+def previous_state(store, book, day, run_id):
+    row = store.db.execute('SELECT payload_json FROM shadow_days_v2 WHERE run_id=? AND book=? AND day<? ORDER BY day DESC LIMIT 1', (run_id, book, day)).fetchone()
     if row:
         state = json.loads(row[0])
         return {'cash': state['cash'], 'positions': state['positions'], 'peak': state.get('peak', state['equity'])}
@@ -143,19 +146,22 @@ def quantity(symbol, budget, price, variant):
     return qty if qty >= rules['min_buy'] else 0
 
 
-def run_day(store, config, day, symbols, data):
+def run_day(store, config, day, symbols, data, run_id):
     """Advance every book by one trading day. `data[symbol]` holds that symbol's bars."""
-    morning = normalize_time(datetime.fromisoformat(day + 'T10:00:00').replace(tzinfo=SH).isoformat())
+    morning = normalize_time(day + 'T09:30:00+08:00')
+    close_at = normalize_time(day + 'T15:00:00+08:00')
     decisions = decision_at(store, morning) or {}
     slip = config['paper_slippage_bps']
     stored = []
     for book in BOOKS:
         for variant in VARIANTS:
             name = book + '-' + variant
-            if store.db.execute('SELECT 1 FROM shadow_book_days WHERE book=? AND day=?', (name, day)).fetchone():
-                continue
-            state = previous_state(store, name, day)
+            state = previous_state(store, name, day, run_id)
             cash, positions, trades = state['cash'], state['positions'], []
+            opening_symbols = set(positions)
+            equity_open = cash + sum(q['qty'] * data[s][day][0] for s, q in positions.items())
+            invested = equity_open - cash
+            buy_cash = cash  # No reuse of sales whose intraday time daily bars cannot establish.
 
             def record(symbol, side, qty, price, reason, extra=None):
                 nonlocal cash
@@ -166,7 +172,7 @@ def run_day(store, config, day, symbols, data):
                 trades.append({'id': tid, 'symbol': symbol, 'side': side, 'qty': qty, 'price_cents': price, 'fee_cents': cost, 'reason': reason, **(extra or {})})
                 return gross, cost
 
-            # Exits first: every position bought before today is sellable (T+1).
+            # Exits affect closing cash only. Opening buy capacity is frozen above.
             for symbol in sorted(list(positions)):
                 p = positions[symbol]
                 bar = data.get(symbol, {}).get(day)
@@ -181,13 +187,12 @@ def run_day(store, config, day, symbols, data):
                 target = levels.get('sell_cents')
                 price, why = exit_price(stop, target, o, h, l)
                 wanted = p['qty'] if price else 0
-                if not price and book in ('C', 'D'):
+                if book in ('C', 'D'):
                     d = decisions.get('watchlist:' + symbol)
                     if d and d['action'] == 'EXIT':
                         price, why, wanted = o, 'PORTFOLIO_EXIT', p['qty']
-                    elif d and d['action'] == 'REDUCE':
-                        equity_now = cash + sum(q['qty'] * data.get(s, {}).get(day, (q['last'],) * 4)[0] for s, q in positions.items())
-                        keep = equity_now * d['target_bps'] / 10000 / o if o else p['qty']
+                    elif d and d['action'] == 'REDUCE' and not price:
+                        keep = equity_open * d['target_bps'] / 10000 / o if o else p['qty']
                         excess = p['qty'] - keep
                         if variant == 'lot':
                             excess = int(-(-excess // 100) * 100) if excess > 0 else 0
@@ -205,11 +210,9 @@ def run_day(store, config, day, symbols, data):
                     if p['qty'] <= 0:
                         del positions[symbol]
 
-            # Entries, in symbol order, against the cash left after exits.
-            equity_open = cash + sum(q['qty'] * data.get(s, {}).get(day, (q['last'],) * 4)[0] for s, q in positions.items())
-            invested = equity_open - cash
+            # Entries use only cash/exposure known at the open; no same-day re-entry.
             for symbol in symbols:
-                if symbol in positions:
+                if symbol in opening_symbols:
                     continue
                 bar = data.get(symbol, {}).get(day)
                 sig = indicators(data.get(symbol, {}), day, config)
@@ -226,17 +229,21 @@ def run_day(store, config, day, symbols, data):
                         continue
                     levels = plan['payload']['levels']
                 target_cap = None
+                valid_through_close = book == 'A' or plan['valid_until'] > close_at
                 if book in ('C', 'D'):
                     d = decisions.get('watchlist:' + symbol)
                     if not d or d['action'] != 'ALLOW':
                         continue
                     target_cap = equity_open * d['target_bps'] // 10000
-                price = entry_price(levels, o, h, l)
+                    valid_through_close = valid_through_close and d['_valid_until'] > close_at
+                # If authorization expires intraday, OHLC cannot locate the touch:
+                # only an opening price already inside the band is admissible.
+                price = entry_price(levels, o, h, l) if valid_through_close else entry_price(levels, o, o, o)
                 if not price:
                     continue
                 fill = min(levels['buy_high_cents'], (price * (10000 + slip) + 9999) // 10000)
                 room = min(equity_open * config['paper_max_stock_pct'] // 100,
-                           equity_open * config['paper_max_gross_pct'] // 100 - invested, cash - 10_000)
+                           equity_open * config['paper_max_gross_pct'] // 100 - invested, min(cash, buy_cash) - 10_000)
                 stop_cents = None
                 if book == 'D':
                     distance = min(1000, max(300, 2 * (sig['atr_bps'] or 300)))
@@ -248,11 +255,14 @@ def run_day(store, config, day, symbols, data):
                 qty = quantity(symbol, room, fill, variant)
                 if not qty:
                     continue
-                gross, cost = record(symbol, 'BUY', qty, fill, 'ENTRY', {'levels': levels})
+                gross, cost = record(symbol, 'BUY', qty, fill, 'ENTRY', {'levels': levels, 'authorization_cutoff': morning,
+                    'plan_id': plan['id'] if book != 'A' else None,
+                    'portfolio_id': d['_id'] if book in ('C', 'D') else None})
                 invested += gross
+                buy_cash -= gross + cost
                 positions[symbol] = {'qty': qty, 'cost_cents': gross + cost, 'entry_day': day, 'last': c, **({'stop_cents': stop_cents} if stop_cents else {})}
 
-            # Mark to market at the close; symbols without today's bar keep their last close.
+            # The caller has verified every symbol/day before entering this transaction.
             for symbol, p in positions.items():
                 bar = data.get(symbol, {}).get(day)
                 if bar:
@@ -263,17 +273,20 @@ def run_day(store, config, day, symbols, data):
                        'drawdown_bps': int((peak - equity) * 10000 // peak) if peak else 0,
                        'exposure_bps': int((equity - cash) * 10000 // equity) if equity else 0,
                        'trades': [t['id'] for t in trades]}
-            with store.db:
-                store.db.execute('INSERT INTO shadow_book_days VALUES(?,?,?,?)', (name, day, now(), encode(payload)))
-                for t in trades:
-                    store.db.execute('INSERT OR IGNORE INTO shadow_trades VALUES(?,?,?,?,?,?,?,?,?,?)',
-                                     (t['id'], name, day, t['symbol'], t['side'], t['qty'], t['price_cents'], t['fee_cents'], t['reason'], encode(t)))
+            store.db.execute('INSERT INTO shadow_days_v2 VALUES(?,?,?,?)', (run_id, name, day, encode(payload)))
+            for t in trades:
+                store.db.execute('INSERT INTO shadow_trades_v2 VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                                 (run_id, t['id'], name, day, t['symbol'], t['side'], t['qty'], t['price_cents'], t['fee_cents'], t['reason'], encode(t)))
             stored.append(name)
     return stored
 
 
 def run(store, config, at=None):
-    """Process every completed trading day since the start date that is not recorded yet."""
+    """Replay a complete consecutive prefix into an immutable, input-addressed batch.
+
+    Late/corrected bars regenerate all dependent days. V1 and previous V2 batches
+    remain intact; a single pointer is published only after the replay commits.
+    """
     if not config.get('shadow_books_enabled', True):
         return {'status': 'DISABLED'}
     at = normalize_time(at or now())
@@ -282,30 +295,55 @@ def run(store, config, at=None):
         return {'status': 'CALENDAR_UNKNOWN'}
     first = start_day(store, config, at)
     symbols = sorted(i['symbol'] for i in config['watchlist'])
-    data = {s: bars_for(store, s) for s in symbols}
-    processed = []
+    data = {s: {d: b for d, b in bars_for(store, s).items() if d <= last} for s in symbols}
+    processed, missing = [], []
     for day in days_between(first, last):
-        if not any(day in bars for bars in data.values()):
-            continue  # Bars for this day are not collected yet; later runs catch up in order.
-        if run_day(store, config, day, symbols, data):
-            processed.append(day)
-    return {'status': 'SUCCEEDED', 'start': first, 'through': last, 'days': processed}
+        missing = [{'symbol': s, 'day': day, 'reason': 'MISSING_BAR' if day not in data[s] else 'INSUFFICIENT_HISTORY'}
+                   for s in symbols if day not in data[s] or not indicators(data[s], day, config)]
+        if missing:
+            break
+        processed.append(day)
+    cutoffs = [normalize_time(d + 'T09:30:00+08:00') for d in processed]
+    evidence = [{'at': t, 'plans': {s: plan_at(store, s, t) for s in symbols}, 'decisions': decision_at(store, t)} for t in cutoffs]
+    settings = {k: v for k, v in config.items() if k.startswith(('paper_', 'shadow_'))}
+    rid = digest(encode([METHOD, first, last, symbols, data, evidence, settings]))[:32]
+    result = {'status': 'SUCCEEDED' if not missing else ('PARTIAL' if processed else 'WAITING_DATA'),
+              'method': METHOD, 'run_id': rid, 'start': first, 'requested_through': last,
+              'through': processed[-1] if processed else None, 'missing': missing, 'days': processed,
+              'limitations': '日线近似；未模拟盘中授权更新、12小时心跳、账户回撤停机及公司行为，不代表可执行净收益。缺价未确证停牌时等待。'}
+    with store.db:
+        exists = store.db.execute('SELECT 1 FROM shadow_evaluations WHERE id=?', (rid,)).fetchone()
+        if not exists:
+            for day in processed:
+                run_day(store, config, day, symbols, data, rid)
+            store.db.execute('INSERT INTO shadow_evaluations VALUES(?,?,?,?)', (rid, METHOD, at, encode(result)))
+        store.db.execute("INSERT OR REPLACE INTO service_state VALUES('shadow_current_v2',?)", (rid,))
+    return {**result, 'days': [] if exists else processed, 'reused': bool(exists)}
+
+
+def status(store):
+    row = store.db.execute("""SELECT e.payload_json FROM shadow_evaluations e JOIN service_state s
+        ON s.key='shadow_current_v2' AND e.id=s.value WHERE e.method=?""", (METHOD,)).fetchone()
+    return json.loads(row[0]) if row else {'status': 'NOT_RUN', 'method': METHOD}
 
 
 def summary(store, config, since=None):
     """Per book: return, drawdown, exposure and closed-trade statistics."""
     result = {}
+    current = status(store)
+    rid = current.get('run_id')
     for book in BOOKS:
         for variant in VARIANTS:
             name = book + '-' + variant
-            rows = [json.loads(r[0]) | {'day': r[1]} for r in store.db.execute('SELECT payload_json,day FROM shadow_book_days WHERE book=? ORDER BY day', (name,))]
+            rows = [json.loads(r[0]) | {'day': r[1]} for r in store.db.execute('SELECT payload_json,day FROM shadow_days_v2 WHERE run_id=? AND book=? ORDER BY day', (rid, name))]
             if not rows:
                 continue
             base = next((r['equity'] for r in reversed(rows) if since and r['day'] < since), INITIAL_CENTS)
             window = [r for r in rows if not since or r['day'] >= since]
-            trades = [json.loads(r[0]) for r in store.db.execute("SELECT payload_json FROM shadow_trades WHERE book=? AND side='SELL'" + (' AND day>=?' if since else ''), (name, since) if since else (name,))]
+            trades = [json.loads(r[0]) for r in store.db.execute("SELECT payload_json FROM shadow_trades_v2 WHERE run_id=? AND book=? AND side='SELL'" + (' AND day>=?' if since else ''), (rid, name, since) if since else (rid, name))]
             wins = [t for t in trades if t.get('realized_cents', 0) > 0]
-            result[name] = {'from': window[0]['day'] if window else None, 'to': rows[-1]['day'], 'equity_cents': rows[-1]['equity'],
+            result[name] = {'method': METHOD, 'run_id': rid, 'completeness': current['status'],
+                            'from': window[0]['day'] if window else None, 'to': rows[-1]['day'], 'equity_cents': rows[-1]['equity'],
                             'return_pct': round((rows[-1]['equity'] / base - 1) * 100, 2),
                             'max_drawdown_pct': round(max(r['drawdown_bps'] for r in window) / 100, 2) if window else None,
                             'avg_exposure_pct': round(sum(r['exposure_bps'] for r in window) / len(window) / 100, 1) if window else None,

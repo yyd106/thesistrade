@@ -112,7 +112,10 @@ def submit(store,config,case,side,q,at,reason):
   if side=='BUY':expiry=min(expiry,fresh['expires_at'])
   oid=digest('dynamic:'+intent)[:24]
   terms={k:v for k,v in config.items() if k.startswith('paper_')}
-  terms.update(portfolio_decision=ps.order_context(store,config,'dynamic',cid,at),portfolio_exit=side=='SELL' and portfolio_exit,plan=plan,quote=q,source_news_id=fresh['news_id'],analysis=json.loads(fresh['analysis_json']),
+  terms.update(portfolio_strategy=config.get('portfolio_strategy'),
+               case_snapshot={'status':fresh['status'],'created_at':fresh['created_at'],'expires_at':fresh['expires_at'],
+                              'blockers':blockers if side=='BUY' else []},
+               portfolio_decision=ps.order_context(store,config,'dynamic',cid,at),portfolio_exit=side=='SELL' and portfolio_exit,plan=plan,quote=q,source_news_id=fresh['news_id'],analysis=json.loads(fresh['analysis_json']),
                account_at_order={k:a[k] for k in ('cash_cents','equity_cents','available_cents','reserved_cents','market_value_cents')})
   store.db.execute('INSERT INTO dynamic_orders VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?)',
    (oid,intent,cid,sym,side,qty,limit,reserve,at,expiry,'OPEN',reason,json.dumps(terms,ensure_ascii=False)))

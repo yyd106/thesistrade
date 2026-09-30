@@ -242,14 +242,21 @@ def validate(result, data):
             raise ValueError('反证或后续步骤无效')
     if not isinstance(result['effectiveness'], list) or len(result['effectiveness']) > 4:
         raise ValueError('有效性评价格式无效')
-    groups = data.get('facts', {}).get('registry', {}).get('all_time', {}).get('groups', {})
+    statistics = data.get('facts', {}).get('registry', {}).get('all_time', {})
+    groups = statistics.get('groups', {})
     seen = set()
     for e in result['effectiveness']:
         if not isinstance(e, dict) or set(e) != {'comparison', 'conclusion', 'reason'} or e['comparison'] not in groups or e['comparison'] in seen or e['conclusion'] not in ('SUPPORTED', 'NOT_SUPPORTED', 'UNKNOWN') or not text(e['reason']):
             raise ValueError('有效性评价没有对应比较组')
         seen.add(e['comparison'])
-        if e['conclusion'] != 'UNKNOWN' and (len(groups[e['comparison']]) < 2 or any(g.get('independent', {}).get('n', 0) < 30 for g in groups[e['comparison']].values())):
-            raise ValueError('独立样本不足30，不得判定策略有效或无效')
+        enough = len(groups[e['comparison']]) >= 2
+        for g in groups[e['comparison']].values():
+            s = g.get('non_overlapping', g.get('independent', {}))
+            enough = enough and s.get('n', 0) >= 30 and (not statistics.get('method') or s.get('time_clusters', 0) >= 30)
+        if statistics.get('method') and (statistics.get('mixed_builds') or e['comparison'] == 'global_stance'):
+            enough = False
+        if e['conclusion'] != 'UNKNOWN' and not enough:
+            raise ValueError('独立样本不足30、时间簇不足或口径不可比，不得判定策略有效或无效')
     return result
 
 

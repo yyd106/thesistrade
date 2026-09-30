@@ -84,7 +84,9 @@ def run(store, config, at=None, model_fn=None, fetch_quotes=True):
         bars = data.get('bars', [])
         causes = evidence(item)
         event_fp = digest(json.dumps(causes, ensure_ascii=False, sort_keys=True))
-        fingerprint = digest(json.dumps([bars, causes, mid], ensure_ascii=False, sort_keys=True))
+        from .governance import guidance
+        adopted = guidance(store, 'global', symbol, at)
+        fingerprint = digest(json.dumps(['research-input-v2', bars, causes, mid, build_parts, adopted], ensure_ascii=False, sort_keys=True))
         old = active_plan(store, symbol, at)
         if old and old['fingerprint'] == fingerprint:
             # Cheap recheck updates execution eligibility, never extends old plan expiry.
@@ -95,8 +97,7 @@ def run(store, config, at=None, model_fn=None, fetch_quotes=True):
         pid = digest(symbol+':'+at+':'+fingerprint)[:24]
         folder = store.root/'workflow'/'global-research'/pid
         # Unvalidated review hypotheses never enter research; only user-adopted guidance does.
-        from .governance import guidance
-        packet = {'adopted_guidance':guidance(store,'global',symbol,at),'symbol': symbol, 'name': item['name'], 'as_of': at, 'currency': 'USD', 'price_scale': 1_000_000,
+        packet = {'adopted_guidance':adopted,'symbol': symbol, 'name': item['name'], 'as_of': at, 'currency': 'USD', 'price_scale': 1_000_000,
                   'bars': bars, 'events': causes, 'method_id': mid, 'history_basis': data.get('history_basis', 'provider daily closes')}
         json_write(folder/'input.json', packet)
         blockers = []
@@ -129,7 +130,8 @@ def run(store, config, at=None, model_fn=None, fetch_quotes=True):
         elif not blockers:
             blockers.append('本轮模型研究预算未就绪');status = 'DEFERRED'
         prices = [b['price_micros'] for b in bars]
-        trend = len(prices) >= 20 and prices[-1] > sum(prices[-20:])//20 and prices[-1] > prices[-5]
+        from .strategy_math import global_trend
+        trend = global_trend(prices)
         if not trend:
             blockers.append('日级趋势条件未成立')
         if analysis['stance'] != 'LONG':

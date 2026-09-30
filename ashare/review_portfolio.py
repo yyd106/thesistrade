@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from .calendar import local, last_completed_day
 
-VERSION='portfolio-review-2'
+VERSION='portfolio-review-3'
 
 
 def executions(store, end, known_at):
@@ -92,17 +92,21 @@ def valuation(store,p,boundary,known_at):
         'quote_first_seen_at':q['first_seen_at'] if q else None,'quality':quality,'late_quote':bool(q and q['first_seen_at']>boundary)}
 
 
-def research_record(store,origin,rid,cutoff):
+def research_record(store,origin,rid,cutoff,known_at=None):
     if origin=='global':
         r=store.db.execute('SELECT * FROM global_plans WHERE id=? AND created_at<?',(rid,cutoff)).fetchone()
         if not r:return None
         payload=json.loads(r['payload_json'])
         return {'id':rid,'symbol':r['symbol'],'origin':origin,'at':r['created_at'],'role':'ENTRY','analysis':payload.get('analysis',{}),'plan':payload}
     if origin=='dynamic':
-        r=store.db.execute('SELECT * FROM dynamic_cases WHERE id=? AND created_at<?',(rid,cutoff)).fetchone()
+        r=store.db.execute('''SELECT o.* FROM dynamic_orders o JOIN dynamic_fills f ON f.order_id=o.id
+            WHERE o.case_id=? AND o.side='BUY' AND o.created_at<? AND f.occurred_at<? AND f.recorded_at<=?
+            ORDER BY f.occurred_at,f.recorded_at,f.id LIMIT 1''',(rid,cutoff,cutoff,known_at or cutoff)).fetchone()
         if not r:return None
-        return {'id':rid,'symbol':r['symbol'],'origin':origin,'at':r['created_at'],'role':'ENTRY','analysis':json.loads(r['analysis_json']),
-            'plan':json.loads(r['plan_json'])}
+        terms=json.loads(r['terms_json'])
+        if 'analysis' not in terms or 'plan' not in terms:return None
+        return {'id':rid,'symbol':r['symbol'],'origin':origin,'at':r['created_at'],'role':'ENTRY',
+            'plan':terms['plan'], 'analysis':terms['analysis'], 'basis':'ORDER_SNAPSHOT', 'order_id':r['id']}
     r=store.db.execute('''SELECT p.id,p.symbol,p.activated_at,p.payload_json,s.result_json,s.created_at FROM plans p
         JOIN studies s ON s.id=p.study_id WHERE p.id=? AND p.activated_at<? AND s.created_at<?''',(rid,cutoff,cutoff)).fetchone()
     if not r:return None
@@ -129,7 +133,7 @@ def build(store,config,start,end,known_at):
         related_ids.update(f['research_id'] for f in relevant if f['research_id'])
         records=[]
         for rid in sorted(related_ids):
-            record=research_record(store,origin,rid,end)
+            record=research_record(store,origin,rid,end,known_at)
             if record:records.append(record);research[rid]=record
         if origin=='watchlist':
             latest=store.db.execute('''SELECT p.id FROM plans p JOIN studies s ON s.id=p.study_id

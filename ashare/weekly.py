@@ -2,19 +2,20 @@
 the evidence a person or a desktop agent reads before proposing any strategy change."""
 import json
 from datetime import datetime, timedelta
-from .storage import now, normalize_time, json_write
+from .storage import now, normalize_time, json_write, digest
 from .calendar import local, next_year_warning
 
 
 def run_daily(store, config, at=None):
     """Score matured registry rows and advance the shadow books. Idempotent."""
-    from .evaluation import score, registry_counts
+    from .evaluation import score, registry_counts, SCORE_METHOD
     from .shadow import run as run_shadow
     at = normalize_time(at or now())
     result = {'at': at, 'registry': score(store, config, at), 'shadow': run_shadow(store, config, at), 'counts': registry_counts(store)}
     with store.db:
         store.db.execute("INSERT OR REPLACE INTO service_state VALUES('evaluation_last',?)", (json.dumps(result, ensure_ascii=False),))
-    json_write(store.root / 'workflow' / 'evaluation' / 'daily' / (local(at).date().isoformat() + '.json'), result)
+    path = store.root / 'workflow' / 'evaluation' / SCORE_METHOD / 'daily' / (local(at).date().isoformat() + '-' + digest(json.dumps(result, sort_keys=True))[:12] + '.json')
+    json_write(path, result)
     return result
 
 
@@ -23,8 +24,8 @@ def _pct(bps):
 
 
 def collect(store, config, at=None, days=7):
-    from .evaluation import comparisons, registry_counts
-    from .shadow import summary
+    from .evaluation import comparisons, registry_counts, SCORE_METHOD
+    from .shadow import summary, status as shadow_status
     from .governance import issues, proposals
     from .maintenance import disk_status
     at = normalize_time(at or now())
@@ -37,8 +38,8 @@ def collect(store, config, at=None, days=7):
     renewed = store.db.execute("SELECT count(*) FROM plan_events WHERE at>=? AND reason LIKE 'RENEWED:%'", (since,)).fetchone()[0]
     return {'generated_at': at, 'window': {'from': since, 'to': at}, 'horizon_days': config.get('evaluation_horizon_days', 20),
             'registry': {'counts': registry_counts(store), 'all_time': comparisons(store, config), 'scored_this_week': store.db.execute(
-                "SELECT count(*) FROM signal_registry WHERE status='SCORED' AND scored_at>=?", (since,)).fetchone()[0]},
-            'shadow': {'all_time': summary(store, config), 'this_week': summary(store, config, week_start)},
+                "SELECT count(*) FROM signal_scores WHERE method=? AND status='SCORED' AND scored_at>=?", (SCORE_METHOD, since)).fetchone()[0]},
+            'shadow': {'status': shadow_status(store), 'all_time': summary(store, config), 'this_week': summary(store, config, week_start)},
             'builds_this_week': builds,
             'model_usage': {'attempts': attempts, 'portfolio_runs': portfolio_runs, 'research_renewals_without_model': renewed},
             'engineering_issues': [{k: i[k] for k in ('id', 'issue_key', 'category', 'symbol', 'title', 'occurrences', 'first_seen_at', 'last_seen_at')} for i in issues(store, 'OPEN')][:30],
@@ -60,17 +61,28 @@ def closed_proposals(store):
 
 def markdown(report, title=None, period='本周'):
     lines = [f"# {title or '周度评估报告'}（{report['window']['from'][:10]} 至 {report['window']['to'][:10]}）", '',
-             '本报告由程序生成，不含模型判断。结论前先看样本量：持有期不重叠的独立样本少于30个时，差异只能当线索，不能作为改动依据。', '']
+             '本报告由程序生成，不含模型判断。持有期不重叠不等于独立；跨标的重叠窗口按时间簇处理，不足30簇不显示区间。所有比较仍属观察性描述。', '']
     lines += ['## 结论注册表', '', f"评估期限：{report['horizon_days']}个交易日；{period}新完成打分 {report['registry']['scored_this_week']} 条。", '',
-              '| 比较项 | 分组 | 每日样本数 | 平均超额 | 独立样本数 | 独立样本平均超额 | 95%区间（独立） |', '|---|---|---|---|---|---|---|']
+              report['registry']['all_time'].get('notice', '旧版统计口径，仅供历史追溯。'), '',
+              '| 比较项 | 分组 | 每日样本数 | 平均超额 | 不重叠样本数 / 时间簇 | 不重叠平均超额 | 95%聚类近似区间 |', '|---|---|---|---|---|---|---|']
     names = {'trend_filter': '趋势过滤是否有效', 'research_veto': '研究否决是否有效（仅趋势成立样本）',
              'portfolio_allow': '组合放行是否有效（有选择余地的样本）', 'global_stance': '全球资产做多判断是否有效'}
     for key, groups in report['registry']['all_time']['groups'].items():
         for label, stats in groups.items():
-            d, i = stats['daily'], stats['independent']
+            d, i = stats['daily'], stats.get('non_overlapping', stats.get('independent', {}))
             ci = i.get('ci95_bps')
-            lines.append(f"| {names.get(key, key)} | {label} | {d.get('n', 0)} | {_pct(d.get('mean_bps'))} | {i.get('n', 0)} | {_pct(i.get('mean_bps'))} | "
+            lines.append(f"| {names.get(key, key)} | {label} | {d.get('n', 0)} | {_pct(d.get('mean_bps'))} | {i.get('n', 0)} / {i.get('time_clusters', 0)} | {_pct(i.get('mean_bps'))} | "
                          + (f"{_pct(ci[0])} ~ {_pct(ci[1])}" if ci else '样本不足') + ' |')
+    lines += ['', '### 按 build 分层（同一采样集合）', '', '| build | 比较项 | 分组 | 不重叠样本 / 时间簇 | 平均超额 |', '|---|---|---|---|---|']
+    for build, groups in report['registry']['all_time'].get('by_build', {}).items():
+        for key, labels_by_group in groups.items():
+            for label, stats in labels_by_group.items():
+                s = stats['non_overlapping']
+                if s['n']:
+                    lines.append(f"| {build} | {names.get(key, key)} | {label} | {s['n']} / {s.get('time_clusters', 0)} | {_pct(s.get('mean_bps'))} |")
+    health = report['shadow'].get('status', {})
+    lines += ['', f"对照回放：{health.get('status', 'UNKNOWN')}；已完整计算至 {health.get('through')}；请求至 {health.get('requested_through')}。",
+              f"待补数据：{json.dumps(health.get('missing', []), ensure_ascii=False)}", health.get('limitations', '')]
     lines += ['', '## 对照账本', '', '四本账共用同一套日线价格与费用；“lot”按整手和当前账户规模，“frac”允许零股，用来剔除整手取整的影响。', '',
               '| 账本 | 起止 | 期末净值（元） | 累计收益 | 最大回撤 | 平均仓位 | 已平仓笔数 | 胜率 | 平均持有天数 |', '|---|---|---|---|---|---|---|---|---|']
     labels = {'A': 'A 纯规则', 'B': 'B 规则+研究资格', 'C': 'C 规则+研究+组合决策', 'D': 'D 规则仓位（模型只否决或下调）'}
@@ -103,11 +115,12 @@ def markdown(report, title=None, period='本周'):
 
 
 def weekly_report(store, config, at=None):
+    from .evaluation import SCORE_METHOD
     at = normalize_time(at or now())
     report = collect(store, config, at)
     year, week, _ = local(at).isocalendar()
-    folder = store.root / 'workflow' / 'evaluation' / 'weekly'
-    stem = f'{year}-W{week:02d}'
+    folder = store.root / 'workflow' / 'evaluation' / SCORE_METHOD / 'weekly'
+    stem = f'{year}-W{week:02d}-' + digest(json.dumps(report, sort_keys=True))[:12]
     json_write(folder / (stem + '.json'), report)
     (folder / (stem + '.md')).write_text(markdown(report), encoding='utf-8')
     return {'status': 'SUCCEEDED', 'report': str((folder / (stem + '.md')).relative_to(store.root)), 'week': stem}

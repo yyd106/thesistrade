@@ -60,7 +60,8 @@ class RegistryTests(Fixture):
         closes = [4000.0] * 4 + [4000.0 + 40 * i for i in range(len(days) - 4)]
         self.benchmark(days, closes)
         self.assertEqual(evaluation.score(self.store, self.cfg, '2026-09-30T10:00:00+08:00')['scored'], 1)
-        score = json.loads(self.store.db.execute('SELECT score_json FROM signal_registry').fetchone()[0])
+        score = json.loads(self.store.db.execute('SELECT score_json FROM signal_scores').fetchone()[0])
+        self.assertIsNone(self.store.db.execute('SELECT score_json FROM signal_registry').fetchone()[0])
         # Entry is the next trading day's open (10.00); exit the fifth day's close (14.50).
         self.assertEqual((score['entry_date'], score['exit_date']), (after[0], after[4]))
         self.assertEqual(score['return_bps'], 4500.0)
@@ -84,7 +85,7 @@ class ShadowBookTests(Fixture):
     def setUp(self):
         super().setUp()
         self.days = trading_days('2026-05-06', 66)
-        base = [(d, 10.0, 10.0 + 0.01 * i, 10.1 + 0.01 * i, 9.9 + 0.01 * i) for i, d in enumerate(self.days[:64])]
+        base = [(d, 10.0 + 0.01 * i, 10.0 + 0.01 * i, 10.1 + 0.01 * i, 9.9 + 0.01 * i) for i, d in enumerate(self.days[:64])]
         self.entry_day, self.exit_day = self.days[64], self.days[65]
         closes = [b[2] for b in base]
         ma20 = sum(closes[-20:]) / 20
@@ -97,8 +98,8 @@ class ShadowBookTests(Fixture):
     def test_mechanical_book_enters_on_band_touch_and_stops_out(self):
         result = shadow.run(self.store, self.cfg, normalize_time(self.exit_day + 'T20:00:00+08:00'))
         self.assertEqual(result['days'], [self.entry_day, self.exit_day])
-        trades = {r['book']: [] for r in self.store.db.execute('SELECT book FROM shadow_trades')}
-        for r in self.store.db.execute('SELECT * FROM shadow_trades ORDER BY day'):trades[r['book']].append((r['side'], r['reason'], r['qty']))
+        trades = {r['book']: [] for r in self.store.db.execute('SELECT book FROM shadow_trades_v2')}
+        for r in self.store.db.execute('SELECT * FROM shadow_trades_v2 ORDER BY day'):trades[r['book']].append((r['side'], r['reason'], r['qty']))
         self.assertEqual([t[:2] for t in trades['A-lot']], [('BUY', 'ENTRY'), ('SELL', 'STOP')])
         self.assertEqual(trades['A-lot'][0][2] % 100, 0);self.assertNotEqual(trades['A-frac'][0][2] % 100, 0)
         self.assertNotIn('B-lot', trades)  # no research plan was active
@@ -119,7 +120,7 @@ class ShadowBookTests(Fixture):
                                   normalize_time(self.exit_day + 'T20:00:00+08:00'), 'ACTIVE', 'cross_research_v1',
                                   json.dumps({'decisions': [{'key': 'watchlist:' + SYMBOL, 'action': 'ALLOW', 'target_bps': 1500}]})))
         shadow.run(self.store, self.cfg, normalize_time(self.exit_day + 'T20:00:00+08:00'))
-        buys = {r['book']: r for r in self.store.db.execute("SELECT * FROM shadow_trades WHERE side='BUY'")}
+        buys = {r['book']: r for r in self.store.db.execute("SELECT * FROM shadow_trades_v2 WHERE side='BUY'")}
         self.assertTrue({'A-lot', 'B-lot', 'C-lot', 'D-lot'} <= set(buys))
         notional = {b: buys[b]['qty'] * buys[b]['price_cents'] for b in buys}
         self.assertLessEqual(notional['C-frac'], 1_500_000 + 1)  # 15% target of CNY 100,000
@@ -131,7 +132,7 @@ class WeeklyTests(Fixture):
     def test_daily_job_and_weekly_report_are_written(self):
         study(self.store, self.cfg, self.packet, model_fn=research_model(self.packet), at='2026-09-15T09:01:00+08:00')
         daily = weekly.run_daily(self.store, self.cfg, '2026-09-18T20:00:00+08:00')
-        self.assertIn('registry', daily);self.assertTrue((self.store.root / 'workflow/evaluation/daily/2026-09-18.json').exists())
+        self.assertIn('registry', daily);self.assertTrue(list((self.store.root / 'workflow/evaluation/decision-time-v2/daily').glob('2026-09-18-*.json')))
         result = weekly.weekly_report(self.store, self.cfg, '2026-09-19T10:00:00+08:00')
         text = (self.store.root / result['report']).read_text()
         for heading in ('## 结论注册表', '## 对照账本', '## 版本变化', '## 未关闭的工程问题', '## 变更提案'):

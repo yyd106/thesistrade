@@ -317,7 +317,8 @@ def review(store, a, b):
     return {'status': r['model_status'], 'window_end': r['window_end'], 'revision': r['revision'],
             'summary': ((payload.get('analysis') or {}).get('summary') or payload.get('analysis_error') or '')[:160],
             'checks_passed': sum(1 for c in checks if c.get('status') == 'PASS'), 'checks_total': len(checks),
-            'checks_failed': [c.get('check') for c in checks if c.get('status') != 'PASS'], 'routing': dict(routing)}
+            'checks_not_applicable': sum(c.get('status') == 'NOT_APPLICABLE' for c in checks),
+            'checks_failed': [c.get('check') for c in checks if c.get('status') in ('FAIL','INSUFFICIENT','ERROR')], 'routing': dict(routing)}
 
 
 def governance(store, a, b):
@@ -585,6 +586,7 @@ def markdown(d):
         L.append('- 当天没有复盘记录。')
     else:
         L.append(f"- {_hm(v['window_end'])} 窗口复盘：{STATUS_NAMES.get(v['status'], v['status'])}；程序检查 {v['checks_passed']}/{v['checks_total']} 通过"
+                 + f"，{v.get('checks_not_applicable', 0)} 项不适用"
                  + (f"（未通过：{'、'.join(CHECK_NAMES.get(c, c) for c in v['checks_failed'])}）" if v['checks_failed'] else '') + '；发现去向：'
                  + ('、'.join(f"{'工程问题' if k == 'engineering_issue' else '提案草稿' if k == 'proposal_draft' else k} {n}" for k, n in v['routing'].items()) or '无') + '。')
         if v['summary']:
