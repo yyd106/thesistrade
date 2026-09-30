@@ -70,20 +70,8 @@
       "name": "迈瑞医疗"
     },
     {
-      "symbol": "sz002352",
-      "name": "顺丰控股"
-    },
-    {
       "symbol": "sh601899",
       "name": "紫金矿业"
-    },
-    {
-      "symbol": "sh600660",
-      "name": "福耀玻璃"
-    },
-    {
-      "symbol": "sh603288",
-      "name": "海天味业"
     },
     {
       "symbol": "sh600031",
@@ -724,5 +712,6 @@
   "investment_policy": "days_cash_v1",
   "portfolio_strategy": "cross_research_v1",
   "deployment_role": "cloud",
-  "cloud_stale_policy": "reduce_only"
+  "cloud_stale_policy": "reduce_only",
+  "industry_enabled": true
 }

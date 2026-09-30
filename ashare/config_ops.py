@@ -28,7 +28,7 @@ OPERATIONAL = {'collection_times', 'review_time', 'evaluation_time', 'weekly_rep
 STRATEGY = {'paper_entry_band_bps', 'paper_stop_loss_bps', 'paper_take_profit_bps', 'plan_max_age_hours', 'model_name',
             'model_reasoning_effort', 'watchlist', 'dynamic_enabled', 'max_packet_chars', 'max_news_packet_pct',
             'evaluation_horizon_days', 'shadow_risk_per_trade_bps', 'shadow_start_date', 'research_topics',
-            'comparison_peers', 'business_keywords', 'model_enabled'}
+            'comparison_peers', 'business_keywords', 'model_enabled', 'industry_enabled', 'industry_policy'}
 
 # Written only by `./agent reports setup` (where the node's reports go), never by `config set`.
 SETUP = {'reports_remote'}

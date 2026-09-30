@@ -111,6 +111,8 @@ class Store:
         migrate(self.db, now(), digest)
         from .cloud_schema import SCHEMA as CLOUD_SCHEMA
         self.db.executescript(CLOUD_SCHEMA)
+        from .industry import SCHEMA as INDUSTRY_SCHEMA
+        self.db.executescript(INDUSTRY_SCHEMA)
 
     def raw(self, data, suffix=".bin"):
         h = digest(data)

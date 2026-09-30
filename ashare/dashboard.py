@@ -1,5 +1,6 @@
 """Loopback dashboard with renewable page sessions and same-origin mutations."""
 from __future__ import annotations
+from .universe import company_targets
 import json
 import secrets
 import signal
@@ -36,7 +37,7 @@ def status(config, *, overview=False):
         a['risk']=risk_state(store)
         a['investment_policy']=public() if enabled(config) else None
         plans=[]
-        for item in config['watchlist']:
+        for item in company_targets(store,config):
             p=store.db.execute("SELECT p.*,s.snapshot_id,s.model_status,s.result_json FROM plans p JOIN studies s ON s.id=p.study_id WHERE p.symbol=? ORDER BY CASE WHEN p.status='ACTIVE' AND p.valid_until>? THEN 0 ELSE 1 END,p.activated_at DESC,p.rowid DESC LIMIT 1",(item['symbol'],now())).fetchone()
             plan=dict(p) if p else None
             if plan:
@@ -101,6 +102,7 @@ def status(config, *, overview=False):
             'market_phase':phase(at),'quote_max_age_seconds':config['quote_max_age_seconds'],'schedule':{'collection':config['collection_times'],'slots':config['slot_times'],'review':config['review_time'],
                                                'execution_mode':config['slot_execution_mode']},
             'watchlist':plans,'observation':observation_view(store,at,config),'dynamic':dynamic_view(store,config,at),'account':a,'reviews':reviews,'followups':followup_view(store,at),
+            'industry':__import__('ashare.industry',fromlist=['view']).view(store,config,at),
             'supervision':supervision_view(store),
             'next_runs':next_runs(config,at),'portfolio':portfolio(store,config,a,at),
             'trade_effects':trade_effects(store,config,at),'portfolio_strategy':portfolio_strategy_view(store,config,at),
@@ -315,11 +317,11 @@ def make_handler(config_path,token,port):
                     assert_command(cfg,kind)
                     if kind not in ('cycle','collect','research','slot','review','repair','dynamic_cycle','global_research','portfolio_strategy'):raise ValueError('未知操作')
                     symbol=body.get('symbol')
-                    if kind=='repair' and symbol not in {i['symbol'] for i in cfg['watchlist']}:raise ValueError('请选择当前自选股')
                     store=Store(cfg['data_dir'])
                     try:
                         store.db.execute('BEGIN IMMEDIATE')
                         if kind=='repair':
+                            if symbol not in {i['symbol'] for i in company_targets(store,cfg)}:raise ValueError('请选择当前研究对象')
                             busy=store.db.execute("SELECT j.id FROM jobs j JOIN job_inputs i ON i.job_id=j.id WHERE j.kind='repair' AND j.status IN ('PENDING','RUNNING') AND json_extract(i.payload_json,'$.symbol')=? LIMIT 1",(symbol,)).fetchone()
                         else:busy=store.db.execute("SELECT id FROM jobs WHERE kind=? AND status IN ('PENDING','RUNNING') LIMIT 1",(kind,)).fetchone()
                         when=review_window(now(),cfg['review_time'])[1].isoformat() if kind=='review' else now()

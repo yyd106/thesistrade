@@ -17,7 +17,7 @@ from .storage import now, digest, normalize_time
 
 SH = ZoneInfo("Asia/Shanghai")
 ALLOWED_HOSTS = {"qt.gtimg.cn", "web.ifzq.gtimg.cn", "www.cninfo.com.cn", "static.cninfo.com.cn", "www.csrc.gov.cn", "www.sse.com.cn",
-                 "news.un.org", "www.mofcom.gov.cn", "datacenter-web.eastmoney.com", "data.eastmoney.com"}
+                 "www.sec.gov", "data.sec.gov", "search.ccgp.gov.cn", "www.ccgp.gov.cn", "news.un.org", "www.mofcom.gov.cn", "datacenter-web.eastmoney.com", "data.eastmoney.com"}
 
 
 def check_url(url):

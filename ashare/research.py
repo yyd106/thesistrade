@@ -196,6 +196,20 @@ def make_snapshot(store,config,symbol,batch_id=None,at=None,persist=True):
         'local_only_required_count':sum(materiality.material_document(d) for d in docs if not d['cloud_allowed']),
         'limitations':['公开来源仅支持研究与模拟','证据检索使用FTS5；自动研究按版本选择增量并沿用有限摘录；未部署语义向量/OCR',
             '公司披露不等于券商研报；授权研报需导入','公开财务仅通过字段与勾稽核验；PDF布局未人工校验；模拟技术策略不使用估值预测']}
+    if config.get('industry_enabled'):
+        from .industry import context
+        from .universe import membership
+        packet['industry_hypotheses']=context(store,symbol,stamp)
+        packet['research_membership']=next((m for m in membership(store,config,stamp) if m['symbol']==symbol),None)
+        for h in packet['industry_hypotheses']:
+            for f in h['facts']:
+                if f['evidence_id'] in {e['evidence_id'] for e in packet['evidence']}:continue
+                c=store.db.execute('SELECT text FROM chunks WHERE id=?',(f['evidence_id'],)).fetchone()
+                d=next((d for d in store.documents_as_of(stamp) if d['id']==f['doc_id']),None)
+                if c and d and d['cloud_allowed']:
+                    packet['evidence'].append({'evidence_id':f['evidence_id'],'doc_id':f['doc_id'],'text':f['quote'],'page':f['page'],**{k:d[k] for k in ('symbol','title','url','kind','claim_type','published_at','ready_at')}})
+                    if d['id'] not in {m['version_id'] for m in packet['document_manifest']}:
+                        packet['document_manifest'].append({'version_id':d['id'],'content_hash':d['content_hash'],'ready_at':d['ready_at'],'claim_type':d['claim_type'],'cloud_allowed':True})
     # Audit snapshots also contain local bars/manifests; bound the actual model input instead.
     # Preserve the complete catalog locally and make deferred raw chunks explicitly unread.
     while len(encode(model_packet(packet,config)))>config['max_packet_chars']:
@@ -242,6 +256,8 @@ def price_plan(packet,config,analysis,model_status):
     """Integer-cent technical baseline for paper evaluation, not a valuation forecast."""
     s=packet['stocks'][0]; f=s.get('features') or {}; u=f.get('unadjusted') or {}
     gaps=[]
+    member=packet.get('research_membership')
+    if config.get('industry_enabled') and (not member or not member['buy_eligible']):gaps.append('RESEARCH_MEMBERSHIP_REVIEW')
     if model_status!='SUCCEEDED':gaps.append('MODEL_NOT_READY')
     if analysis.get('action')!='WATCH':gaps.append('RESEARCH_VETO')
     if not packet['source_checks']:gaps.append('NO_COLLECTION_COVERAGE')
@@ -282,7 +298,7 @@ def price_plan(packet,config,analysis,model_status):
             lot_cost=levels['buy_high_cents']*size['min_buy_qty']
             if lot_cost+fee(config,'BUY',lot_cost)>size['equity_cents']*min(size['max_stock_pct'],config['paper_max_stock_pct'])//100:
                 gaps.append('LOT_EXCEEDS_CAP')
-    return {'holding_unit':'DAYS','recheck_hours':1,'research_method':'days_cash_v1' if config.get('investment_policy') else 'legacy',
+    return {'research_membership_token':(member or {}).get('fingerprint'),'holding_unit':'DAYS','recheck_hours':1,'research_method':'days_cash_v1' if config.get('investment_policy') else 'legacy',
         'kind':'NO_ENTRY' if gaps else 'PAPER_TRADE','strategy_version':config['strategy_version'],
         'event_reviews':packet.get('event_reviews',[]),'corporate_actions':u.get('corporate_actions',[]),
         'basis':basis,'levels':levels,'blockers':list(dict.fromkeys(gaps)),
@@ -369,6 +385,11 @@ def study(store,config,packet,use_model=True,model_fn=None,at=None):
     members={r[0] for r in store.db.execute('SELECT doc_id FROM snapshot_members WHERE snapshot_id=?',(packet['snapshot_id'],))}
     if any(d['id'] not in members and (materiality.material_document(d) or d['kind']=='financial_data') for d in later):
         plan['kind']='NO_ENTRY';plan['blockers'].append('SOURCE_CHANGED_DURING_RESEARCH')
+    if config.get('industry_enabled'):
+        from .universe import membership
+        member=next((m for m in membership(store,config,stamp) if m['symbol']==packet['symbol']),None)
+        if plan.get('research_membership_token')!=(member or {}).get('fingerprint'):
+            plan['kind']='NO_ENTRY';plan['blockers'].append('MEMBERSHIP_CHANGED_DURING_RESEARCH')
     with store.db:
         store.db.execute('INSERT INTO studies VALUES(?,?,?,?,?,?)',(rid,packet['snapshot_id'],packet['symbol'],stamp,model_status,encode(result)))
         if model_status=='SUCCEEDED':learning.commit(store,packet,rid,stamp)
@@ -429,6 +450,7 @@ def reusable(store,config,packet):
             'events':sorted((r['doc_id'],r['status']) for r in p.get('event_reviews',[])),
             'external':sorted(e['doc_id'] for e in p.get('external_events',[])),
             'dossier':[(p.get('company_dossier') or {}).get(k) for k in ('doc_id','status','gaps')],
+            'industry':p.get('industry_hypotheses',[]),'membership':(p.get('research_membership') or {}).get('fingerprint'),
             'guidance':[g['id'] for g in p.get('adopted_guidance',[])]})
     if inputs(json.loads(snap[0]))!=inputs(packet):return None
     return {'study':dict(row),'plan':dict(plan),'model':old.get('model')}
@@ -474,6 +496,8 @@ def model_packet(packet,config):
         '本次资料变化':{k:v for k,v in packet.get('learning',{}).items() if k not in ('new_chunk_ids','revised_documents')},
         '事项规则核验':[{'标题':r['title'],'通过':r['status']=='VERIFIED','缺口':r['missing'],'已核验字段':r['facts']} for r in packet.get('event_reviews',[])],
         '价格口径说明':'纯现金分红经核验后，以除息日为界从此前收盘价扣减每股税前现金分红，再计算可比均线；原始价格保留审计。' if u.get('corporate_actions') else '原始价格口径',
+        '产业链研究假设':[{k:v for k,v in h.items() if k!='facts'} for h in packet.get('industry_hypotheses',[])],
+        '名单资格':packet.get('research_membership'),
         '外部事件与可能影响':packet.get('external_events',[]),
         '行情':{'名称':q.get('name'),'最新价格':yuan(q.get('price_cents')),'昨日收盘':yuan(q.get('prev_close_cents')),'报价时间':q.get('observed_at')},
         '价格趋势':{'价格数据日期':u.get('last_complete_date'),'是否满足趋势条件':trend},

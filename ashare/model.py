@@ -146,7 +146,8 @@ def validate_result(result, packet):
         for key in ("counterpoints", "missing_fields", "next_checks"):
             if not isinstance(stock[key], list) or any(not isinstance(s, str) for s in stock[key]):
                 raise ValueError(key + "格式错误")
-        evidence = {e["evidence_id"]: e for e in packet["evidence"] if e["symbol"] in (symbol, "MARKET")}
+        industry_refs={f["evidence_id"] for h in packet.get("industry_hypotheses",[]) for f in h.get("facts",[])}
+        evidence = {e["evidence_id"]: e for e in packet["evidence"] if e["symbol"] in (symbol, "MARKET") or e["evidence_id"] in industry_refs}
         for fact in stock["facts"]:
             if not isinstance(fact, dict) or set(fact) != {"evidence_id", "quote"}:
                 raise ValueError("事实引用格式不符")

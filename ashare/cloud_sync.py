@@ -73,7 +73,7 @@ def display_packet(config):
     from .dashboard import status
     s=status(config,overview=False)
     # UI summaries only; account, credentials, jobs, raw documents and model files are excluded.
-    keep=('watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds','supervision')
+    keep=('watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds','supervision','industry')
     result={k:s[k] for k in keep};previews={}
     from .storage import Store
     local=Store(config['data_dir'])
@@ -137,6 +137,10 @@ def queue_publication(store,config,decision_id):
     payload={'protocol':1,'kind':'strategy','bundle_id':row['id'],'completed_at':row['created_at'],'decision':dict(row),'sources':tables,'contracts':capsules,
              'ledger_version':decision.get('remote_ledger_version'),'news_watermark':watermark[0] if watermark else None,
              'active_assets':list({d['symbol'] for d in decision['decisions']}),'display':display}
+    if config.get('industry_enabled'):
+        if not remote_supports(store,'industry_lists_v1'):raise ValueError('云端尚不支持双名单，等待云端升级')
+        from .universe import publication
+        payload['research_membership']=publication(store,config,row['created_at'],row['valid_until'])
     if remote_supports(store,'display_delta'):
         # Send only the parts of the UI summary the cloud does not already hold.
         sections=display_sections(display);hashes=section_hashes(sections);known=value(store,'remote_display_hashes') or {}
@@ -206,6 +210,10 @@ def receive_strategy(store,config,body,at):
     if not 1<=len(items)<=60 or len({d['key'] for d in items})!=len(items):raise ValueError('策略资产数量或重复项错误')
     if set(body['sources'])!=set(ledger.SUPPORT) or set(body['contracts'])!={d['key'] for d in items}:raise ValueError('策略与研究引用不完整')
     allowed=set(w['symbol'] for w in config['watchlist'])
+    if config.get('industry_enabled'):
+        from .universe import validate_publication
+        members=validate_publication(store,config,body.get('research_membership'),items,completed,until)
+        allowed.update(members)
     for d in items:
         if d['route'] not in ('watchlist','dynamic','global') or d['key']!=d['route']+':'+d['identity']:raise ValueError('交易线路错误')
         if d['route']=='watchlist' and d['symbol'] not in allowed:raise ValueError('未经配置的自选股')
@@ -226,6 +234,7 @@ def receive_strategy(store,config,body,at):
     store.db.execute('DELETE FROM cloud_contracts')
     for k,c in body['contracts'].items():store.db.execute('INSERT INTO cloud_contracts VALUES(?,?,?)',(k,completed,canonical(c).decode()))
     put(store,'active_assets',body['active_assets'])
+    if config.get('industry_enabled'):put(store,'research_membership',body['research_membership'])
     display_hashes=receive_display(store,body)
     # Key invalidations older than this decision no longer apply.
     put(store,'invalidated_keys',{k:v for k,v in (value(store,'invalidated_keys') or {}).items() if v>completed})
@@ -314,6 +323,21 @@ def sync_once(config):
                 if long_enough:
                     from .connectivity import local_network_error,log_interval
                     log_interval(store.root,'offline',offline_since,recovered_at,cause='NETWORK' if local_network_error(failure) else 'CLOUD')
+            if config.get('industry_enabled'):
+                from .portfolio_strategy import changed_keys,request as request_portfolio
+                changed=changed_keys(store,config,now())
+                if changed:
+                    # Persist once per distinct change; a retry must not keep moving the invalidation clock.
+                    from .portfolio_strategy import candidate_sources,row_token
+                    from .universe import membership
+                    marker=digest(canonical([changed,{k:row_token(v) for k,v in candidate_sources(store,config,now()).items()},[(m['symbol'],m['fingerprint']) for m in membership(store,config,now())]]))
+                    if value(store,'membership_invalidation_marker')!=marker:
+                        queue_invalidation(store,changed,now())
+                        with store.db:put(store,'membership_invalidation_marker',marker)
+                    request_portfolio(store,config,now(),changed=True)
+                else:
+                    with store.db:put(store,'membership_invalidation_marker',None)
+            phase='invalidate';deliver_invalidation(store,config)
             phase='publish';answer=flush(store,config)
             with store.db:put(store,'last_sync',{'at':now(),'status':'OK','ledger_version':packet['ledger_version']})
             try:
@@ -349,3 +373,23 @@ def deliver_supervision(store,config):
         put(store,'supervision_sent_hash',fingerprint)
         put(store,'supervision_sync',{'at':now(),'status':'OK'})
     return answer
+
+
+def queue_invalidation(store,keys,at):
+    """Persist revocation before networking; failed sends survive process restarts."""
+    prior=value(store,'pending_invalidation') or {}
+    combined=set(prior.get('keys',[]))|set(keys)
+    with store.db:put(store,'pending_invalidation',{'changed_at':max(at,prior.get('changed_at','')),'keys':sorted(combined)})
+
+
+def deliver_invalidation(store,config):
+    pending=value(store,'pending_invalidation')
+    if not pending:return None
+    body={'changed_at':pending['changed_at']}
+    if '*' not in pending['keys'] and remote_supports(store,'targeted_invalidation'):body['keys']=pending['keys']
+    result=request(config,'/api/sync/invalidate',body)
+    with store.db:
+        # Another worker may have appended a later revocation while this request ran.
+        if value(store,'pending_invalidation')==pending:put(store,'pending_invalidation',None)
+        put(store,'last_invalidation',{**body,'receipt':result,'acknowledged_at':now()})
+    return result

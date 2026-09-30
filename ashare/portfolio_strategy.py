@@ -1,4 +1,5 @@
 """Versioned portfolio decisions over existing research; never replaces native entry/risk gates."""
+from .universe import company_targets
 import json
 import uuid
 from datetime import datetime, timedelta
@@ -43,7 +44,9 @@ def snapshot(store, config, at):
     a = account_inside_transaction(store, at) if store.db.in_transaction else account(store, at)
     candidates = []; equity = max(1, a['equity_cents'])
     selected = targets(store, config, at)
-    names = {i['symbol']: i['name'] for i in config['watchlist']}
+    names = {i['symbol']: i['name'] for i in company_targets(store,config,at)}
+    from .universe import membership
+    members={m['symbol']:m for m in membership(store,config,at)}
 
     def add(route, identity, symbol, name, position, row):
         row = dict(row) if row else None
@@ -63,9 +66,15 @@ def snapshot(store, config, at):
             from .dynamic import eligibility
             blockers, _ = eligibility(store, config, row, at, execution=False)
             ready = ready and not blockers
+        member=members.get(symbol)
+        if config.get('industry_enabled'):
+            ready=ready and bool(member and member['buy_eligible']) if symbol not in ('GOLD','SILVER','BTC','ETH') else ready
+            if route=='dynamic' and symbol in names:ready=False
+            if route=='watchlist' and p.get('research_membership_token')!=(member or {}).get('fingerprint'):ready=False
         cap = min(config['paper_max_stock_pct'], p.get('max_stock_pct', 20) if route == 'watchlist' else p.get('max_position_pct', 5))*100
         key = route+':'+identity
         candidates.append({'key': key, 'route': route, 'identity': identity, 'symbol': symbol, 'name': name,
+            'membership_token':member.get('fingerprint') if member else None,
             'source_id': row['id'] if row else None, 'source_token': row_token(row),
             'source_valid_until': row.get('valid_until', row.get('expires_at')) if row else None,
             'current_value_cents': value, 'qty': qty, 'current_bps': weight, 'max_bps': cap,
@@ -91,7 +100,7 @@ def snapshot(store, config, at):
     for symbol in sorted(set(selected) | set(a['global_positions'])):
         add('global', symbol, symbol, selected.get(symbol, {}).get('name', symbol), a['global_positions'].get(symbol, {}), source(store, 'global', symbol))
     orders = [{k:o.get(k) for k in ('id','symbol','origin','case_id','side','qty','filled_qty','reserved_cents','status')} for o in a['orders']]
-    guard = digest(encoded({'sources': [(c['key'],c['source_token']) for c in candidates],
+    guard = digest(encoded({'sources': [(c['key'],c['source_token'],c.get('membership_token')) for c in candidates],
         'positions': [(c['key'],c['qty'],c['cost_cents']) for c in candidates], 'cash': a['cash_cents'],
         'orders': orders, 'withdrawals': a['withdrawal_reserved_cents'], 'halted': state(store)['halted']}))
     return {'version': VERSION, 'as_of': at, 'guard': guard,
@@ -265,6 +274,10 @@ def decision(store, config, route, identity, at):
     d = next((d for d in current['payload']['decisions'] if d['key']==key),None)
     if not d:
         return None
+    if config.get('industry_enabled') and d['action']=='ALLOW':
+        from .universe import membership
+        member=next((m for m in membership(store,config,at) if m['symbol']==d['symbol']),None)
+        if d.get('membership_token')!=(member or {}).get('fingerprint'):return None
     dependencies=set(d['related_keys'])|{d['key']}
     dependencies.update(x['key'] for x in current['payload']['decisions'] if x['reference_id'] in d['evidence_ids'])
     for g in current['payload']['risk_groups']:
@@ -283,7 +296,7 @@ def candidate_sources(store, config, at):
     from .global_market import targets
     result = {}
     held = {r[0] for r in store.db.execute('SELECT DISTINCT symbol FROM paper_lots WHERE qty>0')}
-    for symbol in sorted({i['symbol'] for i in config['watchlist']} | held):
+    for symbol in sorted({i['symbol'] for i in company_targets(store,config,at)} | held):
         result['watchlist:'+symbol] = source(store, 'watchlist', symbol)
     from .dynamic_paper import case_position
     seen = set()
@@ -309,6 +322,10 @@ def changed_keys(store, config, at):
     changed = [k for k, row in now_sources.items() if decided.get(k) != row_token(row)]
     # Candidates that disappeared matter too: their authorization must lapse.
     changed += [k for k in decided if k not in now_sources and decided[k] is not None]
+    if config.get('industry_enabled'):
+        from .universe import membership
+        tokens={m['symbol']:m['fingerprint'] for m in membership(store,config,at)}
+        changed += [d['key'] for d in current['payload']['decisions'] if d.get('membership_token')!=tokens.get(d['symbol'])]
     return sorted(set(changed))
 
 
@@ -334,6 +351,10 @@ def buy_budget(store, config, route, identity, at, a, exclude_order=None):
     d = decision(store,config,route,identity,at)
     if not d or d['action']!='ALLOW':
         raise ValueError('组合策略未授权新增买入或已失效')
+    if config.get('industry_enabled') and d['symbol'] not in ('GOLD','SILVER','BTC','ETH'):
+        from .universe import permit,company_targets
+        if not permit(store,config,d['symbol'],at):raise ValueError('名单依据待复核，暂停新买入')
+        if route=='dynamic' and d['symbol'] in {m['symbol'] for m in company_targets(store,config,at)}:raise ValueError('该证券已由统一公司研究管理')
     current = active(store,at); bykey = {x['key']:x for x in current['payload']['decisions']}
     def reserved(keys):
         return sum(o['reserved_cents'] for o in a['orders'] if o['side']=='BUY' and o['id']!=exclude_order and order_key(o) in keys)

@@ -1,4 +1,5 @@
 """Bounded per-stock recovery planning. No permission or trading gate is overridden."""
+from .universe import company_targets
 import json
 import re
 from datetime import datetime
@@ -62,7 +63,7 @@ def enqueue_recovery(store,config,at):
     if store.db.execute("SELECT 1 FROM jobs WHERE kind IN ('cycle','collect','research','repair') AND status IN ('PENDING','RUNNING') LIMIT 1").fetchone():return
     row=store.db.execute("SELECT value FROM service_state WHERE key='last_recovery'").fetchone()
     if row and (datetime.fromisoformat(at)-datetime.fromisoformat(row[0])).total_seconds()<config['recovery_interval_seconds']:return
-    states=[(item['symbol'],recovery_status(store,config,item['symbol'],at)) for item in config['watchlist']]
+    states=[(item['symbol'],recovery_status(store,config,item['symbol'],at)) for item in company_targets(store,config)]
     for sym,state in sorted(states,key=lambda pair:pair[1]['automatic_attempts']):
         if state['state']!='PENDING':continue
         # Persisted daily identity prevents restart from resetting the retry budget.

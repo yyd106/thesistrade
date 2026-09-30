@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .universe import company_targets
 
 import fcntl
 import html
@@ -54,7 +55,7 @@ def collect(store, run_id, config, on_ready=None):
             return None
     from .inbox import import_inbox
     attempt('report_inbox',None,lambda:import_inbox(store,config,run_id))
-    attempt("tencent_quotes", None, lambda: sources.collect_quotes(store, run_id, [i["symbol"] for i in config["watchlist"]], config))
+    attempt("tencent_quotes", None, lambda: sources.collect_quotes(store, run_id, [i["symbol"] for i in company_targets(store,config)], config))
     catalog = attempt("cninfo_stock_catalog", None, lambda: sources.stock_catalog(store))
     if catalog is not None:store.check(run_id,'cninfo_stock_catalog',None,'OK','股票目录已读取')
     attempt("official_news", "MARKET", lambda: sources.collect_news(store, run_id, config["news_url"]))
@@ -64,7 +65,14 @@ def collect(store, run_id, config, on_ready=None):
     from . import market_context, fundamentals
     attempt('market_comparison','MARKET',lambda:market_context.collect_comparisons(store,run_id,config))
     from .connectivity import check as online_or_stop
-    for item in config["watchlist"]:
+    import time
+    targets=company_targets(store,config)
+    if config.get('industry_enabled'):
+        targets=sorted(targets,key=lambda i:(not i.get('protected'),store.db.execute("SELECT coalesce(max(ready_at),'') FROM batch_stocks WHERE symbol=?",(i['symbol'],)).fetchone()[0],i['symbol']))
+    for item in targets:
+        if config.get('_deadline') and time.monotonic()>=config['_deadline']:
+            store.check(run_id,'research_budget',item['symbol'],'PARTIAL','本轮预算结束；已完成公司保存，下轮优先补齐')
+            break
         # Stop before the next stock once the machine has been offline for a while; research is redone after reconnect.
         online_or_stop(store)
         symbol = item["symbol"]
@@ -80,7 +88,7 @@ def collect(store, run_id, config, on_ready=None):
 
 def build_packet(store, run_id, config, as_of):
     stocks, evidence = [], {}
-    for item in config["watchlist"]:
+    for item in company_targets(store,config,as_of):
         symbol = item["symbol"]
         quote = store.latest_quote(symbol, as_of)
         if quote:

@@ -63,7 +63,8 @@ def collect_comparisons(store,run_id,config):
     from .calendar import completed_bar_cutoff
     cutoff=completed_bar_cutoff(now())
     requested={BENCHMARK['symbol']:BENCHMARK['name']}
-    for item in config['watchlist']:requested.update(dict(peers(config,item['symbol'])))
+    from .universe import company_targets
+    for item in company_targets(store,config):requested.update(dict(peers(config,item['symbol'])))
     for symbol,name in requested.items():
         try:
             raw=sources.fetch('https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param='+symbol+',day,,,120,qfq',max_bytes=2000000)

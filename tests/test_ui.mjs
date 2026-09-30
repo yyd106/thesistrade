@@ -451,3 +451,12 @@ assert.ok(noticeActions('DECISION').every(a=>a.confirm));
 assert.deepEqual([...noticeActions('VETO')].map(a=>a.action),['VETO','ACK']);
 assert.deepEqual([...noticeActions('INFO')].map(a=>a.action),['ACK']);
 console.log('Notice selection, roles and per-kind answers passed.');
+// Industry cards use text nodes and show missing evidence without implying trade permission.
+const drawIndustry=vm.runInContext('drawIndustry',context);
+const industryBox=new FakeElement('div');
+drawIndustry(industryBox,{domains:{ai:{name:'AI 算力基础设施'}},methods:{'1':'二级供应链传导'},members:[{symbol:'sz300499',membership:'DYNAMIC',buy_eligible:false}],hypotheses:[{id:'h',symbol:'sz300499',domain:'ai',method:'1',effective_state:'REVIEW',review_at:'2026-09-30T12:00:00Z',payload:{name:'高澜股份',thesis:'<script>不可信原文</script>',causal_chain:['终端订单','上游供应'],next_check:'核实实际采购份额',invalidation:'客户否认供货',missing:['客户收入占比未知'],counterpoints:['认证不等于量产'],facts:[{entity:'供应商',product:'部件',metric:'订单',value:'未知',unit:'元',period:'本季度',quote:'原始披露文字',published_at:'2026-09-29T12:00:00Z',ready_at:'2026-09-30T12:00:00Z',claim_type:'DISCLOSED',url:'javascript:alert(1)'}]}}]});
+assert.match(JSON.stringify(industryBox),/待复核/);assert.match(JSON.stringify(industryBox),/暂停新增买入/);assert.match(JSON.stringify(industryBox),/收入占比未知/);
+assert.doesNotMatch(JSON.stringify(industryBox),/javascript:/);
+const methodBox=new FakeElement('div');vm.runInContext('drawImpactAssessment',context)(methodBox,{method_gate:true,admitted:true},'new-method');
+assert.match(JSON.stringify(methodBox),/初步证据通过/);assert.doesNotMatch(JSON.stringify(methodBox),/通过影响评估/);
+console.log('Industry evidence, uncertainty, method gate and safe source-link rendering passed.');

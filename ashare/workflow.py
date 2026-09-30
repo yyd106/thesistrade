@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .universe import company_targets
 import fcntl
 import time
 from contextlib import contextmanager
@@ -76,6 +77,20 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
         scope='collection' if command in ('collect','cycle') else command
         with task_lock(store.root,scope):
             if command in ('collect','cycle'):
+                if command=='cycle' and config.get('industry_enabled'):
+                    from .industry_research import run as discover,policy as industry_policy
+                    limits=industry_policy(config);deadline=time.monotonic()+limits['company_seconds']
+                    discover(store,{**config,'model_enabled':config.get('model_enabled') and use_model},key,deadline=time.monotonic()+limits['discovery_seconds'])
+                    if role(config)=='research':
+                        from .portfolio_strategy import changed_keys
+                        from .cloud_sync import queue_invalidation,deliver_invalidation
+                        changes=changed_keys(store,config,now())
+                        if changes:
+                            queue_invalidation(store,changes,now())
+                            try:
+                                with task_lock(store.root,'cloud-sync'):deliver_invalidation(store,config)
+                            except Exception:pass  # Durable pending record is retried by the minute sync.
+                    config={**config,'_deadline':deadline}
                 studies=[]
                 def after_ready(sym):
                     with task_lock(store.root,'research-'+sym):
@@ -84,13 +99,13 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                 result['studies']=studies
             elif command=='research':
                 result=[]
-                for item in config['watchlist']:
+                for item in company_targets(store,config):
                     if symbol and item['symbol']!=symbol:continue
                     online_or_stop(store)
                     with task_lock(store.root,'research-'+item['symbol']):
                         result.append(research_stock(item['symbol'],batch_id))
             elif command=='repair':
-                if symbol not in {i['symbol'] for i in config['watchlist']}:raise ValueError('只可恢复当前自选股')
+                if symbol not in {i['symbol'] for i in company_targets(store,config)}:raise ValueError('只可恢复当前自选股')
                 from .recovery import recovery_need
                 need=recovery_need(store,config,symbol,now())
                 with task_lock(store.root,'research-'+symbol):
@@ -106,7 +121,7 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                             except Exception as exc:store.check(bid,source,symbol,'FAILED',str(exc)[:300])
                         from .inbox import import_inbox
                         collect_one('report_inbox',lambda:import_inbox(store,config,bid))
-                        collect_one('market_comparison',lambda:market_context.collect_comparisons(store,bid,{**config,'watchlist':[i for i in config['watchlist'] if i['symbol']==symbol]}))
+                        collect_one('market_comparison',lambda:market_context.collect_comparisons(store,bid,{**config,'industry_enabled':False,'watchlist':[i for i in company_targets(store,config) if i['symbol']==symbol]}))
                         collect_one('tencent_daily',lambda:sources.collect_history(store,bid,symbol,config))
                         collect_one('financials',lambda:fundamentals.collect(store,bid,symbol))
                         collect_one('cninfo_catalog',lambda:sources.collect_announcements(store,bid,{'symbol':symbol},config,sources.stock_catalog(store)))
@@ -119,6 +134,9 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                         result=research_stock(symbol,bid)
                     elif need['action']=='research':result=research_stock(symbol)
                     else:result={'status':'NEEDS_INPUT','reason':need['why']}
+            elif command=='industry_research':
+                from .industry_research import run as discover
+                result=discover(store,{**config,'model_enabled':config.get('model_enabled') and use_model},key)
             elif command=='global_research':
                 from .global_research import run
                 result=run(store,config)
@@ -143,6 +161,9 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
             elif command=='evaluate':
                 from .weekly import run_daily
                 result=run_daily(store,config)
+                if config.get('industry_enabled'):
+                    from .industry import evaluate
+                    result['operating_predictions']=evaluate(store,now())
             elif command=='weekly_report':
                 from .weekly import weekly_report
                 result=weekly_report(store,config)
@@ -167,8 +188,11 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                 refresh_market(store,config,False)
                 result={'fills':settle(store,config,now()),'account':mark_equity(store,now())}
             else:raise ValueError('未知阶段')
+            if config.get('industry_enabled'):
+                from .universe import reconcile
+                reconcile(store,config,now())
             changed=[]
-            if command in ('cycle','research','repair','dynamic_cycle','global_research'):
+            if command in ('cycle','research','repair','dynamic_cycle','global_research','industry_research'):
                 from .portfolio_strategy import request,changed_keys,enabled as portfolio_enabled
                 # Only a real change in some candidate's research re-runs the portfolio and pauses its buys.
                 changed=changed_keys(store,config,now()) if portfolio_enabled(config) else ['*']
@@ -182,10 +206,8 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                         cloud_sync.queue_publication(store,config,result['decision_id'])
                         with task_lock(store.root,'cloud-sync'):cloud_sync.flush(store,config)
                     elif changed:
-                        body={'changed_at':now()}
-                        if '*' not in changed and cloud_sync.remote_supports(store,'targeted_invalidation'):body['keys']=changed
-                        sync_request(config,'/api/sync/invalidate',body)
-                        with store.db:put(store,'last_invalidation',{**body,'command':command})
+                        cloud_sync.queue_invalidation(store,changed,now())
+                        with task_lock(store.root,'cloud-sync'):cloud_sync.deliver_invalidation(store,config)
                     elif command=='review':
                         from .cloud_ledger import rows
                         # Send only rows the cloud has not acknowledged; it stores them append-only.

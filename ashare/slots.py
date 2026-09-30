@@ -1,5 +1,6 @@
 """Bounded strategy execution, persistent inputs, deterministic gates and paper-only orders."""
 from __future__ import annotations
+from .universe import company_targets
 import json
 import time
 import uuid
@@ -20,7 +21,7 @@ SLOT_SCHEMA={'type':'object','additionalProperties':False,'properties':{'decisio
 
 def refresh_market(store,config,events=True):
     rid=uuid.uuid4().hex
-    symbols={i['symbol'] for i in config['watchlist']}
+    symbols={i['symbol'] for i in company_targets(store,config)}
     symbols.update(r[0] for r in store.db.execute('SELECT DISTINCT symbol FROM paper_lots WHERE qty>0'))
     symbols.update(r[0] for r in store.db.execute("SELECT DISTINCT symbol FROM paper_orders WHERE status IN ('OPEN','PARTIAL','UNKNOWN')"))
     with store.db:
@@ -191,7 +192,7 @@ def run_slot(store,config,scheduled_at=None,use_model=True,refresh_fn=None,model
         a=mark_equity(store,cutoff)
         from .portfolio_risk import refresh as refresh_risk, halted
         risk_state=refresh_risk(store,config,cutoff)
-        symbols=sorted({i['symbol'] for i in config['watchlist']}|set(a['positions']))
+        symbols=sorted({i['symbol'] for i in company_targets(store,config,cutoff)}|set(a['positions']))
         entries=[]
         for sym in symbols:
             plan=active_plan(store,sym,cutoff);q=store.latest_quote(sym,cutoff)

@@ -260,7 +260,7 @@ class Scheduler:
                 if len(self.futures)>=3:break
                 if row['kind'] in active_kinds:continue
                 if offline and row['kind'] in NEEDS_NETWORK:continue
-                if row['kind'] in ('research','cycle','collect','repair') and active_kinds & {'research','cycle','collect','repair'}:continue
+                if row['kind'] in ('research','cycle','collect','repair','industry_research') and active_kinds & {'research','cycle','collect','repair','industry_research'}:continue
                 with store.db:
                     store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))
                 active_kinds.add(row['kind']);self.futures[row['id']]=self.pool.submit(self.work,dict(row))
@@ -284,7 +284,7 @@ class Scheduler:
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind IN ('global_slot','global_research','portfolio_strategy') ORDER BY CASE kind WHEN 'global_slot' THEN 0 ELSE 1 END,scheduled_at DESC").fetchall():
                 if len(self.global_futures)>=2 or row['kind'] in active_kinds:continue
                 if offline and row['kind'] in NEEDS_NETWORK:continue
-                if row['kind'] in ('global_research','portfolio_strategy') and active_kinds & {'research','cycle','collect','repair','review','dynamic_cycle','global_research','portfolio_strategy'}:continue
+                if row['kind'] in ('global_research','portfolio_strategy') and active_kinds & {'research','cycle','collect','repair','industry_research','review','dynamic_cycle','global_research','portfolio_strategy'}:continue
                 if row['kind']=='global_slot' and store.db.execute("SELECT 1 FROM jobs WHERE kind IN ('slot','dynamic_slot') AND scheduled_at=? AND status IN ('PENDING','RUNNING')",(row['scheduled_at'],)).fetchone():continue
                 with store.db:store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))
                 active_kinds.add(row['kind']);self.global_futures[row['id']]=self.global_pool.submit(self.work,dict(row))

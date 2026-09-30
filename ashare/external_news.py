@@ -26,7 +26,7 @@ class BodyParser(HTMLParser):
         self.depth+=1
         if tag in ('script','style','nav'):self.ignored+=1
         classes=a.get('class','').lower().split()
-        if self.active is None and any(x in classes for x in ('art-con','trs_editor','field--name-field-text-column','views-field-field-news-story-lead')):
+        if self.active is None and any(x in classes for x in ('vF_detail_content','vf_detail_content','art-con','trs_editor','field--name-field-text-column','views-field-field-news-story-lead')):
             self.active=self.depth
 
     def handle_startendtag(self,tag,attrs):

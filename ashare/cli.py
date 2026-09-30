@@ -24,7 +24,7 @@ def main():
     sub.add_parser("status")
     sub.add_parser("doctor")
     sub.add_parser("backup")
-    for name in ('collect','cycle','research','slot','review','settle'):
+    for name in ('collect','cycle','research','slot','review','settle','industry_research'):
         p=sub.add_parser(name)
         p.add_argument('--without-model',action='store_true')
         p.add_argument('--job-key')
@@ -142,7 +142,7 @@ def main():
     if args.command=='demo':
         from .demo import run_demo
         result=run_demo(config)
-    elif args.command in ('collect','cycle','research','slot','review','settle'):
+    elif args.command in ('collect','cycle','research','slot','review','settle','industry_research'):
         from .workflow import execute
         result=execute(config,args.command,use_model=not args.without_model,key=args.job_key,
             batch_id=getattr(args,'batch_id',None),symbol=getattr(args,'symbol',None),end=getattr(args,'end',None))
@@ -190,7 +190,9 @@ def main():
                     quality = "user_supplied_text"
                 else:
                     raise ValueError("仅支持PDF、TXT、Markdown；扫描PDF需先OCR")
-                if args.symbol not in [x["symbol"] for x in config["watchlist"]] + ["MARKET"]:
+                from .observation import registry
+                allowed={x["symbol"] for x in config["watchlist"]}|{k for k,v in registry(store).items() if v.get("kind")=="STOCK" and v.get("category") in ("CN","US")}
+                if args.symbol not in allowed|{"MARKET"}:
                     raise ValueError("证券不在自选股内")
                 path = store.raw(raw, file.suffix.lower())
                 doc_id, created = store.add_document(symbol=args.symbol, kind=args.kind, title=args.title, source="user_import",

@@ -1,6 +1,7 @@
 import re
 
 DEFAULTS = {
+ 'industry_enabled':False,'industry_policy':{},
  'dynamic_enabled':False,'dynamic_model_timeout_seconds':120,
  'collection_times': ['08:00','20:00'], 'review_time': '19:30',
  'slot_times': ['09:30','10:00','10:30','11:00','13:00','13:30','14:00','14:30'],
@@ -56,6 +57,9 @@ def validate_settings(config):
             raise ValueError('总观察额度40，须为四个固定资产保留名额')
     for k,v in DEFAULTS.items():
         config.setdefault(k,v)
+    from .industry_research import policy as industry_policy
+    industry_policy(config)
+    if type(config['industry_enabled']) is not bool:raise ValueError('industry_enabled必须为布尔值')
     for k in ('collection_times','slot_times'):
         v = config[k]
         if not isinstance(v,list) or not v or len(set(v))!=len(v) or any(not isinstance(x,str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',x) for x in v):

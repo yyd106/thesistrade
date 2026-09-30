@@ -9,7 +9,7 @@ APPEND=('quotes','dynamic_quotes','global_quotes','slots','decisions','paper_ord
 SUPPORT=('snapshots','studies','plans','global_plans','dynamic_news','dynamic_cases')
 BOOT=SUPPORT+APPEND+MUTABLE+('portfolio_runs','portfolio_decisions','reviews','lessons','research_methods','research_improvements','app_users')
 # Advertised by the cloud so a newer research node only uses what the deployed cloud understands.
-FEATURES=('ledger_v2','targeted_invalidation','display_delta','cash_dividend_credit','quote_health','notices','supervision_summary')
+FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','cash_dividend_credit','quote_health','notices','supervision_summary')
 PRIMARY={'latest_trade_checks':'symbol'}
 # Appended rows the cloud later updates in place; their updates travel through the change log.
 UPDATED_APPEND=('slots',)

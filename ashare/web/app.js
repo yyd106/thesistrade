@@ -768,6 +768,7 @@ function drawLogicChain(parent,impact,key){
 }
 function drawImpactAssessment(parent,value,key){
   const v=value||{state:'PENDING',admitted:false,reason:'等待独立影响评估，暂不占用活跃名额'};
+  if(v.method_gate){parent.append(el('p',v.admitted?'产业方法初步证据通过；交易资格仍需独立核验':'产业假设等待补证或复核','subtle'));return;}
   const block=el('section',null,'impact-assessment');block.setAttribute('aria-label','独立影响评估');
   const labels={PENDING:'待评估',BACKGROUND:'背景资料',NEEDS_EVIDENCE:'待补证据',HISTORICALLY_WEAK:'历史反应偏弱',ADMITTED:'通过影响评估'};
   block.append(el('p',labels[v.state]||'待评估','impact-assessment-title'),el('p',v.reason,'subtle'));
@@ -862,7 +863,52 @@ function drawGlobalWatchlistRow(table,target,s){
   drawPoolStatus(research,target);drawObservationCauses(research,target);cell.append(research);summaryRow.append(cell);
   const group=el('tbody');group.id='observed-'+target.asset;group.tabIndex=-1;group.setAttribute('aria-label',target.name);group.append(row,summaryRow);table.append(group);
 }
+let researchListFilter='ALL';
+function drawIndustry(box,data){
+  const states={ACTIVE:'依据有效',WAITING:'候选线索',REVIEW:'待复核',ARCHIVED:'已归档',INVALIDATED:'假设失效',REALIZED:'已兑现'};
+  const members=new Map((data.members||[]).map(m=>[m.symbol,m]));
+  const rows=data.hypotheses||[];
+  if(!rows.length)box.append(el('p','尚未形成通过原文核验的产业假设。系统将按五个领域检查方法 1、2、3、8；资料不足会保留缺口。','subtle'));
+  for(const h of rows){
+    const p=h.payload,m=members.get(h.symbol),d=details(p.name+' · 方法 '+h.method+' '+(data.methods?.[h.method]||'')+' · '+(states[h.effective_state]||h.effective_state),'industry:'+h.id);
+    d.append(el('p',p.thesis),el('p',(data.domains?.[h.domain]?.name||h.domain)+' · '+(m?.membership==='CORE'?'固定 Watchlist':'Dynamic List')+' · '+(m?.buy_eligible?'仍需公司计划、组合授权与交易条件通过':'暂停新增买入；已有敞口继续管理'),'subtle'));
+    d.append(el('p','传导路径：'+p.causal_chain.join(' → ')),el('p','下一验证：'+p.next_check),el('p','复核期限：'+shortTime(h.review_at)),el('p','失效条件：'+p.invalidation));
+    if(p.revenue_scenario){const r=p.revenue_scenario;d.append(el('p',r.status==='SCENARIO'?'新增收入条件情景：'+r.low+'–'+r.high+' '+r.unit+'；不等于已确认收入。':'新增收入情景尚不能计算：'+(r.missing||[]).join('、'),'subtle'));}
+    for(const text of p.counterpoints||[])d.append(el('p','反证：'+text,'caution'));
+    for(const text of p.missing||[])d.append(el('p','待核实：'+text,'subtle'));
+    const evidence=details('支持资料与业务口径','industry-evidence:'+h.id);
+    for(const f of p.facts||[]){const row=el('div');row.append(el('p',f.entity+' · '+f.product+' · '+f.metric+' · '+f.value+' '+f.unit+' · '+f.period),el('blockquote',f.quote),el('p','公开 '+shortTime(f.published_at)+' · 实际可用 '+shortTime(f.ready_at)+' · '+({DISCLOSED:'原文披露',GUIDANCE:'公司指引',ESTIMATE:'模型估计'}[f.claim_type]||f.claim_type),'subtle'));if(/^https:\/\//.test(f.url)){const a=el('a','查看公开来源');a.href=f.url;a.target='_blank';a.rel='noopener noreferrer';row.append(a);}evidence.append(row);}
+    d.append(evidence);
+    if(h.versions?.length){const versions=details('假设历史版本（最近 10 版）','industry-versions:'+h.id);for(const v of h.versions)versions.append(el('p',shortTime(v.at)+' · '+(states[v.state]||v.state)+' · '+v.thesis),el('p','版本 '+v.id,'subtle'));d.append(versions);}
+    box.append(d);
+  }
+  const checks=details('五个领域的最近研究','industry-checks');
+  for(const c of data.checks||[]){checks.append(el('h4',(data.domains?.[c.step]?.name||c.step)+' · '+(c.status==='DONE'?'本轮已检查':'待续做')));for(const [method,reason] of Object.entries(c.payload.methods||{}))checks.append(el('p','方法 '+method+'：'+reason));if(c.payload.status==='NO_EVIDENCE')checks.append(el('p','尚未取得足够原文；不代表没有机会。','subtle'));}
+  box.append(checks);
+  const coverage=details('来源覆盖与缺口','industry-coverage');
+  for(const c of data.coverage||[])coverage.append(el('p',(data.domains?.[c.domain]?.name||c.domain)+' · '+c.source+' · '+(c.status==='FAILED'?'未取得资料':'部分覆盖')+'：'+c.detail,'subtle'));
+  box.append(coverage);
+  const history=details('名单变更与经营验证','industry-history');
+  for(const m of data.history||[])history.append(el('p',shortTime(m.at)+' · '+m.symbol+' · '+m.membership+' · '+m.tier+' · '+(m.buy_eligible?'研究资格有效':'暂停新增')));
+  for(const f of data.forecasts||[])history.append(el('p',f.symbol+' · '+f.payload.metric+' '+f.payload.low+'–'+f.payload.high+' '+f.payload.unit+' · '+f.payload.period+' · 到期 '+shortTime(f.due_at)+' · '+({UNKNOWN:'待披露，尚不能判断',CONFLICT:'披露冲突待核验',IN_RANGE:'落在预测范围内',OUTSIDE_RANGE:'超出预测范围'}[f.outcome?.status]||'尚未到验证期限')));
+  box.append(history);
+}
+function renderResearchLists(s){
+  const data=s.industry,box=$('research-list-tabs');if(!box)return;
+  box.hidden=!data?.enabled;$('industry-research-panel').hidden=!data?.enabled;
+  if(!data?.enabled)return;
+  renderChanged('research-list-tabs',[data.members,researchListFilter],target=>{
+    for(const [key,title] of [['CORE','固定 Watchlist'],['DYNAMIC','Dynamic List'],['ALL','全部观察']]){
+      const count=(data.members||[]).filter(m=>key==='ALL'||m.membership===key).length;
+      const b=el('button',title+' '+count);b.type='button';b.setAttribute('role','tab');b.setAttribute('aria-selected',String(researchListFilter===key));
+      b.addEventListener('click',()=>{researchListFilter=key;renderWatchlist(state||s);});target.append(b);
+    }
+  });
+  $('industry-summary').textContent='五个研究域 · 方法 1、2、3、8 · 固定成员由人工维护，动态成员随证据复核。入选表示值得研究。';
+  renderChanged('industry-hypotheses',[data,researchListFilter],target=>drawIndustry(target,{...data,hypotheses:(data.hypotheses||[]).filter(h=>researchListFilter==='ALL'||(data.members||[]).some(m=>m.symbol===h.symbol&&m.membership===researchListFilter))}));
+}
 function renderWatchlist(s){
+  renderResearchLists(s);
   if(!observationCategories[observationCategory])observationCategory='CN';
   const observed=s.observation?.items||[],manual=new Set(s.watchlist.map(w=>w.symbol));
   renderChanged('observation-categories',[observed.map(t=>[t.asset,t.category]),s.watchlist.map(w=>w.symbol),observationCategory],box=>{
@@ -884,12 +930,12 @@ function renderWatchlist(s){
   $('watchlist-refresh-button').dataset.run=observationCategory==='CN'?'cycle':'global_research';
   $('watchlist-note').hidden=false;
   $('watchlist-note').textContent=observationCategory==='CN'?'单位：元。成本价为当前持仓的平均买入成本（含买入费用）。盈亏按已取得的最近报价计算；参考区间用于观察。':'持仓价值与浮动盈亏以人民币显示；现价、成本价及买卖区间使用标注的原币单位。较成本变动按原币计算，人民币盈亏还受汇率影响。';
-  $('research-timing').textContent=s.watchlist.length+' 只原自选股 · '+observed.filter(t=>!manual.has(t.asset)&&!t.fixed).length+' 个动态发现标的'+(observed.some(t=>t.fixed)?' · 4 个固定现货资产':'');
-  renderChanged('stocks',[s.watchlist,s.portfolio.holdings,s.market_phase,s.next_runs,observed,observationCategory,[...s.watchlist,...observed].map(item=>quoteIsStale(item.quote,s))],box=>{
+  $('research-timing').textContent=s.watchlist.filter(w=>!w.membership||w.membership==='CORE').length+' 只固定 Watchlist · '+(s.industry?.enabled?(s.industry.members||[]).filter(m=>m.membership==='DYNAMIC'&&m.buy_eligible).length:observed.filter(t=>!manual.has(t.asset)&&!t.fixed).length)+' 个动态活跃标的'+(observed.some(t=>t.fixed)?' · 4 个固定现货资产':'');
+  renderChanged('stocks',[s.watchlist,s.portfolio.holdings,s.market_phase,s.next_runs,observed,observationCategory,researchListFilter,[...s.watchlist,...observed].map(item=>quoteIsStale(item.quote,s))],box=>{
     const holdings=new Map(s.portfolio.holdings.filter(h=>h.origin!=='dynamic').map(h=>[h.symbol,h]));
     const discoveries=new Map(observed.map(t=>[t.asset,t]));
     if(observationCategory!=='CN'){
-      const targets=observed.filter(t=>t.category===observationCategory).sort((a,b)=>(b.position?.market_value_cents||0)-(a.position?.market_value_cents||0)||(a.pool_tier!=='FOCUS')-(b.pool_tier!=='FOCUS')||(b.priority_score||0)-(a.priority_score||0)||(a.fixed&&b.fixed?['GOLD','SILVER','BTC','ETH'].indexOf(a.asset)-['GOLD','SILVER','BTC','ETH'].indexOf(b.asset):0));
+      const targets=observed.filter(t=>t.category===observationCategory&&(!s.industry?.enabled||researchListFilter==='ALL'||researchListFilter==='DYNAMIC'&&!t.fixed)).sort((a,b)=>(b.position?.market_value_cents||0)-(a.position?.market_value_cents||0)||(a.pool_tier!=='FOCUS')-(b.pool_tier!=='FOCUS')||(b.priority_score||0)-(a.priority_score||0)||(a.fixed&&b.fixed?['GOLD','SILVER','BTC','ETH'].indexOf(a.asset)-['GOLD','SILVER','BTC','ETH'].indexOf(b.asset):0));
       const table=watchlistTable();
       if(!targets.length){const body=el('tbody'),row=el('tr'),cell=el('td');cell.colSpan=6;cell.append(el('p','暂未发现需要跟踪的'+observationCategories[observationCategory]+'标的。新事件形成影响结论后会自动加入。','empty'));row.append(cell);body.append(row);table.append(body);}
       targets.forEach(target=>drawGlobalWatchlistRow(table,target,s));box.append(table);return;
@@ -897,12 +943,13 @@ function renderWatchlist(s){
     const extra=observed.filter(t=>t.category==='CN'&&!manual.has(t.asset)).map(t=>({symbol:t.asset,name:t.name,quote:t.quote,discovery:t}));
     for(const item of extra){const h=s.portfolio.holdings.find(h=>h.origin==='dynamic'&&h.symbol===item.symbol);if(h)holdings.set(item.symbol,h);}
     const value=item=>holdings.get(item.symbol)?.market_value_cents??0;
-    const ordered=[...s.watchlist,...extra].sort((a,b)=>value(b)-value(a));
+    const ordered=[...s.watchlist,...extra].filter(w=>!s.industry?.enabled||researchListFilter==='ALL'||(w.membership||(w.discovery?'DYNAMIC':'CORE'))===researchListFilter).sort((a,b)=>value(b)-value(a));
     const t=watchlistTable();
     for(const item of ordered){const row=el('tr'),name=el('td'),holding=el('td',null,'holding-value'),quote=el('td'),buy=el('td'),sell=el('td'),decision=el('td');
       const h=holdings.get(item.symbol),p=item.plan,l=p?.payload?.levels,discovery=discoveries.get(item.symbol),v=item.discovery?{title:discovery.status==='NEEDS_REVIEW'?'影响待复核':macroDirections[discovery.direction],reason:'动态发现标的，持续观察事件条件与后续证据。',ready:false}:researchDecision(item,s.market_phase);
       name.append(item.discovery?el('strong',item.name):pageLink(item.name,'/stocks/'+item.symbol),el('p',item.symbol,'subtle'),el('p',h?h.qty+' 股 · '+percent(h.weight_pct):'未持仓','subtle'));
       if(item.discovery)name.append(el('span',poolTierLabels[discovery.pool_tier]||'动态发现','badge'));
+      if(item.membership)name.append(el('span',item.membership==='CORE'?'固定 Watchlist':'Dynamic List','badge'));
       holding.append(el('strong',money(value(item))+' 元'));
       if(h?.unrealized_cents!=null)holding.append(el('p',(h.unrealized_cents>0?'浮盈 ':h.unrealized_cents<0?'浮亏 ':'浮动盈亏 ')+signed(h.unrealized_cents)+' 元','holding-pnl '+(h.unrealized_cents>0?'profit':h.unrealized_cents<0?'loss':'')));
       if(h?.valuation_basis==='COST_FALLBACK')holding.append(el('p','暂无报价 · 按成本估算','subtle'));

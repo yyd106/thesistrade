@@ -19,7 +19,7 @@ LOCAL_NETWORK_ERRORS = ('nodename nor servname', 'Name or service not known', 'T
                         'Network is unreachable', 'No route to host', 'Network is down')
 GRACE_SECONDS = 180   # a short blip must not stop a collection that is about to succeed
 PAUSE_SECONDS = 300   # a scheduler that did not tick for this long was asleep or stopped
-NEEDS_NETWORK = ('cycle', 'collect', 'research', 'repair', 'review', 'dynamic_cycle', 'global_research', 'portfolio_strategy')
+NEEDS_NETWORK = ('cycle', 'collect', 'research', 'repair', 'review', 'dynamic_cycle', 'global_research', 'portfolio_strategy', 'industry_research')
 LOGS = {'offline': 'offline.jsonl', 'pause': 'pauses.jsonl'}
 
 

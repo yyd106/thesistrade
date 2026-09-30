@@ -723,5 +723,7 @@
   },
   "investment_policy": "days_cash_v1",
   "portfolio_strategy": "cross_research_v1",
-  "deployment_role": "standalone"
+  "deployment_role": "standalone",
+  "industry_enabled": false,
+  "industry_policy": {}
 }

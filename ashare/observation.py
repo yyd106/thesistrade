@@ -113,6 +113,11 @@ def all_items(store,at):
    from .dynamic_sources import latest_quote
    item['quote']=latest_quote(store,item['asset'],at)
   items.append(item)
+ from .industry import links as industry_links
+ by_asset={i['asset']:i for i in items}
+ for asset,item in industry_links(store,at).items():
+  if asset in by_asset:by_asset[asset]['links']+=item['links']
+  else:items.append(item)
  return items
 
 
