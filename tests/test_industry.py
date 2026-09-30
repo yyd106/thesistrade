@@ -160,6 +160,31 @@ class IndustryTests(unittest.TestCase):
                 execute(self.cfg,command,use_model=False)
                 self.assertFalse(discover.call_args.args[1]['model_enabled'])
 
+    def test_dynamic_company_is_monitored_without_holding_and_keeps_followups(self):
+        from ashare.monitor import symbols_for,cached_checks
+        from ashare.followups import build
+        self.save()
+        with patch('ashare.universe.now',return_value=self.at):
+            self.assertIn('sz300499',symbols_for(self.store,self.cfg))
+            self.assertIn('sz300499',cached_checks(self.store,self.cfg)['event_status'])
+        from ashare.finance import PaperLedger
+        PaperLedger(self.store).initialize()
+        result=build(self.store,self.cfg,self.at)
+        self.assertIn('sz300499',{i['symbol'] for i in result[0]})
+
+    def test_inbox_can_import_verified_candidate_before_dynamic_admission(self):
+        from ashare.inbox import import_inbox
+        with self.store.db:
+            for s,v in self.identities.items():self.store.db.execute('INSERT INTO macro_instruments VALUES(?,?,?,?)',(s,'CN',self.at,json.dumps(v)))
+        folder=self.store.root/'inbox';folder.mkdir()
+        (folder/'report.txt').write_text(self.text)
+        manifest={'file':'report.txt','symbol':'sz300499','kind':'company_report','title':'候选公司公开资料','published_at':self.at,'cloud_allowed':False}
+        (folder/'report.json').write_text(json.dumps(manifest))
+        with self.store.db:self.store.db.execute("INSERT INTO runs(id,job_key,kind,started_at,status) VALUES('inbox','inbox','collect',?,'RUNNING')",(self.at,))
+        import_inbox(self.store,self.cfg,'inbox')
+        row=self.store.db.execute("SELECT symbol,cloud_allowed FROM documents WHERE title='候选公司公开资料'").fetchone()
+        self.assertEqual((row['symbol'],row['cloud_allowed']),('sz300499',0))
+
 class IndustryCloudTests(unittest.TestCase):
     from test_cloud_sync import CloudSyncTests as F
     quote=F.quote;plan=F.plan;later=F.later;output=F.output;transact=F.transact;publication=F.publication;receive=F.receive

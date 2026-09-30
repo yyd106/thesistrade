@@ -10,7 +10,8 @@ from .storage import Store, now
 
 
 def symbols_for(store, config):
-    symbols={i['symbol'] for i in config['watchlist']}
+    from .universe import company_targets
+    symbols={i['symbol'] for i in company_targets(store,config)}
     symbols.update(r[0] for r in store.db.execute('SELECT DISTINCT symbol FROM paper_lots WHERE qty>0'))
     symbols.update(r[0] for r in store.db.execute("SELECT DISTINCT symbol FROM paper_orders WHERE status IN ('OPEN','PARTIAL','UNKNOWN')"))
     return sorted(symbols)

@@ -94,7 +94,9 @@ def collect_article(store,run_id,row,source):
 
 
 def collect(store,run_id,config):
-    active_topics={topic for item in config['watchlist'] for topic in events.profile(config,item['symbol'])}
+    from .universe import company_targets
+    companies=company_targets(store,config)
+    active_topics={topic for item in companies for topic in events.profile(config,item['symbol'])}
     for key,name,url,kind in FEEDS:
         try:
             raw=sources.fetch(url,max_bytes=3000000);raw_path=store.raw(raw,'.xml' if kind=='rss' else '.html')
@@ -114,7 +116,7 @@ def collect(store,run_id,config):
             last=store.db.execute("SELECT checked_at FROM data_attempts WHERE source='external_news_article' AND resource_key=? ORDER BY checked_at DESC,id DESC LIMIT 1",(row['url'],)).fetchone()
             return last[0] if last else ''
         def relevance_priority(row):
-            matches=[events.relevance(config,item['symbol'],row['title'],row['brief']) for item in config['watchlist']]
+            matches=[events.relevance(config,item['symbol'],row['title'],row['brief']) for item in companies]
             return 0 if 'COMPANY' in matches else 1 if 'BUSINESS' in matches else 2
         selected=sorted(relevant,key=lambda r:(relevance_priority(r),last_check(r)))[:config.get('external_news_articles_per_source',3)]
         completed=0

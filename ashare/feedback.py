@@ -12,7 +12,8 @@ def submit(store,config,user,data):
     page=data.get('page');symbol=data.get('symbol');body=data.get('body','');nickname=data.get('nickname','')
     topic=data.get('topic','strategy');request_id=data.get('request_id','')
     if page not in ('home','stock'):raise ValueError('意见须来自首页或股票详情。')
-    if page=='stock' and symbol not in {w['symbol'] for w in config['watchlist']}:raise ValueError('请选择当前自选股。')
+    from .universe import company_targets
+    if page=='stock' and symbol not in {w['symbol'] for w in company_targets(store,config)}:raise ValueError('请选择当前研究名单中的公司。')
     if page=='home':symbol=None
     if not isinstance(body,str) or not 3<=len(body.strip())<=4000:raise ValueError('意见请填写3至4000个字符。')
     if not isinstance(nickname,str) or len(nickname)>40:raise ValueError('昵称不超过40个字符。')

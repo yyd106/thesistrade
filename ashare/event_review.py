@@ -547,7 +547,8 @@ def check(store,config,symbols=None,at=None):
     from .storage import now
     from .dividends import supported, amount_cents
     stamp=normalize_time(at or now())
-    names={w['symbol']:w['name'] for w in config['watchlist']}
+    from .universe import company_targets
+    names={w['symbol']:w['name'] for w in company_targets(store,config,stamp)}
     credits=supported(store,config)
     stocks=[]
     for symbol in symbols or list(names):

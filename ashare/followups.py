@@ -78,7 +78,8 @@ def event_route(key,review,g,schedules):
 def build(store,config,at):
     """Only read current evidence; unresolved items never expire because the date changed."""
     schedules={r['kind']:r['scheduled_at'] for r in next_runs(config,at)}
-    names={w['symbol']:w['name'] for w in config['watchlist']}
+    from .universe import company_targets
+    names={w['symbol']:w['name'] for w in company_targets(store,config,at)}
     symbols=set(names)|{r[0] for r in store.db.execute('SELECT symbol FROM paper_lots WHERE qty>0')}
     recoveries={s:recovery_status(store,config,s,at) for s in symbols}
     items=[]

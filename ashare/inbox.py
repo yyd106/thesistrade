@@ -14,7 +14,10 @@ def import_inbox(store,config,run_id):
             m=json.loads(manifest.read_text());file=(root/m['file']).resolve()
             if root.resolve() not in file.parents:raise ValueError('文件必须在inbox目录中')
             if file.stat().st_size>20_000_000:raise ValueError('文件超过20MB')
-            if m['symbol'] not in {x['symbol'] for x in config['watchlist']}|{'MARKET'}:raise ValueError('证券不在自选股中')
+            from .observation import registry
+            allowed={x['symbol'] for x in config['watchlist']}|{'MARKET'}
+            if config.get('industry_enabled'):allowed.update(k for k,v in registry(store).items() if v.get('kind')=='STOCK' and v.get('category') in ('CN','US'))
+            if m['symbol'] not in allowed:raise ValueError('证券身份未在固定名单或证券目录中核验')
             scope=m['symbol'];title=m.get('title') or manifest.name
             if m['kind'] not in ('broker_report','news','company_report'):raise ValueError('资料类型不支持')
             if not isinstance(m.get('title'),str) or not m['title']:raise ValueError('缺少标题')
