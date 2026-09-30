@@ -12,6 +12,8 @@ def run_daily(store, config, at=None):
     from .shadow import run as run_shadow
     at = normalize_time(at or now())
     result = {'at': at, 'registry': score(store, config, at), 'shadow': run_shadow(store, config, at), 'counts': registry_counts(store)}
+    from .selfcheck import run as selfcheck
+    result['selfcheck'] = selfcheck(store, config, at)
     with store.db:
         store.db.execute("INSERT OR REPLACE INTO service_state VALUES('evaluation_last',?)", (json.dumps(result, ensure_ascii=False),))
     path = store.root / 'workflow' / 'evaluation' / SCORE_METHOD / 'daily' / (local(at).date().isoformat() + '-' + digest(json.dumps(result, sort_keys=True))[:12] + '.json')
@@ -28,6 +30,7 @@ def collect(store, config, at=None, days=7):
     from .shadow import summary, status as shadow_status
     from .governance import issues, proposals
     from .maintenance import disk_status
+    from .selfcheck import status as selfcheck_status
     at = normalize_time(at or now())
     since = normalize_time((datetime.fromisoformat(at) - timedelta(days=days)).isoformat())
     week_start = local(since).date().isoformat()
@@ -37,6 +40,7 @@ def collect(store, config, at=None, days=7):
     portfolio_runs = {r['status']: r['n'] for r in store.db.execute('SELECT status,count(*) n FROM portfolio_runs WHERE started_at>=? GROUP BY status', (since,))}
     renewed = store.db.execute("SELECT count(*) FROM plan_events WHERE at>=? AND reason LIKE 'RENEWED:%'", (since,)).fetchone()[0]
     return {'generated_at': at, 'window': {'from': since, 'to': at}, 'horizon_days': config.get('evaluation_horizon_days', 20),
+            'selfcheck': selfcheck_status(store),
             'registry': {'counts': registry_counts(store), 'all_time': comparisons(store, config), 'scored_this_week': store.db.execute(
                 "SELECT count(*) FROM signal_scores WHERE method=? AND status='SCORED' AND scored_at>=?", (SCORE_METHOD, since)).fetchone()[0]},
             'shadow': {'status': shadow_status(store), 'all_time': summary(store, config), 'this_week': summary(store, config, week_start)},
@@ -103,6 +107,11 @@ def markdown(report, title=None, period='本周'):
     for status, items in report['proposals'].items():
         lines.append(f"- {status}：{len(items)} 条" + ('' if not items else '；' + '；'.join(f"{p['id']} {p['title']}" for p in items[:8])))
     closed = report.get('proposals_closed')
+    sc = report.get('selfcheck') or {}
+    if sc.get('last'):
+        lines += ['', '## 长期自检', '', f"最近检查：{sc['last'].get('at')}；报告：{sc['last'].get('report')}。",
+                  f"自动候选 {len(sc.get('candidates', []))} 项；每周最多 {sc.get('weekly_budget', 3)} 项新候选；当前仅登记实验设计，尚未运行。",
+                  '结论：证据不足时维持现行方法，草稿与复盘不会自动进入生产研究。']
     if closed:
         replaced = closed['replacements']
         lines.append(f"- REJECTED（驳回，累计）：{closed['REJECTED']} 条")
@@ -117,6 +126,8 @@ def markdown(report, title=None, period='本周'):
 def weekly_report(store, config, at=None):
     from .evaluation import SCORE_METHOD
     at = normalize_time(at or now())
+    from .selfcheck import run as selfcheck
+    selfcheck(store, config, at, generate=True)
     report = collect(store, config, at)
     year, week, _ = local(at).isocalendar()
     folder = store.root / 'workflow' / 'evaluation' / SCORE_METHOD / 'weekly'

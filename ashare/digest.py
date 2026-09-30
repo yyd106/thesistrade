@@ -322,6 +322,7 @@ def review(store, a, b):
 
 
 def governance(store, a, b):
+    from .selfcheck import status as selfcheck_status
     changes = []
     log = store.root / 'workflow' / 'changes' / 'config-changes.jsonl'
     if log.exists():
@@ -348,6 +349,7 @@ def governance(store, a, b):
             if f.is_file() and a <= normalize_time(datetime.fromtimestamp(f.stat().st_mtime, SH).isoformat()) < b:
                 notes.append(f.name)
     return {'config_changes': changes, 'proposals_new': proposals_new, 'proposals_decided': proposals_decided, 'guidance_changes': guidance,
+            'selfcheck': selfcheck_status(store).get('last'),
             'issues_new': issues_new, 'issues_recurring': issues_seen[0]['n'] if issues_seen else 0, 'issues_resolved': issues_resolved,
             'issues_retitled': issues_retitled,
             'new_builds': builds, 'agent_notes': notes}
@@ -593,6 +595,9 @@ def markdown(d):
             L.append(f"- 结论：{v['summary']}")
     g = d['governance']
     L += ['', '## 调整与治理', ''] + _failed(g)
+    if g.get('selfcheck'):
+        sc = g['selfcheck']
+        L.append(f"- 长期自检：{sc.get('at')}；报告 {sc.get('report')}；仅生成待验证方案，未运行候选实验。")
     L += [f"- 设置修改：{x['key']} {json.dumps(x['before'], ensure_ascii=False)}→{json.dumps(x['after'], ensure_ascii=False)}（{x['class']}，"
           + (f"批准人 {x['approved_by']}，" if x.get('approved_by') else '') + f"理由：{(x.get('reason') or '')[:60]}）" for x in g['config_changes']] or ['- 设置：无修改。']
     L.append(f"- 提案：新建 {len(g['proposals_new'])}，决策 {len(g['proposals_decided'])}"

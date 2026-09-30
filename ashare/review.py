@@ -22,7 +22,7 @@ REVIEW_SCHEMA={'type':'object','additionalProperties':False,'properties':{
     'required':['symbol','category','issue_key','lesson','decision_ids','fill_ids','applicability']}}},'required':['summary','lessons']}
 
 
-def route_lessons(store,rid,lessons,at):
+def route_lessons(store,rid,lessons,at,build_id=None):
     """Defects collapse into one engineering issue per key and symbol; observations become drafts."""
     from .governance import record_issue,draft_proposal
     routed=[]
@@ -34,11 +34,19 @@ def route_lessons(store,rid,lessons,at):
             iid=record_issue(store,key,lesson['symbol'],lesson['lesson'],evidence,at)
             routed.append({'lesson':n,'to':'engineering_issue','id':iid,'issue_key':key})
         else:
-            pid=draft_proposal(store,source='review',kind='OTHER',target=lesson['symbol'],title=lesson['lesson'][:60],
+            import re
+            normal=lambda s: re.sub(r'[\W_]+','',s or '').casefold()
+            key='review-observation:'+digest(encode([build_id or 'UNKNOWN',lesson['symbol'],lesson['category'],
+                normal(lesson.get('applicability')),normal(lesson['lesson'])]))
+            prior=store.db.execute('SELECT proposal_id FROM review_observations WHERE review_id=? AND ordinal=?',(rid,n)).fetchone()
+            existing=store.db.execute('SELECT id FROM strategy_proposals WHERE dedupe_key=?',(key,)).fetchone()
+            pid=prior[0] if prior else existing[0] if existing else draft_proposal(store,source='review',kind='OTHER',target=lesson['symbol'],title=lesson['lesson'][:60],
                 payload={'observations':[{'review_id':rid,'lesson':lesson['lesson'],'applicability':lesson.get('applicability'),
                     'category':lesson['category'],'evidence':evidence}],
                     'note':'复盘产生的策略观察草稿：尚未验证，不进入研究输入。需整理成含检验方法的完整提案并经用户批准。'},
-                at=at,dedupe_key='review:'+rid+':'+str(n))
+                at=at,dedupe_key=key)
+            store.db.execute('INSERT OR IGNORE INTO review_observations VALUES(?,?,?,?,?)',
+                (pid,rid,n,at,encode({'lesson':lesson['lesson'],'evidence':evidence,'build_id':build_id})))
             routed.append({'lesson':n,'to':'proposal_draft','id':pid})
     return routed
 
@@ -182,7 +190,7 @@ def run_review(store,config,end=None,use_model=True,model_fn=None,clock=now):
     payload={'facts':facts,'analysis':result,'revision':revision,'internal_only':True,'analysis_error':failure,'analysis_scope':'ALL_POSITIONS',
              'consistency_checks':checks,'model':model_record(folder/'model'),'build':record_build(store,config,ready)}
     with store.db:
-        payload['routing']=route_lessons(store,rid,result['lessons'],ready)
+        payload['routing']=route_lessons(store,rid,result['lessons'],ready,payload['build']['build_id'])
         store.db.execute('INSERT INTO reviews VALUES(?,?,?,?,?,?,?,?)',(rid,a,b,revision,ready,fp,model_status,encode(payload)))
         for n,lesson in enumerate(result['lessons']):
             # Kept for display only; research never reads this table.

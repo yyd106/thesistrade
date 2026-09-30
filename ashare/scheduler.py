@@ -41,8 +41,8 @@ def schedule_due(store,config,at):
     while cursor<=finish:
         for kind,times in (('cycle',config['collection_times']),('review',[config['review_time']]),
             ('slot',config['slot_times'] if trading_day(cursor) is True else []),
-            # Model-free evaluation after each trading day's data is collected, and a weekly report.
-            ('evaluate',[config['evaluation_time']] if config.get('evaluation_enabled',True) and trading_day(cursor) is True else []),
+            # Daily model-free checks also cover the global route on A-share holidays.
+            ('evaluate',[config['evaluation_time']] if config.get('evaluation_enabled',True) else []),
             ('weekly_report',[config['weekly_report_time']] if config.get('evaluation_enabled',True) and cursor.weekday()==config.get('weekly_report_weekday',5) else []),
             # One-page daily summary of every stage, for the operator and the supervisor.
             ('digest',[config.get('digest_time','23:50')])):

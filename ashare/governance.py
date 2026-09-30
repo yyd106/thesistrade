@@ -233,7 +233,15 @@ def decide(store, proposal_id, status, *, decided_by, note, at=None, replaced_by
 
 def proposals(store, status=None):
     sql = 'SELECT * FROM strategy_proposals' + (' WHERE status=?' if status else '') + ' ORDER BY created_at DESC LIMIT 200'
-    return [{**dict(r), 'payload': json.loads(r['payload_json'])} for r in store.db.execute(sql, (status,) if status else ())]
+    result = []
+    for r in store.db.execute(sql, (status,) if status else ()):
+        item = {**dict(r), 'payload': json.loads(r['payload_json'])}
+        item['additional_evidence'] = [dict(e) for e in store.db.execute(
+            'SELECT run_id,created_at,payload_json FROM selfcheck_evidence WHERE proposal_id=? ORDER BY created_at', (r['id'],))]
+        item['review_observations'] = [dict(e) for e in store.db.execute(
+            'SELECT review_id,created_at,payload_json FROM review_observations WHERE proposal_id=? ORDER BY created_at', (r['id'],))]
+        result.append(item)
+    return result
 
 
 def issues(store, status='OPEN'):

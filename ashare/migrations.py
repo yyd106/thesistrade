@@ -129,6 +129,8 @@ def migrate(db, timestamp, hash_fn):
     db.executescript(INVESTMENT_SCHEMA)
     from .evaluation_schema import SCHEMA as EVALUATION_SCHEMA
     db.executescript(EVALUATION_SCHEMA)
+    from .selfcheck_schema import SCHEMA as SELFCHECK_SCHEMA
+    db.executescript(SELFCHECK_SCHEMA)
     # A v1 record proves first retrieval, not completion of extraction.
     for d in db.execute("SELECT * FROM documents WHERE id NOT IN (SELECT doc_id FROM document_meta)").fetchall():
         family = hash_fn(d['url'] + '|' + d['symbol'] + '|' + d['kind'])[:24]

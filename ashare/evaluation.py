@@ -26,13 +26,17 @@ def horizon(config):
     return config.get('evaluation_horizon_days', 20)
 
 
-def _insert(store, rid, route, symbol, source_id, created_at, as_of_day, build_id, days, benchmark, judgment):
-    store.db.execute('INSERT OR IGNORE INTO signal_registry VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+def _insert(store, rid, route, symbol, source_id, created_at, as_of_day, build_id, days, benchmark, judgment, *, research=None, historical=False):
+    inserted = store.db.execute('INSERT OR IGNORE INTO signal_registry VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                      (rid, route, symbol, source_id, created_at, as_of_day, build_id, days, benchmark, 'OPEN',
-                      encode(judgment), None, None))
+                      encode(judgment), None, None)).rowcount
+    if inserted and not historical:
+        from .judgments import freeze
+        freeze(store, identity=rid, route=route, symbol=symbol, source_id=source_id, at=created_at,
+               build_id=build_id, days=days, benchmark=benchmark, judgment=judgment, research=research)
 
 
-def register_plan(store, config, plan_id, symbol, at, plan, stock_result):
+def register_plan(store, config, plan_id, symbol, at, plan, stock_result, *, historical=False):
     """Watchlist plan. Caller owns the transaction. Records what the mechanical rule said, independent
     of whether the model vetoed it, so the veto itself can be scored."""
     basis = plan.get('basis') or {}
@@ -49,10 +53,11 @@ def register_plan(store, config, plan_id, symbol, at, plan, stock_result):
                 'levels': levels, 'renewed': bool(plan.get('research_reuse')),
                 'model': (plan.get('model') or {}).get('actual_model') or (plan.get('model') or {}).get('requested_model')}
     _insert(store, 'watchlist:' + plan_id, 'watchlist', symbol, plan_id, normalize_time(at), basis.get('last_complete_date'),
-            (plan.get('build') or {}).get('build_id'), horizon(config), BENCHMARK, judgment)
+            (plan.get('build') or {}).get('build_id'), horizon(config), BENCHMARK, judgment,
+            research=stock_result or plan, historical=historical)
 
 
-def register_portfolio(store, config, decision_id, created_at, payload):
+def register_portfolio(store, config, decision_id, created_at, payload, *, historical=False):
     """One row per candidate the portfolio layer actually had a choice on (can_increase or held)."""
     day = last_completed_day(created_at)
     build_id = (payload.get('build') or {}).get('build_id')
@@ -66,10 +71,11 @@ def register_portfolio(store, config, decision_id, created_at, payload):
                     'key': d['key']}
         _insert(store, 'portfolio:' + decision_id + ':' + d['key'], 'portfolio', d['symbol'], decision_id,
                 normalize_time(created_at), day if d['route'] == 'watchlist' else created_at[:10], build_id,
-                horizon(config), BENCHMARK if d['route'] == 'watchlist' else None, judgment)
+                horizon(config), BENCHMARK if d['route'] == 'watchlist' else None, judgment,
+                research={'thesis': d.get('reason'), 'evidence_ids': d.get('evidence_ids', [])}, historical=historical)
 
 
-def register_global(store, config, plan_id, symbol, at, payload):
+def register_global(store, config, plan_id, symbol, at, payload, *, historical=False):
     analysis = payload.get('analysis') or {}
     blockers = payload.get('blockers', [])
     judgment = {'stance': analysis.get('stance'), 'plan_kind': payload.get('kind'), 'blockers': blockers,
@@ -77,7 +83,8 @@ def register_global(store, config, plan_id, symbol, at, payload):
                 'holding_days': payload.get('holding_days')}
     days = payload.get('holding_days') if analysis.get('stance') == 'LONG' else 5
     _insert(store, 'global:' + plan_id, 'global', symbol, plan_id, normalize_time(at), normalize_time(at)[:10],
-            (payload.get('build') or {}).get('build_id'), int(days or 5), None, judgment)
+            (payload.get('build') or {}).get('build_id'), int(days or 5), None, judgment,
+            research=analysis, historical=historical)
 
 
 def backfill(store, config):
@@ -88,18 +95,18 @@ def backfill(store, config):
         for p in store.db.execute("SELECT p.*,s.result_json FROM plans p JOIN studies s ON s.id=p.study_id WHERE p.status!='DRAFT' AND json_extract(p.payload_json,'$.kind')!='RISK_EXIT_ONLY'").fetchall():
             stock = next(iter(json.loads(p['result_json']).get('stocks', [])), {})
             before = store.db.total_changes
-            register_plan(store, config, p['id'], p['symbol'], p['activated_at'], json.loads(p['payload_json']), stock)
+            register_plan(store, config, p['id'], p['symbol'], p['activated_at'], json.loads(p['payload_json']), stock, historical=True)
             counts['watchlist'] += store.db.total_changes - before
         for d in store.db.execute('SELECT * FROM portfolio_decisions').fetchall():
             before = store.db.total_changes
-            register_portfolio(store, config, d['id'], d['created_at'], json.loads(d['payload_json']))
+            register_portfolio(store, config, d['id'], d['created_at'], json.loads(d['payload_json']), historical=True)
             counts['portfolio'] += store.db.total_changes - before
         for g in store.db.execute("SELECT * FROM global_plans").fetchall():
             payload = json.loads(g['payload_json'])
             if payload.get('model_status') == 'DEFERRED':
                 continue
             before = store.db.total_changes
-            register_global(store, config, g['id'], g['symbol'], g['created_at'], payload)
+            register_global(store, config, g['id'], g['symbol'], g['created_at'], payload, historical=True)
             counts['global'] += store.db.total_changes - before
     return counts
 

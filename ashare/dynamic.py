@@ -197,8 +197,11 @@ def research(store,config,news,catalog,at,model_fn=None,*,direct_only=False):
         'reference_quote_at':q['observed_at'] if q else None,'strategy_version':'dynamic_events_v1'}
   cid=digest(n['id']+'|'+item['symbol'])[:24];expiry=normalize_time((datetime.fromisoformat(completed)+timedelta(hours=12)).isoformat())
   with store.db:
-   store.db.execute('INSERT OR IGNORE INTO dynamic_cases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-    (cid,n['id'],item['symbol'],instrument['name'],item['theme'],item['event_type'],item['direction'],completed,expiry,basis,'RESEARCH',encode(analysis),encode(plan)))
+   inserted=store.db.execute('INSERT OR IGNORE INTO dynamic_cases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    (cid,n['id'],item['symbol'],instrument['name'],item['theme'],item['event_type'],item['direction'],completed,expiry,basis,'RESEARCH',encode(analysis),encode(plan))).rowcount
+   if inserted:
+    from .judgments import dynamic as freeze_dynamic
+    freeze_dynamic(store,config,cid)
    if item['direction']=='BEARISH' and analysis['direct_company_evidence'] and item['novelty'] in ('NEW','UPDATE'):
     store.db.execute("UPDATE dynamic_cases SET status='INVALIDATED' WHERE symbol=? AND created_at<? AND direction='BULLISH' AND status IN ('READY','HOLDING','RESEARCH')",(item['symbol'],completed))
  with store.db:

@@ -50,7 +50,7 @@ class ScoreAuditTests(fx.Fixture):
                 ('2026-09-02','2026-09-09','WAIT','b'),
                 ('2026-09-10','2026-09-17','WAIT','b')]):
                 rid = str(i)
-                evaluation._insert(self.store, rid, 'watchlist', SYMBOL, rid, entry, entry, build, 5, None,
+                evaluation._insert(self.store, rid, 'watchlist', SYMBOL, rid, n(entry+'T08:00:00+08:00'), entry, build, 5, None,
                                    {'trend_ok': True, 'model_action': action})
                 self.store.db.execute('INSERT INTO signal_scores VALUES(?,?,?,?,?)',
                     (rid,evaluation.SCORE_METHOD,'SCORED',json.dumps({'entry_date':entry,'exit_date':exit_,'excess_bps':100}),exit_))

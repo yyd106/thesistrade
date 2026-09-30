@@ -54,6 +54,14 @@ def main():
     ev=sub.add_parser('evaluate', help='给到期的结论打分并推进对照账本（不调用模型）')
     ev.add_argument('--backfill', action='store_true', help='先把注册表上线前的历史研究、组合与全球判断补登记（按原时间）')
     sub.add_parser('weekly-report', help='生成周度评估报告（不调用模型）')
+    sc = sub.add_parser('self-check', help='长期自检：run诊断，propose整理候选，status/show查询；不调用模型或改策略')
+    sc.add_argument('action', choices=['run', 'propose', 'status', 'show'])
+    sc.add_argument('id', nargs='?')
+    ex = sub.add_parser('experiments', help='实验设计：list/show查询，register登记，close保留记录并关闭；一期不运行实验')
+    ex.add_argument('action', choices=['list', 'show', 'register', 'close'])
+    ex.add_argument('id', nargs='?')
+    ex.add_argument('--file');ex.add_argument('--proposal');ex.add_argument('--note')
+    ex.add_argument('--to', choices=['CANCELLED', 'REJECTED'])
     sub.add_parser('schedule', help='显示周期任务与下一次运行时间')
     prop = sub.add_parser('proposals', help='变更提案：list/show/new/decide')
     prop.add_argument('action', choices=['list', 'show', 'new', 'decide'])
@@ -216,6 +224,26 @@ def extended(args, config):
             finally:store.close()
         result = execute(config, 'evaluate' if command == 'evaluate' else 'weekly_report', use_model=False)
         return {**extra, **result} if extra else result
+    if command in ('self-check', 'experiments'):
+        from . import selfcheck, experiments
+        store = Store(config['data_dir'])
+        try:
+            if command == 'self-check':
+                if args.action in ('run', 'propose'):
+                    return selfcheck.run(store, config, generate=args.action == 'propose')
+                if args.action == 'show' and not args.id:raise ValueError('需要自检编号')
+                return selfcheck.status(store, args.id if args.action == 'show' else None)
+            if args.action in ('list', 'show'):
+                if args.action == 'show' and not args.id:raise ValueError('需要实验编号')
+                return experiments.view(store, args.id if args.action == 'show' else None)
+            if config.get('deployment_role') == 'cloud':raise ValueError('实验设计仅在本机研究端登记')
+            if args.action == 'register':
+                if not args.file or not args.proposal:raise ValueError('需要设计文件及提案编号')
+                with store.db:
+                    identity = experiments.register(store, args.proposal, json.loads(Path(args.file).read_text(encoding='utf-8')))
+                return {'id': identity, 'status': 'DESIGNED'}
+            return experiments.close(store, args.id, args.to, args.note)
+        finally:store.close()
     if command == 'digest':
         from .digest import write, rollup
         store = Store(config['data_dir'])
