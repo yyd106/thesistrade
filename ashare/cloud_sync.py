@@ -73,7 +73,7 @@ def display_packet(config):
     from .dashboard import status
     s=status(config,overview=False)
     # UI summaries only; account, credentials, jobs, raw documents and model files are excluded.
-    keep=('watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds','supervision','industry')
+    keep=('fixed_watchlist','watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds','supervision','industry')
     result={k:s[k] for k in keep};previews={}
     from .storage import Store
     local=Store(config['data_dir'])

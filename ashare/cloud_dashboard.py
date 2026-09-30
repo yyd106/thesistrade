@@ -33,6 +33,10 @@ def status(store,config):
     # A section missing from a partial display update is re-sent by research within one publication.
     cache.setdefault('watchlist',[]);cache.setdefault('observation',{'items':[]});cache.setdefault('reviews',[])
     cache['observation'].setdefault('items',[])
+    cache['fixed_watchlist']=config['watchlist']
+    from .industry_presentation import current
+    cache['industry']=current(cache.get('industry'),at,signed=value(store,'research_membership') or {},
+        research_lease=lease(store,config,at),revoked=value(store,'invalidated_keys'),revoked_at=value(store,'invalidated_at'))
     for w in cache['watchlist']:
         w['quote']=store.latest_quote(w['symbol'],at)
         w['open_orders']=[{k:o[k] for k in ('id','side','qty','filled_qty','limit_cents','status','created_at')} for o in a['orders'] if o['symbol']==w['symbol'] and not o.get('origin')]

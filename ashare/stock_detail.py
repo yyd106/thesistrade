@@ -26,9 +26,19 @@ def dimensions(item):
 def detail(config,symbol,offset=0):
     from .dashboard import status
     current=status(config);item=next((x for x in current['watchlist'] if x['symbol']==symbol),None)
-    if not item:raise ValueError('未找到这只自选股。')
     store=Store(config['data_dir'])
     try:
+        industry=current.get('industry') or {}
+        member=next((m for m in industry.get('members',[]) if m['symbol']==symbol),None)
+        if not item:
+            item=historical_item(store,config,symbol,member,current['at'])
+        if not item:raise ValueError('尚未建立这家公司的研究档案。')
+        if member:item={**item,**member,'archived':member.get('research_status')=='ARCHIVED'}
+        company_industry={**industry,'members':[member] if member else [],
+            'hypotheses':[h for h in industry.get('hypotheses',[]) if h['symbol']==symbol],
+            'history':[h for h in industry.get('history',[]) if h['symbol']==symbol],
+            'forecasts':[f for f in industry.get('forecasts',[]) if f['symbol']==symbol],
+            'checks':[],'coverage':[]}
         def page(table,order):
             condition=' WHERE symbol=?'+(' AND EXISTS(SELECT 1 FROM paper_orders o WHERE o.decision_id=decisions.id)' if table=='decisions' else '')
             total=store.db.execute('SELECT count(*) FROM '+table+condition,(symbol,)).fetchone()[0]
@@ -42,8 +52,32 @@ def detail(config,symbol,offset=0):
         followups.update(failed_today=len(followups['today_failures']),recovered_today=sum(f['recovered'] for f in followups['today_failures']),
             carried_over=sum(local(i['opened_at']).date()<local(current['at']).date() for i in followups['items']),
             owners={owner:sum(i['owner']==owner for i in followups['items']) for owner in followups['owners']})
-        return {'at':current['at'],'stock':item,'dimensions':dimensions(item),
+        return {'at':current['at'],'stock':item,'dimensions':dimensions(item),'industry':company_industry,
             'position':next((h for h in current['portfolio']['holdings'] if h['symbol']==symbol),None),
             'trade_statistics':dict(zip(('fill_count','fee_cents','realized_cents'),total)),
             'history':{'fills':fills,'orders':orders,'decisions':decisions},'followups':followups}
     finally:store.close()
+
+
+def historical_item(store,config,symbol,member,at):
+    """Archive affects future research allocation, never the address of a dossier."""
+    row=store.db.execute('''SELECT p.*,s.snapshot_id,s.model_status,s.result_json FROM plans p
+        JOIN studies s ON s.id=p.study_id WHERE p.symbol=? ORDER BY p.activated_at DESC,p.rowid DESC LIMIT 1''',(symbol,)).fetchone()
+    if not member and not row:return None
+    item={**(member or {}),'symbol':symbol,'name':(member or {}).get('name',symbol),'archived':not member or member.get('research_status')=='ARCHIVED',
+          'plan':None,'report':None,'quote':store.latest_quote(symbol,at),'open_orders':[],
+          'failures':[],'last_decision':None,'latest_study':None,'last_research_at':None}
+    if row:
+        from .presentation import trader_report
+        p=dict(row);p['payload']=json.loads(p.pop('payload_json'));p['research']=json.loads(p.pop('result_json'))
+        p['effective_status']='EXPIRED' if p['valid_until']<=at else p['status']
+        snapshot=store.db.execute('SELECT packet_json FROM snapshots WHERE id=?',(p['snapshot_id'],)).fetchone()
+        packet=json.loads(snapshot[0]) if snapshot else {}
+        from .fundamentals import view as dossier
+        p['company_dossier']=dossier(packet.get('company_dossier',{}),item['quote'])
+        p['learning']={k:v for k,v in packet.get('learning',{}).items() if k not in ('new_chunk_ids','revised_documents')}
+        p['external_events']=packet.get('external_events',[]);p['background_events']=packet.get('background_events',[])
+        p['market_context']=((packet.get('stocks') or [{}])[0].get('features') or {}).get('market_context',{})
+        p['coverage']=[]
+        item.update(plan=p,report=trader_report(p,symbol),last_research_at=p['activated_at'])
+    return item

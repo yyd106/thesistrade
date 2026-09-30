@@ -6,6 +6,7 @@ from decimal import Decimal
 from .storage import digest, normalize_time, now
 
 VERSION = 'industry_v1'
+RULE_VERSION = 'industry_v2'
 DOMAINS = {
     'ai': {'name': 'AI 算力基础设施', 'terms': ['数据中心', '液冷', '光模块', '服务器']},
     'power': {'name': '电力与能源基础设施', 'terms': ['变压器', '电网', '输配电', '储能']},
@@ -47,6 +48,10 @@ CREATE TABLE IF NOT EXISTS industry_forecasts(
 CREATE TABLE IF NOT EXISTS industry_outcomes(
  id TEXT PRIMARY KEY, forecast_id TEXT NOT NULL REFERENCES industry_forecasts(id), checked_at TEXT NOT NULL,
  status TEXT NOT NULL, payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS industry_source_queue(
+ url TEXT PRIMARY KEY, domain TEXT NOT NULL, symbol TEXT NOT NULL, title TEXT NOT NULL,
+ published_at TEXT NOT NULL, discovered_at TEXT NOT NULL, status TEXT NOT NULL,
+ attempted_at TEXT, completed_at TEXT, error TEXT NOT NULL DEFAULT '');
 '''
 
 
@@ -70,8 +75,47 @@ def evidence_current(store, h, at):
 def state(store, h, at):
     if h['state']!='ACTIVE':return h['state']
     if at>=h['expires_at']:return 'ARCHIVED'
+    if h['method']=='2' and bottleneck_gaps(h['payload'], usable_facts(h['payload']['facts'],at)):
+        return 'REVIEW'
     if at>=h['review_at'] or not evidence_current(store,h,at):return 'REVIEW'
     return 'ACTIVE'
+
+
+def usable_facts(facts, at):
+    return [f for f in facts if f['entity'] not in ('','UNKNOWN') and f['period'] not in ('','UNKNOWN')
+            and (f['kind']!='RELATION' or f['counterparty'] and f['product'])
+            and f['claim_type']=='DISCLOSED' and (not f.get('effective_from') or f['effective_from']<=at)
+            and (not f.get('effective_until') or at<f['effective_until'])]
+
+
+def bottleneck_gaps(proposal, facts):
+    """Admission needs comparable observations and sourced constraint/profit evidence.
+
+    This validates a conservative extracted contract, not the model's truthfulness.
+    Unknown scope or a merely non-empty narrative cannot authorize a member.
+    """
+    import re
+    known=lambda v: bool(str(v).strip()) and not re.search(r'未知|待核|待补|未披露|不明确|\b(?:unknown|n/?a)\b',str(v),re.I)
+    metrics=[f for f in facts if f['kind']=='METRIC' and all(known(f[k]) for k in ('value','product','entity','period'))]
+    def comparable(a,b):
+        same_scope=a['entity']==b['entity'] or bool(a.get('project_id') and a['project_id']==b.get('project_id')
+            and all(known(a[k]) and known(b[k]) for k in ('project','owner','lot')) and a['lot']==b['lot'])
+        return a['product'].strip()==b['product'].strip() and a['period'].strip()==b['period'].strip() and same_scope
+    pairs=[(a,b) for a in metrics for b in metrics if a['metric'] in ('DEMAND','ORDERS')
+           and b['metric'] in ('CAPACITY','OUTPUT','LEAD_TIME','INVENTORY') and comparable(a,b)
+           and known(a['unit']) and known(b['unit']) and (b['metric']=='LEAD_TIME' or a['unit']==b['unit'])]
+    gaps=[]
+    if not pairs:gaps.append('需求与供应资料须对应同一产品、业务期间及主体或项目')
+    constraints={'CAPACITY':{'DEMAND_EXCEEDS_SUPPLY','CAPACITY_FULL'},'OUTPUT':{'DEMAND_EXCEEDS_SUPPLY'},
+                 'LEAD_TIME':{'LEAD_TIME_RISING'},'INVENTORY':{'INVENTORY_DEPLETING'}}
+    if not any(any(f['metric']=='SUPPLY_CONSTRAINT' and f['value'] in constraints[b['metric']]
+                       and comparable(a,f) for f in metrics) for a,b in pairs):
+        gaps.append('尚缺产能不足、交期持续延长或库存下降等明确供应约束证据')
+    for key,metric,title in [('alternatives','ALTERNATIVE_SUPPLY','替代供应'),('profit_capture','PROFIT_CAPTURE','公司取得订单利润')]:
+        supporting=[f for f in metrics if f['metric']==metric and any(comparable(a,f) for a,b in pairs)]
+        if metric=='PROFIT_CAPTURE':supporting=[f for f in supporting if f['entity'] in (proposal['symbol'],proposal.get('name')) or f['counterparty'] in (proposal['symbol'],proposal.get('name'))]
+        if not known(proposal.get(key,'')) or not supporting:gaps.append(title+'的判断尚无可比较的原文支持')
+    return gaps
 
 
 def save(store, proposal, at, identities):
@@ -112,8 +156,8 @@ def save(store, proposal, at, identities):
         original=store.db.execute('SELECT min(d.published_at) FROM chunks c JOIN documents d ON d.id=c.doc_id JOIN document_meta m ON m.doc_id=d.id WHERE instr(c.text,?)>0 AND m.ready_at<=? AND d.available_at<=?',(quote,at,at)).fetchone()[0]
         f['original_published_at']=original or d['published_at']
         facts.append(f)
-    p['facts']=facts;p['name']=spec['name'];p['category']=spec['category'];p['rule_version']=VERSION
-    usable=[f for f in facts if f['entity']!='UNKNOWN' and f['period']!='UNKNOWN' and (f['kind']!='RELATION' or f['counterparty'] and f['product']) and f['claim_type']=='DISCLOSED' and (not f.get('effective_from') or f['effective_from']<=at) and (not f.get('effective_until') or at<f['effective_until'])]
+    p['facts']=facts;p['name']=spec['name'];p['category']=spec['category'];p['rule_version']=RULE_VERSION
+    usable=usable_facts(facts,at)
     gaps=list(p.get('missing',[]));method=p['method']
     if not any(f['entity'] in (p['symbol'],spec['name']) or f['counterparty'] in (p['symbol'],spec['name']) or docs[f['doc_id']]['symbol']==p['symbol'] for f in usable):gaps.append('证据尚未关联到该上市主体')
     if method=='1':
@@ -121,9 +165,7 @@ def save(store, proposal, at, identities):
         if not any(a is not b and a['counterparty']==b['entity'] and b['counterparty'] in (p['symbol'],spec['name']) for a in edges for b in edges):gaps.append('两跳供货链尚未由原文连接')
         if not any(f['kind']=='EXPOSURE' for f in usable):gaps.append('公司业务敞口待核实')
     if method=='2':
-        metrics={f['metric'] for f in usable if f['kind']=='METRIC'}
-        if not metrics&{'DEMAND','ORDERS'} or not metrics&{'CAPACITY','OUTPUT','LEAD_TIME','INVENTORY'}:gaps.append('需求与供给约束缺少配对证据')
-        if not p.get('alternatives') or not p.get('profit_capture'):gaps.append('替代供给或利润归属待核实')
+        gaps.extend(bottleneck_gaps(p,usable))
     if method in ('3','8'):
         milestones=[f for f in usable if f['kind']=='MILESTONE' and f['project_id']]
         projects={f['project_id'] for f in milestones}
@@ -193,37 +235,52 @@ def scenario(parameters):
 def view(store,config,at):
     from .universe import membership
     rows=membership(store,config,at)
+    known={r['symbol']:json.loads(r['payload_json']) for r in store.db.execute('SELECT symbol,payload_json FROM industry_memberships WHERE at<=? ORDER BY id',(at,))}
+    current={m['symbol'] for m in rows}
+    rows.extend({**m,'membership':'DYNAMIC','tier':'ARCHIVED','research_status':'ARCHIVED','buy_eligible':False,'protected':False,'reason':'已停止跟踪，历史研究仍可查看'} for symbol,m in known.items() if symbol not in current)
     forecasts=[]
-    for r in store.db.execute('SELECT * FROM industry_forecasts ORDER BY created_at DESC LIMIT 100'):
-        outcome=store.db.execute('SELECT * FROM industry_outcomes WHERE forecast_id=? ORDER BY checked_at DESC,rowid DESC LIMIT 1',(r['id'],)).fetchone()
-        forecasts.append({**dict(r),'payload':json.loads(r['payload_json']),'outcome':dict(outcome) if outcome else None})
+    for r in store.db.execute('SELECT * FROM industry_forecasts WHERE created_at<=? ORDER BY created_at DESC',(at,)):
+        outcome=store.db.execute('SELECT * FROM industry_outcomes WHERE forecast_id=? AND checked_at<=? ORDER BY checked_at DESC,rowid DESC LIMIT 1',(r['id'],at)).fetchone()
+        forecasts.append({k:r[k] for k in ('id','hypothesis_id','symbol','created_at','due_at')} | {'payload':json.loads(r['payload_json']),'outcome':({k:outcome[k] for k in ('status','checked_at')} | {'payload':json.loads(outcome['payload_json'])}) if outcome else None})
     hypotheses=[]
     for h in latest(store,at):
-        versions=[{'id':r['id'],'at':r['created_at'],'state':r['state'],'thesis':json.loads(r['payload_json'])['thesis']} for r in store.db.execute('SELECT id,created_at,state,payload_json FROM industry_hypotheses WHERE thesis_key=? AND created_at<=? ORDER BY created_at DESC,rowid DESC LIMIT 10',(h['thesis_key'],at))]
+        versions=[{'id':r['id'],'at':r['created_at'],'state':r['state'],'thesis':json.loads(r['payload_json'])['thesis'],'payload':json.loads(r['payload_json'])} for r in store.db.execute('SELECT id,created_at,state,payload_json FROM industry_hypotheses WHERE thesis_key=? AND created_at<=? ORDER BY created_at DESC,rowid DESC',(h['thesis_key'],at))]
+        if h['method']=='2':h['payload']['missing']=list(dict.fromkeys(h['payload'].get('missing',[])+bottleneck_gaps(h['payload'],usable_facts(h['payload']['facts'],at))))
         hypotheses.append({**{k:v for k,v in h.items() if k!='payload_json'},'effective_state':state(store,h,at),'versions':versions})
-    return {'version':VERSION,'enabled':bool(config.get('industry_enabled')),'domains':DOMAINS,'methods':METHODS,'members':rows,
+    return {'version':VERSION,'as_of':at,'enabled':bool(config.get('industry_enabled')),'domains':DOMAINS,'methods':METHODS,'members':rows,
       'hypotheses':hypotheses,
       'checks':[{**dict(r),'payload':json.loads(r['payload_json'])} for r in store.db.execute('SELECT s.* FROM industry_steps s WHERE NOT EXISTS(SELECT 1 FROM industry_steps n WHERE n.step=s.step AND n.updated_at>s.updated_at) ORDER BY updated_at DESC LIMIT 5')],
       'forecasts':forecasts,'coverage':[dict(r) for r in store.db.execute('SELECT * FROM industry_coverage ORDER BY id DESC LIMIT 30')],
-      'storage':'本机 SQLite 与内容哈希原文档案；云端仅同步摘要及资格','history':[dict(r) for r in store.db.execute('SELECT symbol,at,membership,tier,buy_eligible FROM industry_memberships ORDER BY id DESC LIMIT 50')]}
+      'storage':'完整原文保存在研究电脑，网页展示可追溯的研究摘录',
+      'history':[{**json.loads(r['payload_json']), 'at':r['at']} for r in store.db.execute('SELECT at,payload_json FROM industry_memberships WHERE at<=? ORDER BY id DESC',(at,))]}
 
 
 def evaluate(store,at):
     """Forward operating outcomes, separate from security price performance."""
     results=[]
     for row in store.db.execute('SELECT * FROM industry_forecasts WHERE due_at<=?',(at,)).fetchall():
-        prediction=json.loads(row['payload_json']);observed=[]
-        for h in latest(store,at,row['symbol']):
-            for f in h['payload']['facts']:
-                if (f['claim_type']=='DISCLOSED' and f['ready_at']>row['created_at'] and f['metric']==prediction['metric'] and f['unit']==prediction['unit'] and f['period']==prediction['period'] and f['entity'] in (row['symbol'],h['payload']['name'])):
-                    try:
-                        number=Decimal(f['value'])
-                        if number.is_finite():observed.append({'value':str(number),'doc_id':f['doc_id'],'evidence_id':f['evidence_id']})
-                    except Exception:continue
+        prediction=json.loads(row['payload_json']);observed=[];seen=set()
+        current_docs={d['id'] for d in store.documents_as_of(at)}
+        facts=store.db.execute('''SELECT f.payload_json,h.payload_json AS hypothesis FROM industry_facts f
+          JOIN industry_hypotheses h ON h.id=f.hypothesis_id WHERE h.symbol=? AND h.created_at<=?
+          AND f.ready_at<=? ORDER BY f.ready_at,f.id''',(row['symbol'],at,at))
+        for entry in facts:
+            f=json.loads(entry['payload_json']);h=json.loads(entry['hypothesis'])
+            if (f['doc_id'] in current_docs and f['claim_type']=='DISCLOSED' and f['ready_at']>row['created_at']
+                and f['metric']==prediction['metric'] and f['unit']==prediction['unit'] and f['period']==prediction['period']
+                and f['entity'] in (row['symbol'],h['name'])):
+                try:
+                    number=Decimal(f['value']);key=(f['doc_id'],f['evidence_id'],str(number))
+                    if number.is_finite() and key not in seen:
+                        seen.add(key);observed.append({'value':str(number),'doc_id':f['doc_id'],'evidence_id':f['evidence_id'],'quote':f['quote'],'url':f['url'],'ready_at':f['ready_at']})
+                except (ValueError, ArithmeticError):continue
         values={Decimal(o['value']) for o in observed}
         status='UNKNOWN' if not values else 'CONFLICT' if len(values)>1 else 'IN_RANGE' if Decimal(prediction['low'])<=next(iter(values))<=Decimal(prediction['high']) else 'OUTSIDE_RANGE'
         payload={'prediction':prediction,'observations':observed,'notice':'尚未取得可比经营披露不记作预测失败；价格表现另行评估'}
-        oid=digest(encoded([row['id'],status,observed]))[:24]
+        prior=store.db.execute('SELECT id,status,payload_json FROM industry_outcomes WHERE forecast_id=? ORDER BY checked_at DESC,rowid DESC LIMIT 1',(row['id'],)).fetchone()
+        if prior and prior['status']==status and json.loads(prior['payload_json'])==payload:
+            results.append({'forecast_id':row['id'],'status':status});continue
+        oid=digest(encoded([row['id'],status,observed,at,prior['id'] if prior else None]))[:24]
         with store.db:store.db.execute('INSERT OR IGNORE INTO industry_outcomes VALUES(?,?,?,?,?)',(oid,row['id'],at,status,encoded(payload)))
         results.append({'forecast_id':row['id'],'status':status})
     return results

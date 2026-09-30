@@ -28,7 +28,10 @@ class IndustryTests(unittest.TestCase):
             a=self.fact('RELATION');a.update(entity='终端客户',counterparty='一级客户')
             b=self.fact('RELATION');b.update(entity='一级客户',counterparty='高澜股份')
             p['facts']=[a,b,self.fact('EXPOSURE',metric='BUSINESS')]
-        if method=='2':p['facts']=[self.fact('METRIC','DEMAND'),self.fact('METRIC','LEAD_TIME')]
+        if method=='2':
+            p['alternatives']='替代供应商产能尚需半年';p['profit_capture']='公司已取得产品定价和供货合同'
+            p['facts']=[self.fact('METRIC',m) for m in ('DEMAND','LEAD_TIME','SUPPLY_CONSTRAINT','ALTERNATIVE_SUPPLY','PROFIT_CAPTURE')]
+            p['facts'][2]['value']='LEAD_TIME_RISING'
         return p
     def save(self,p=None,at=None):return industry.save(self.store,p or self.proposal(),at or self.at,self.identities)
     def test_all_four_methods_admit_only_their_evidence_gates(self):

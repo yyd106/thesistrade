@@ -73,7 +73,7 @@ showChanges(card,{symbol:'sz000333',learning:{mode:'DELTA',new_documents:2,pendi
 assert.match(JSON.stringify(card),/本次阅读 2 份/);
 assert.match(JSON.stringify(card),/仍有 3 段/);
 assert.match(JSON.stringify(card),/相关行业与国际消息/);
-assert.match(JSON.stringify(card),/公司实际敞口/);
+assert.match(JSON.stringify(card),/公司相关业务规模/);
 card=new FakeElement('article');showChanges(card,{learning:{mode:'DELTA',new_documents:0,pending_chunks:0}});
 assert.match(JSON.stringify(card),/本次没有新增原文/);
 assert.doesNotMatch(JSON.stringify(card),/相关行业与国际消息/);
@@ -322,7 +322,7 @@ renderWatchlist(observationState);
 assert.equal(macroNodes.get('observation-categories').children.length,3);
 assert.equal(macroNodes.get('observation-categories').children[0].textContent,'A股 2');
 assert.equal(macroNodes.get('stocks').children[0].children.length,3); // Header plus 2 distinct targets; no duplicate original stock.
-assert.match(JSON.stringify(macroNodes.get('stocks')),/动态影响/);
+assert.match(JSON.stringify(macroNodes.get('stocks')),/跟踪依据/);
 macroNodes.get('observation-categories').children[1].listeners.click();
 assert.match(JSON.stringify(macroNodes.get('stocks')),/NVIDIA Corporation/);
 assert.doesNotMatch(JSON.stringify(macroNodes.get('stocks')),/山东黄金/);
@@ -364,7 +364,7 @@ console.log('Independent impact admission, sources and honest cold-start state p
 // Semantic screening is inspectable, bounded and uses text nodes for external content.
 const drawScreening=vm.runInContext('renderNewsScreening',context),screenBox=new FakeElement('section');
 drawScreening(screenBox,{counts:{DEEP:2,WATCH:3,BACKGROUND:4},recent:[{decision:'WATCH',title:'<img src=x onerror=alert(1)>',url:'https://www.ft.com/test',source:'Financial Times',at:'2026-09-22T02:00:00Z',reason:'等待政策范围确认',channel:'供给约束可能向成本传导',scale_basis:'缺少产业分母',next_evidence:'正式实施范围'}]});
-assert.match(JSON.stringify(screenBox),/深研 2 条/);assert.match(JSON.stringify(screenBox),/等待政策范围确认/);assert.match(JSON.stringify(screenBox),/传导路径/);assert.equal(screenBox.children[1].tag,'details');
+assert.match(JSON.stringify(screenBox),/深入研究 2 条/);assert.match(JSON.stringify(screenBox),/等待政策范围确认/);assert.match(JSON.stringify(screenBox),/传导路径/);assert.equal(screenBox.children[1].tag,'details');
 assert.doesNotMatch(JSON.stringify(screenBox),/undefined|innerHTML/);
 console.log('News screening decisions, economic rationale and safe collapsed detail passed.');
 // Older unfiltered research remains accessible without flooding the main important-news list.
@@ -413,7 +413,7 @@ assert.match(JSON.stringify(missingRow),/未持仓|报价待获取|暂未形成/
 const expiredRow=new FakeElement('table');drawGlobalRow(expiredRow,{...spotTarget,trade_plan:{status:'ACTIVE',created_at:'2026-09-22T00:00:00Z',valid_until:'2026-09-23T01:00:00Z',payload:{kind:'PAPER_TRADE',thesis:'依据供给变化',holding_days:5,levels:{buy_low_micros:1900000000,buy_high_micros:2000000000,sell_micros:2200000000,stop_micros:1800000000}}}},foreignState);
 assert.match(JSON.stringify(expiredRow),/仅供回看/);assert.match(JSON.stringify(expiredRow),/1,900.00 – 2,000.00/);
 vm.runInContext('observationCategory="US"',context);renderWatchlist(foreignState);
-assert.equal(macroNodes.get('stocks').children[0].tag,'table');assert.match(JSON.stringify(macroNodes.get('stocks')),/暂未发现需要跟踪的美股标的/);
+assert.equal(macroNodes.get('stocks').children[0].tag,'table');assert.match(JSON.stringify(macroNodes.get('stocks')),/当前名单与状态下没有美股标的/);
 console.log('Three unified tables, native currency costs, fractional quantities, holding order, collapsed research and empty/expired states passed.');
 const showPortfolioStrategy=vm.runInContext('renderPortfolioStrategy',context);
 macroNodes.clear();
@@ -429,11 +429,11 @@ assert.match(macroNodes.get('portfolio-strategy-state').textContent,/暂停新�
 console.log('Portfolio targets, current authorization, safe text and failure state passed.');
 const strategyCard=new FakeElement('article');
 drawGlobalRow(strategyCard,{...observationTarget('BTC','比特币','COMMODITY'),last_strategy_updated_at:'2026-09-23T01:23:00Z'},foreignState);
-assert.match(JSON.stringify(strategyCard),/上一次交易策略更新时间/);
+assert.match(JSON.stringify(strategyCard),/组合买卖安排更新/);
 assert.doesNotMatch(JSON.stringify(strategyCard),/尚未发布/);
 const emptyStrategyCard=new FakeElement('article');
 drawGlobalRow(emptyStrategyCard,observationTarget('ETH','以太坊','COMMODITY'),foreignState);
-assert.match(JSON.stringify(emptyStrategyCard),/上一次交易策略更新时间：尚未发布/);
+assert.match(JSON.stringify(emptyStrategyCard),/组合买卖安排更新：尚未发布/);
 console.log('Per-asset strategy timestamp and missing-publication state passed.');
 // Notices: only an admin sees them, oldest open first, one deferred with "稍后再看" stays hidden until reload.
 const nextNotice=vm.runInContext('nextNotice',context),noticeActions=vm.runInContext('noticeActions',context);
@@ -460,3 +460,25 @@ assert.doesNotMatch(JSON.stringify(industryBox),/javascript:/);
 const methodBox=new FakeElement('div');vm.runInContext('drawImpactAssessment',context)(methodBox,{method_gate:true,admitted:true},'new-method');
 assert.match(JSON.stringify(methodBox),/初步证据通过/);assert.doesNotMatch(JSON.stringify(methodBox),/通过影响评估/);
 console.log('Industry evidence, uncertainty, method gate and safe source-link rendering passed.');
+// The editor never promotes discovered companies to the manually maintained list.
+const fixedOnly=vm.runInContext('fixedWatchlist',context),listDiff=vm.runInContext('watchlistDiff',context);
+const coreMember={symbol:'sh600519',name:'固定公司',category:'CN',membership:'CORE',buy_eligible:true,research_status:'TRACKING'};
+const activeMember={symbol:'sz300502',name:'活跃公司',category:'CN',membership:'DYNAMIC',buy_eligible:true,research_status:'TRACKING'};
+const leadMember={symbol:'sz300503',name:'候选公司',category:'CN',membership:'DYNAMIC',buy_eligible:false,research_status:'LEAD'};
+const archiveMember={symbol:'sz300504',name:'归档公司',category:'CN',membership:'DYNAMIC',buy_eligible:false,research_status:'ARCHIVED'};
+const reviewFixture={watchlist:[coreMember,activeMember],fixed_watchlist:[{symbol:coreMember.symbol,name:coreMember.name}],industry:{enabled:true,members:[coreMember,activeMember,leadMember,archiveMember]},observation:{items:['GOLD','SILVER','BTC','ETH'].map(asset=>({asset,name:asset,category:'COMMODITY',fixed:true}))}};
+assert.equal(fixedOnly(reviewFixture).length,1);assert.equal(fixedOnly({...reviewFixture,fixed_watchlist:undefined}).length,1);
+assert.deepEqual([...listDiff(fixedOnly(reviewFixture),fixedOnly(reviewFixture))],[]);
+assert.match([...listDiff(fixedOnly(reviewFixture),[activeMember])].join(';'),/新增：活跃公司.*移除：固定公司/);
+const filteredRows=vm.runInContext('filteredResearchRows',context);
+assert.equal(filteredRows(reviewFixture,'ALL','TRACKING').length,6);
+assert.equal(filteredRows(reviewFixture,'CORE','TRACKING').length,1);
+assert.equal(filteredRows(reviewFixture,'DYNAMIC','TRACKING').length,1);
+assert.equal(filteredRows(reviewFixture,'DYNAMIC','LEAD').length,1);
+assert.equal(filteredRows(reviewFixture,'DYNAMIC','ARCHIVED')[0].symbol,'sz300504');
+assert.equal(filteredRows(reviewFixture,'CORE','ALL').filter(r=>r.category==='COMMODITY').length,0);
+const copyForTrader=vm.runInContext('traderText',context),errorForTrader=vm.runInContext('readableError',context);
+assert.doesNotMatch(copyForTrader('CORE FOCUS industry_v1 ORDERS Dynamic List 组合授权 心跳 research_pipeline'),/CORE|FOCUS|industry_v1|ORDERS|Dynamic List|授权|心跳|research_pipeline/);
+assert.doesNotMatch(errorForTrader('HTTPError: 403 cninfo_pdf'),/HTTPError|cninfo_pdf/);
+assert.equal(vm.runInContext('el',context)('blockquote','ORDERS 原始引用').textContent,'ORDERS 原始引用');
+console.log('Fixed-list isolation, explicit diff, market/status/count consistency and trader copy regressions passed.');

@@ -29,6 +29,12 @@ def membership(store,config,at=None):
           'review_at':min([t for t in [item.get('review_due_at')]+[l.get('qualification_review_at') for l in links] if t],default=None),'hypothesis_ids':[l['event_id'] for l in links],
           'methods':sorted({l['method'] for l in item.get('links',[]) if l.get('method')}),
           'domains':sorted({l['theme'] for l in item.get('links',[]) if l.get('theme')})}
+        states={l.get('industry_state') for l in item.get('links',[]) if l.get('industry_state')}
+        member['research_status']='TRACKING' if eligible else 'REVIEW' if 'REVIEW' in states else 'LEAD' if states and states<={'WAITING'} else 'REVIEW' if tier=='COOLING' else 'ARCHIVED'
+        member['category']='CN' if symbol.startswith(('sh','sz')) else 'US'
+        member['rule_version']=__import__('ashare.industry',fromlist=['RULE_VERSION']).RULE_VERSION
+        if member['research_status']=='LEAD':member['reason']='已发现相关线索，关键证据仍待补齐'
+        elif member['research_status']=='REVIEW':member['reason']='原研究依据需要重新核对，补齐前不新增买入'
         member['fingerprint']=digest(json.dumps({k:member[k] for k in ('membership','tier','buy_eligible','hypothesis_ids')},sort_keys=True))
         result.append(member)
     return result
@@ -54,12 +60,13 @@ def reconcile(store,config,at):
     removed=[]
     for symbol,prior in known.items():
         if symbol not in current:
-            m={**prior,'membership':'DYNAMIC','tier':'ARCHIVED','buy_eligible':False,'protected':False,'hypothesis_ids':[],'reason':'固定名单人工调整或已无活跃依据；保留历史'}
+            m={**prior,'membership':'DYNAMIC','tier':'ARCHIVED','research_status':'ARCHIVED','buy_eligible':False,'protected':False,'hypothesis_ids':[],'reason':'已移出固定名单或不再继续跟踪；历史资料仍可查看'}
             m['fingerprint']=digest(json.dumps({k:m[k] for k in ('membership','tier','buy_eligible','hypothesis_ids')},sort_keys=True));removed.append(m)
     with store.db:
         for m in members+removed:
-            old=store.db.execute('SELECT fingerprint FROM industry_memberships WHERE symbol=? ORDER BY id DESC LIMIT 1',(m['symbol'],)).fetchone()
-            if not old or old[0]!=m['fingerprint']:
+            old=store.db.execute('SELECT fingerprint,payload_json FROM industry_memberships WHERE symbol=? ORDER BY id DESC LIMIT 1',(m['symbol'],)).fetchone()
+            old_payload=json.loads(old['payload_json']) if old else {}
+            if not old or old[0]!=m['fingerprint'] or any(old_payload.get(k)!=m.get(k) for k in ('reason','protected','rule_version','research_status')):
                 store.db.execute('INSERT INTO industry_memberships(symbol,at,membership,tier,buy_eligible,fingerprint,payload_json) VALUES(?,?,?,?,?,?,?)',(m['symbol'],at,m['membership'],m['tier'],int(m['buy_eligible']),m['fingerprint'],json.dumps(m,ensure_ascii=False)))
     return members
 

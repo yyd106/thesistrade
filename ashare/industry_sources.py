@@ -20,15 +20,17 @@ def collect(store,config,cycle,domain,deadline,fetch_fn=None):
     limits=policy(config)
     fetch=fetch_fn or sources.fetch;start=now();end=datetime.fromisoformat(start).date();begin=end-timedelta(days=limits['lookback_days'])
     terms=DOMAINS[domain]['terms'];term=terms[end.toordinal()%len(terms)];count=0;errors=[]
+    from .cloud_runtime import value,put
+    cursor_key='industry_catalog:'+domain+':'+term
+    cursor=value(store,cursor_key) or {'begin':str(begin),'end':str(end),'page':1}
+    directory_ok=False
     try:
-        # One page is intentionally not represented as full-market coverage.
-        form={'pageNum':1,'pageSize':limits['page_size'],'column':'szse','tabName':'fulltext','stock':'','searchkey':term,'secid':'','plate':'','category':'','trade':'','seDate':f'{begin}~{end}','sortName':'time','sortType':'desc','isHLtitle':'false'}
+        form={'pageNum':cursor['page'],'pageSize':limits['page_size'],'column':'szse','tabName':'fulltext','stock':'','searchkey':term,'secid':'','plate':'','category':'','trade':'','seDate':cursor['begin']+'~'+cursor['end'],'sortName':'time','sortType':'desc','isHLtitle':'false'}
         raw=fetch('https://www.cninfo.com.cn/new/hisAnnouncement/query',form=form,max_bytes=3000000)
         store.raw(raw,'.json');data=json.loads(raw)
-        if not isinstance(data.get('announcements'),(list,type(None))) or 'hasMore' not in data:raise ValueError('产业公告目录结构变化')
-        downloaded=0
+        if not isinstance(data.get('announcements'),(list,type(None))) or 'hasMore' not in data:raise ValueError('公告目录暂时无法读取')
+        # Advance a page only after its entire bounded catalog is durably queued.
         for a in (data['announcements'] or [])[:limits['page_size']]:
-            if time.monotonic()>=deadline:errors.append('本轮采集预算结束');break
             code=a.get('secCode','')
             if not re.fullmatch(r'(60|68|00|30)\d{4}',code):continue
             symbol=('sh' if code.startswith('6') else 'sz')+code
@@ -36,15 +38,48 @@ def collect(store,config,cycle,domain,deadline,fetch_fn=None):
             title=html.unescape(re.sub('<[^>]+>','',a['announcementTitle']))
             published=normalize_time(datetime.fromtimestamp(a['announcementTime']/1000,timezone.utc).isoformat())
             store.add_document(symbol=symbol,kind='announcement_metadata',title=title,source='cninfo',url=url,published_at=published,time_precision='date',pages=[(None,title)],raw_path=store.raw(json.dumps(a,ensure_ascii=False).encode(),'.json'),quality='metadata_only',cloud_allowed=True)
-            if downloaded>=limits['pdf_limit']:continue
-            downloaded+=1
-            try:
-                body=fetch(url,max_bytes=12000000);path=store.raw(body,'.pdf')
-                if store.db.execute("SELECT 1 FROM documents WHERE url=? AND raw_path=? AND kind='company_report'",(url,path)).fetchone():continue
-                store.add_document(symbol=symbol,kind='company_report',title=title,source='cninfo',url=url,published_at=published,time_precision='date',pages=sources.pdf_pages(body),raw_path=path,quality='pdf_text_layout_unverified',cloud_allowed=True);count+=1
-            except Exception as exc:errors.append(title+': '+str(exc)[:140])
-        coverage(store,cycle,domain,'cninfo_industry',start,'PARTIAL',f"{begin}至{end}；关键词{term}，最多{limits['page_size']}条目录、{limits['pdf_limit']}份正文，本次新增{count}份；"+('存在后续页；' if data['hasMore'] else '')+'；'.join(errors))
-    except Exception as exc:coverage(store,cycle,domain,'cninfo_industry',start,'FAILED',str(exc))
+            with store.db:
+                store.db.execute("INSERT OR IGNORE INTO industry_source_queue(url,domain,symbol,title,published_at,discovered_at,status) VALUES(?,?,?,?,?,?,'PENDING')",(url,domain,symbol,title,published,start))
+        with store.db:put(store,cursor_key,{**cursor,'page':cursor['page']+1} if data['hasMore'] else None)
+        directory_ok=True
+    except Exception as exc:errors.append('公告目录：'+str(exc)[:180])
+    # Existing successful bodies do not spend the new-body allowance. Failed
+    # items remain queued and move behind untried items so one bad PDF cannot starve them.
+    pending=list(store.db.execute("SELECT * FROM industry_source_queue WHERE domain=? AND status!='DONE' ORDER BY attempted_at IS NOT NULL,attempted_at,discovered_at,url",(domain,)))
+    attempts=0
+    for item in pending:
+        if time.monotonic()>=deadline:break
+        existing=store.db.execute("SELECT 1 FROM documents WHERE url=? AND kind='company_report' AND extraction_quality NOT IN ('metadata_only','ocr_required')",(item['url'],)).fetchone()
+        if existing:
+            with store.db:store.db.execute("UPDATE industry_source_queue SET status='DONE',completed_at=?,error='' WHERE url=?",(now(),item['url']))
+            continue
+        if attempts>=limits['pdf_limit']:break
+        attempts+=1
+        try:
+            body=fetch(item['url'],max_bytes=12000000);path=store.raw(body,'.pdf');pages=sources.pdf_pages(body)
+            if not pages or not any(text.strip() for _,text in pages):raise ValueError('正文暂未识别，需要重新取得或核对')
+            store.add_document(symbol=item['symbol'],kind='company_report',title=item['title'],source='cninfo',url=item['url'],published_at=item['published_at'],time_precision='date',pages=pages,raw_path=path,quality='pdf_text_layout_unverified',cloud_allowed=True)
+            with store.db:store.db.execute("UPDATE industry_source_queue SET status='DONE',attempted_at=?,completed_at=?,error='' WHERE url=?",(now(),now(),item['url']))
+            count+=1
+        except Exception as exc:
+            errors.append(item['title']+'：'+str(exc)[:140])
+            with store.db:store.db.execute("UPDATE industry_source_queue SET status='PENDING',attempted_at=?,error=? WHERE url=?",(now(),str(exc)[:300],item['url']))
+    # A separate bounded revision check cannot consume the new-body allowance.
+    cutoff=normalize_time((datetime.fromisoformat(start)-timedelta(hours=config.get('document_recheck_hours',24))).isoformat())
+    revisions=store.db.execute("SELECT * FROM industry_source_queue WHERE domain=? AND status='DONE' AND coalesce(attempted_at,completed_at)<? ORDER BY coalesce(attempted_at,completed_at) LIMIT 1",(domain,cutoff)).fetchall()
+    for item in revisions:
+        if time.monotonic()>=deadline:break
+        try:
+            body=fetch(item['url'],max_bytes=12000000);path=store.raw(body,'.pdf')
+            if not store.db.execute("SELECT 1 FROM documents WHERE url=? AND raw_path=? AND kind='company_report'",(item['url'],path)).fetchone():
+                pages=sources.pdf_pages(body)
+                if not pages or not any(text.strip() for _,text in pages):raise ValueError('修订后的正文尚不能读取')
+                store.add_document(symbol=item['symbol'],kind='company_report',title=item['title'],source='cninfo',url=item['url'],published_at=item['published_at'],time_precision='date',pages=pages,raw_path=path,quality='pdf_text_layout_unverified',cloud_allowed=True)
+            with store.db:store.db.execute("UPDATE industry_source_queue SET attempted_at=?,error='' WHERE url=?",(now(),item['url']))
+        except Exception as exc:errors.append('正文修订检查：'+str(exc)[:140])
+    remaining=store.db.execute("SELECT count(*) FROM industry_source_queue WHERE domain=? AND status!='DONE'",(domain,)).fetchone()[0]
+    coverage(store,cycle,domain,'cninfo_industry',start,'PARTIAL' if directory_ok or count else 'FAILED',
+             cursor['begin']+'至'+cursor['end']+'；关键词'+term+'，目录第'+str(cursor['page'])+'页；本次取得'+str(count)+'份正文，待补'+str(remaining)+'份；'+('；'.join(errors) or '继续按资料取得进度补齐，不代表完整覆盖'))
     if time.monotonic()>=deadline:return
     # Procurement pages are public sources. Failure/captcha is a coverage gap,
     # never evidence that the industry has no procurement activity.

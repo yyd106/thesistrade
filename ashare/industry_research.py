@@ -2,7 +2,7 @@
 import json
 import time
 from .storage import now, digest, json_write
-from .industry import DOMAINS, METHODS, encoded, save, latest, context
+from .industry import DOMAINS, METHODS, RULE_VERSION, encoded, save, latest, context
 
 
 DEFAULTS={'discovery_seconds':600,'company_seconds':3000,'source_seconds':90,'lookback_days':14,'page_size':20,'pdf_limit':2,'hypotheses_per_domain':8}
@@ -30,7 +30,7 @@ PROMPT='''你是产业链研究员。仅根据给定原文，检查方法1二级
 facts.kind=RELATION/METRIC/MILESTONE/EXPOSURE/COUNTEREVIDENCE；claim_type=DISCLOSED(原文披露)/GUIDANCE(计划指引)/ESTIMATE(模型估计)。未知字符串留空，period只写业务期间或原文明示当前，未知留空并保留WAITING，不把发布日期冒充业务期间。effective_from/until只填原文明示的ISO带时区日期，否则空。
 方法1若有原文参数，用METRIC记录INCREMENTAL_UNITS(台)、CONTENT_PER_UNIT(件/台)、UNIT_PRICE(元/件)、SUPPLIER_SHARE(0至1比例)，value仅数字或low-high；期间一致才由程序算条件收入情景，未知就不填。
 RELATION的entity是客户，counterparty是供应商，product为具体产品；方法1需两条相接链，认证/历史合作不是量产，份额不能推测。
-METRIC的metric使用DEMAND/ORDERS/CAPACITY/OUTPUT/LEAD_TIME/INVENTORY/PRICE等，unit保持原文量纲，value保持原文数字与范围；需求增长本身不证明短缺。方法2需需求和供给约束、alternatives替代供应、profit_capture利润保留证据。
+METRIC的metric使用DEMAND/ORDERS/CAPACITY/OUTPUT/LEAD_TIME/INVENTORY/PRICE等，unit保持原文量纲，value保持原文数字与范围；需求增长本身不证明短缺。方法2必须有同产品、同业务期间、同主体或同业主项目标包的需求和供应指标，不可拼接其他时期或其他产品。用METRIC记录SUPPLY_CONSTRAINT，其value只可为DEMAND_EXCEEDS_SUPPLY/CAPACITY_FULL/LEAD_TIME_RISING/INVENTORY_DEPLETING，必须有原文支持当前供应约束；另外用METRIC记录ALTERNATIVE_SUPPLY和PROFIT_CAPTURE，value写原文事实，均须匹配同一产品、期间和主体或项目；利润事实的entity或counterparty须是目标上市公司。alternatives、profit_capture只总结这些原文。缺任何一项或只能写未知则WAITING。
 MILESTONE的owner项目业主、project稳定项目名/编号、lot标包必须区分；metric仅POLICY/BUDGET/FUNDING/TENDER/AWARD/CONTRACT/DELIVERY/ACCEPTANCE/PAYMENT/CANCELLED。方法3、8需同一项目资金和采购节点；中标不等于收入或回款，各节点金额不可相加。联合体、代理商与上市公司份额未知则保留缺口。
 forecasts为可检验的经营指标，基线baseline、low/high数字字符串、unit与period、未来due_at完整才输出，否则空数组。不要凭空造范围，不用股价代替经营验证。数值推导由程序完成，不编造计算结果。不要为了填满领域而造候选。
 '''
@@ -76,7 +76,7 @@ def run(store,config,cycle=None,*,deadline=None,model_fn=None,collect_fn=None,at
         hits=sorted(hits,key=lambda h:h['published_at'],reverse=True)[:16]
         body='\n'.join(h['text'] for h in hits)
         selected={k:v for k,v in identities.items() if v.get('kind')=='STOCK' and (k in {h['symbol'] for h in hits} or len(v.get('name',''))>=3 and v['name'] in body or k in {h['symbol'] for h in prior})}
-        packet={'domain':domain,'as_of':stamp,'identities':selected,'evidence':hits,'previous':[{'topic':h['payload']['topic'],'symbol':h['symbol'],'method':h['method'],'thesis':h['payload']['thesis'],'state':h['state']} for h in prior]}
+        packet={'rule_version':RULE_VERSION,'domain':domain,'as_of':stamp,'identities':selected,'evidence':hits,'previous':[{'topic':h['payload']['topic'],'symbol':h['symbol'],'method':h['method'],'thesis':h['payload']['thesis'],'state':h['state']} for h in prior]}
         fingerprint=digest(encoded(packet|{'as_of':None}))
         prior_step=store.db.execute("SELECT payload_json FROM industry_steps WHERE step=? AND status='DONE' ORDER BY updated_at DESC LIMIT 1",(domain,)).fetchone()
         previous_payload=json.loads(prior_step[0]) if prior_step else {}

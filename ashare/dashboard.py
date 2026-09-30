@@ -37,7 +37,7 @@ def status(config, *, overview=False):
         a['risk']=risk_state(store)
         a['investment_policy']=public() if enabled(config) else None
         plans=[]
-        for item in company_targets(store,config):
+        for item in company_targets(store,config,at):
             p=store.db.execute("SELECT p.*,s.snapshot_id,s.model_status,s.result_json FROM plans p JOIN studies s ON s.id=p.study_id WHERE p.symbol=? ORDER BY CASE WHEN p.status='ACTIVE' AND p.valid_until>? THEN 0 ELSE 1 END,p.activated_at DESC,p.rowid DESC LIMIT 1",(item['symbol'],now())).fetchone()
             plan=dict(p) if p else None
             if plan:
@@ -101,8 +101,8 @@ def status(config, *, overview=False):
             'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,
             'market_phase':phase(at),'quote_max_age_seconds':config['quote_max_age_seconds'],'schedule':{'collection':config['collection_times'],'slots':config['slot_times'],'review':config['review_time'],
                                                'execution_mode':config['slot_execution_mode']},
-            'watchlist':plans,'observation':observation_view(store,at,config),'dynamic':dynamic_view(store,config,at),'account':a,'reviews':reviews,'followups':followup_view(store,at),
-            'industry':__import__('ashare.industry',fromlist=['view']).view(store,config,at),
+            'fixed_watchlist':config['watchlist'],'watchlist':plans,'observation':observation_view(store,at,config),'dynamic':dynamic_view(store,config,at),'account':a,'reviews':reviews,'followups':followup_view(store,at),
+            'industry':__import__('ashare.industry_presentation',fromlist=['current']).current(__import__('ashare.industry',fromlist=['view']).view(store,config,at),at),
             'supervision':supervision_view(store),
             'next_runs':next_runs(config,at),'portfolio':portfolio(store,config,a,at),
             'trade_effects':trade_effects(store,config,at),'portfolio_strategy':portfolio_strategy_view(store,config,at),
@@ -358,7 +358,9 @@ def make_handler(config_path,token,port):
                         try:
                             if len(set(symbols)|set(FIXED)|protected_assets(check_store))>MAX_ASSETS:raise ValueError('新列表加上固定资产及持仓/未完成委托超过40，请保留受保护持仓的名额。')
                         finally:check_store.close()
-                    validate_settings(raw);json_write(Path(config_path),raw)
+                    validate_settings(raw)
+                    from .config_ops import apply
+                    apply(config_path,body,reason='管理员在设置页确认修改',approved_by=user['username']+' 在已登录管理页提交',data_dir=cfg['data_dir'])
                     self.send(200,{'status':'SAVED'})
                 else:self.send(404,{'error':'Not found'})
             except auth.AuthError as exc:self.send(exc.code,{'error':str(exc)})

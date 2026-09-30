@@ -67,6 +67,17 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(code,200)
         self.assertTrue(json.loads(self.path.read_text())['scheduler_enabled'])
 
+    def test_fixed_list_edit_is_audited_and_status_separates_fixed_members(self):
+        original=json.loads(self.path.read_text())['watchlist']
+        code,raw,_=self.request('GET','/api/status')
+        self.assertEqual(json.loads(raw)['fixed_watchlist'],original)
+        changed=[{**w,'name':w['name']+'核对'} if i==0 else w for i,w in enumerate(original)]
+        code,raw,_=self.request('POST','/api/settings',{'watchlist':changed},{'X-CSRF-Token':self.csrf})
+        self.assertEqual(code,200,raw)
+        records=[json.loads(line) for line in (Path(self.data)/'workflow/changes/config-changes.jsonl').read_text().splitlines()]
+        self.assertIn('watchlist',json.dumps(records[-1]));self.assertIn('admin',json.dumps(records[-1]))
+        self.assertEqual(json.loads(self.path.read_text())['watchlist'],changed)
+
     def test_foreign_origin_or_host_remains_blocked(self):
         code,body=self.post('cycle',Origin='https://foreign.example')
         self.assertEqual((code,body['code']),(403,'ORIGIN_FORBIDDEN'))
