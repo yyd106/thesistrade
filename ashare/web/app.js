@@ -488,7 +488,7 @@ function renderActivity(s) {
   const reviewNext=s.next_runs.find(r=>r.kind==='review');
   $('review-timing').textContent='每日核算盈亏 · 回看前48小时持仓与研究依据'+(reviewNext?' · '+shortTime(reviewNext.scheduled_at)+' 自动更新':'');
   renderChanged('decision-summary',s.decisions.slice(0,1),box=>{
-    const d=s.decisions[0];if(!d){box.append(el('p','尚无买卖操作。每只股票的最近检查结果见上方，无操作检查不逐次保存。','empty'));return;}
+    const d=s.decisions[0];if(!d){box.append(el('p','尚无买卖操作。每只股票的最近检查结果见观察名单，无操作检查不逐次保存。','empty'));return;}
     box.append(el('p',(s.watchlist.find(w=>w.symbol===d.symbol)?.name||d.symbol)+' · '+label(d.action)+' · '+label(d.status)),el('p',decisionReason(d.reason),'subtle'),el('p',shortTime(d.at),'subtle'));
   });
   table('decisions',['时间','股票 / 操作','提交结果','依据'],s.decisions.map(d=>[shortTime(d.at),d.symbol+' '+label(d.action),label(d.status),decisionReason(d.reason)]));
@@ -660,19 +660,40 @@ async function saveSettings(button,body,target,success) {
   catch(error){feedback(target,error.message,'error');}
   finally{delete button.dataset.saving;button.disabled=!connected;}
 }
+const boards=['watchlist','holdings','activity','dynamic'];
+let currentBoard='watchlist';
+function watchlistHash(){
+  const params=new URLSearchParams({list:researchListFilter,status:researchStatusFilter,market:observationCategory});
+  if(watchlistQuery)params.set('q',watchlistQuery);
+  return '#watchlist?'+params;
+}
+function rememberWatchlist(){if(typeof location!=='undefined'&&location.pathname==='/')history.replaceState(history.state,'',watchlistHash());}
+function stockPath(symbol){return '/stocks/'+encodeURIComponent(symbol)+'?return='+encodeURIComponent(watchlistHash());}
+function parseWorkspaceHash(hash){
+  const [raw,query='']=hash.replace(/^#/,'').split('?'),params=new URLSearchParams(query);
+  const board=raw==='fill-history'?'activity':raw==='portfolio-section'||raw==='watchlist-performance'?'holdings':raw.replace(/-section$/,'');
+  return {board:boards.includes(board)?board:'watchlist',list:['CORE','DYNAMIC','FIXED','ALL'].includes(params.get('list'))?params.get('list'):'CORE',status:['ALL',...Object.keys(researchStates)].includes(params.get('status'))?params.get('status'):'ALL',market:observationCategories[params.get('market')]?params.get('market'):'CN',query:(params.get('q')||'').slice(0,80)};
+}
 function selectBoard(board,{focus=false,remember=false}={}) {
-  for(const name of ['watchlist','dynamic']) {
-    const selected=name===board,tab=$(name+'-tab');
+  currentBoard=boards.includes(board)?board:'watchlist';
+  for(const name of boards) {
+    const selected=name===currentBoard,tab=$(name+'-tab');
     tab.setAttribute('aria-selected',String(selected));tab.tabIndex=selected?0:-1;
     $(name+'-section').hidden=!selected;
     if(selected&&focus)tab.focus();
   }
-  if(remember)history.replaceState(history.state,'','#'+board);
+  if(remember)history.replaceState(history.state,'',currentBoard==='watchlist'?watchlistHash():'#'+currentBoard);
 }
 function initBoardTabs() {
   if(location.pathname!=='/'||!$('watchlist-tab'))return;
-  const boards=['watchlist','dynamic'];
-  const fromHash=()=>selectBoard(['#dynamic','#dynamic-section'].includes(location.hash)?'dynamic':'watchlist');
+  const fromHash=()=>{
+    const view=parseWorkspaceHash(location.hash);
+    if(view.board==='watchlist'){
+      researchListFilter=view.list;researchStatusFilter=view.status;observationCategory=view.market;watchlistQuery=view.query;
+      $('watchlist-search').value=watchlistQuery;if(state)renderWatchlist(state);
+    }
+    selectBoard(view.board);if(location.hash==='#fill-history')$('fill-history').open=true;
+  };
   fromHash();window.addEventListener('hashchange',fromHash);
   boards.forEach((board,index)=>{
     const tab=$(board+'-tab');
@@ -683,6 +704,13 @@ function initBoardTabs() {
       event.preventDefault();selectBoard(boards[next],{focus:true,remember:true});
     });
   });
+  $('watchlist-search').addEventListener('input',event=>{watchlistQuery=event.target.value;renderWatchlist(state);rememberWatchlist();});
+  $('research-status-filter').addEventListener('change',event=>{researchStatusFilter=event.target.value;renderWatchlist(state);rememberWatchlist();});
+  $('watchlist-reset').addEventListener('click',()=>resetWatchlist());
+}
+function resetWatchlist(){
+  researchListFilter='CORE';researchStatusFilter='ALL';observationCategory='CN';watchlistQuery='';
+  $('watchlist-search').value='';if(state)renderWatchlist(state);rememberWatchlist();$('watchlist-search').focus();
 }
 async function boot() {
   try{const session=await api.get('/api/session');if(!session.authenticated){location.replace('/login?next='+encodeURIComponent(location.pathname));return;}currentUser=session.user;document.body.dataset.role=currentUser.role;initPages();initBoardTabs();}catch(e){showRefreshProblem(e);if(e.kind!=='AUTH')setTimeout(boot,10000);return;}
@@ -768,7 +796,7 @@ async function loadObservationArchive(offset=0,asset=null){
 }
 
 async function showObservation(asset,category){
-  researchListFilter='ALL';researchStatusFilter='ALL';observationCategory=observationCategories[category]?category:'CN';selectBoard('watchlist',{remember:true});if(state)renderWatchlist(state);
+  researchListFilter='ALL';researchStatusFilter='ALL';watchlistQuery='';if($('watchlist-search'))$('watchlist-search').value='';observationCategory=observationCategories[category]?category:'CN';selectBoard('watchlist',{remember:true});if(state)renderWatchlist(state);
   const member=state?.observation?.membership?.[asset];
   if(member&&['COOLING','ARCHIVED'].includes(member.tier)){if(!await loadObservationArchive(0,asset))return;}
   const target=$('observed-'+asset);if(target){target.scrollIntoView({block:'center',behavior:'smooth'});target.focus({preventScroll:true});}
@@ -876,8 +904,8 @@ function drawGlobalWatchlistRow(table,target,s){
   if(expired)buy.append(el('p','研究已过期 · 仅供回看','caution'));
   const blockers=target.recheck?.payload?.blockers?.length?target.recheck.payload.blockers:pp?.blockers||[];
   const title=target.entry_allowed===false?target.entry_reason||'暂停新增买入':expired?'研究已过期，等待更新':!p?'等待研究形成交易计划':blockers.length?'等待：'+blockers.slice(0,2).join('；'):pp.kind==='PAPER_TRADE'?(h?'按策略持续检查':'等待价格与资金条件'):'当前研究暂不买入';
-  decision.append(el('strong',title,'caution'),el('p',p?'研究 '+shortTime(p.created_at):'等待首次研究','subtle'),el('p','组合买卖安排更新：'+(target.last_strategy_updated_at?shortTime(target.last_strategy_updated_at):'尚未发布'),'subtle'));
-  row.append(name,holding,quote,buy,sell,decision);
+  decision.append(el('strong',title,'decision-status caution'),el('p',p?'研究 '+shortTime(p.created_at):'等待首次研究','subtle'),el('p','组合买卖安排更新：'+(target.last_strategy_updated_at?shortTime(target.last_strategy_updated_at):'尚未发布'),'subtle'));
+  [name,holding,quote,buy,sell,decision].forEach((cell,i)=>cell.dataset.label=['股票 / 资产','当前持仓','当前价 / 成本价','买入参考区间','卖出 / 止损参考','当前状态'][i]);row.append(name,holding,quote,buy,sell,decision);
   const summaryRow=el('tr',null,'watchlist-summary-row'),cell=el('td'),research=details('研究逻辑与动态影响','watchlist-research:'+target.asset);cell.colSpan=6;
   if(pp){research.append(el('p',pp.thesis,'watchlist-status-summary'),el('p','持有参考 '+pp.holding_days+' 天 · 每小时复核 · 研究有效至 '+shortTime(p.valid_until),'subtle'));}
   else research.append(el('p','等待本轮研究形成交易计划。','subtle'));
@@ -889,7 +917,8 @@ function drawGlobalWatchlistRow(table,target,s){
   cell.append(research);summaryRow.append(cell);
   const group=el('tbody');group.id='observed-'+target.asset;group.tabIndex=-1;group.setAttribute('aria-label',target.name);group.append(row,summaryRow);table.append(group);
 }
-let researchListFilter='ALL',researchStatusFilter='TRACKING';
+let researchListFilter='CORE',researchStatusFilter='ALL',watchlistQuery='';
+const researchLists={CORE:'固定关注',DYNAMIC:'动态发现',FIXED:'固定资产',ALL:'全部标的'};
 const researchStates={TRACKING:'活跃跟踪',LEAD:'研究线索',REVIEW:'待复核',ARCHIVED:'已归档'};
 const hypothesisStates={ACTIVE:'依据有效',WAITING:'待补证据',REVIEW:'待复核',ARCHIVED:'已归档',INVALIDATED:'判断已失效',REALIZED:'已兑现'};
 const industryMethods={'1':'供应链需求传导','2':'供应瓶颈与盈利机会','3':'投资建设的先后顺序','8':'政策到实际采购'};
@@ -905,6 +934,14 @@ function researchRows(s){
 }
 function filteredResearchRows(s,list=researchListFilter,status=researchStatusFilter){
   return researchRows(s).filter(r=>(!s.industry?.enabled||list==='ALL'||r.membership===list)&&(!s.industry?.enabled||status==='ALL'||r.research_status===status));
+}
+function matchesWatchlistQuery(row,query=watchlistQuery){
+  const text=[row.name,row.symbol,row.asset].filter(Boolean).join(' ').toLocaleLowerCase();
+  return query.trim().toLocaleLowerCase().split(/\s+/).every(term=>text.includes(term));
+}
+function drawWatchlistEmpty(box){
+  const empty=el('div',null,'watchlist-empty');empty.append(el('strong',watchlistQuery?'没有找到匹配的股票或资产':'当前筛选下暂无标的'),el('p','可以调整名单、市场或研究状态，也可以回到固定关注查看全部股票。','subtle'));
+  const reset=el('button','返回固定关注');reset.type='button';reset.addEventListener('click',resetWatchlist);empty.append(reset);box.append(empty);
 }
 function drawIndustryEvidence(box,p,key){
   const evidence=details('查看原文与数据口径',key+':evidence');
@@ -942,15 +979,25 @@ function renderResearchLists(s){
   box.hidden=!data?.enabled;$('industry-research-panel').hidden=!data?.enabled;
   if($('research-status-tabs'))$('research-status-tabs').hidden=!data?.enabled;
   if(!data?.enabled)return;
-  renderChanged('research-list-tabs',[researchRows(s),researchListFilter,researchStatusFilter],target=>{
-    for(const [key,title] of [['CORE','固定关注'],['DYNAMIC','动态发现'],['ALL','全部跟踪']]){
-      const count=filteredResearchRows(s,key).length,b=el('button',title+' '+count);b.type='button';b.setAttribute('role','tab');b.setAttribute('aria-selected',String(researchListFilter===key));
-      b.addEventListener('click',()=>{researchListFilter=key;renderWatchlist(state||s);});target.append(b);
+  renderChanged('research-list-tabs',[researchRows(s),researchListFilter],target=>{
+    for(const [key,title] of Object.entries(researchLists)){
+      const count=filteredResearchRows(s,key,'ALL').length,b=el('button',null,'list-choice');b.type='button';b.id='list-'+key;b.setAttribute('aria-pressed',String(researchListFilter===key));
+      b.append(el('span',title),el('span',String(count),'list-count'));
+      b.addEventListener('click',()=>{
+        researchListFilter=key;researchStatusFilter='ALL';watchlistQuery='';$('watchlist-search').value='';
+        const rows=filteredResearchRows(state||s,key,'ALL');
+        observationCategory=rows.some(r=>r.category==='CN')?'CN':rows[0]?.category||'CN';
+        renderWatchlist(state||s);rememberWatchlist();$('list-'+key).focus();
+      });target.append(b);
     }
   });
-  if($('research-status-tabs'))renderChanged('research-status-tabs',[researchRows(s),researchListFilter,researchStatusFilter],target=>{
-    for(const [key,title] of Object.entries({...researchStates,ALL:'全部状态'})){const b=el('button',title+' '+filteredResearchRows(s,researchListFilter,key).length);b.type='button';b.setAttribute('aria-pressed',String(researchStatusFilter===key));b.addEventListener('click',()=>{researchStatusFilter=key;renderWatchlist(state||s);});target.append(b);}
+  renderChanged('research-status-filter',[researchRows(s),researchListFilter,observationCategory,watchlistQuery],target=>{
+    for(const [key,title] of Object.entries({ALL:'全部状态',...researchStates})){
+      const count=filteredResearchRows(s,researchListFilter,key).filter(r=>r.category===observationCategory&&matchesWatchlistQuery(r)).length;
+      const option=el('option',title+' · '+count);option.value=key;target.append(option);
+    }
   });
+  $('research-status-filter').value=researchStatusFilter;
   $('industry-summary').textContent='跟踪领域：'+Object.values(data.domains||{}).map(d=>d.name).join('、')+'。先核对需求、供给、预算和项目进度，再判断哪些公司值得研究。入选名单不等于可以买入。';
   renderChanged('industry-hypotheses',[data.checks,data.coverage],target=>{
     for(const c of data.checks||[]){const d=details((data.domains?.[c.step]?.name||'相关行业')+' · '+(c.status==='DONE'?'本轮已检查':'尚待完成'),'industry-check:'+c.step);for(const [method,reason] of Object.entries(c.payload?.methods||{}))d.append(el('p',industryMethods[method]+'：'+reason));target.append(d);}
@@ -958,15 +1005,16 @@ function renderResearchLists(s){
   });
 }
 function renderWatchlist(s){
+  if(!s)return;
   renderResearchLists(s);
   if(!observationCategories[observationCategory])observationCategory='CN';
-  const observed=s.observation?.items||[],manual=new Set(s.watchlist.map(w=>w.symbol)),visible=filteredResearchRows(s);
+  const observed=s.observation?.items||[],manual=new Set(s.watchlist.map(w=>w.symbol)),visible=filteredResearchRows(s).filter(r=>matchesWatchlistQuery(r));
   renderChanged('observation-categories',[visible,observationCategory,researchListFilter,researchStatusFilter],box=>{
     Object.entries(observationCategories).forEach(([category,title],index)=>{
       const count=visible.filter(t=>t.category===category).length;
       const b=el('button',title+' '+count);b.type='button';b.id='category-'+category;b.setAttribute('role','tab');b.setAttribute('aria-selected',String(category===observationCategory));b.setAttribute('aria-controls','stocks');b.tabIndex=category===observationCategory?0:-1;
-      b.addEventListener('click',()=>{observationCategory=category;renderWatchlist(state||s);});
-      b.addEventListener('keydown',event=>{const keys=Object.keys(observationCategories),next=event.key==='ArrowRight'?(index+1)%keys.length:event.key==='ArrowLeft'?(index+keys.length-1)%keys.length:event.key==='Home'?0:event.key==='End'?keys.length-1:null;if(next!==null){event.preventDefault();observationCategory=keys[next];renderWatchlist(state||s);$('category-'+keys[next]).focus();}});box.append(b);
+      b.addEventListener('click',()=>{observationCategory=category;renderWatchlist(state||s);rememberWatchlist();$('category-'+category).focus();});
+      b.addEventListener('keydown',event=>{const keys=Object.keys(observationCategories),next=event.key==='ArrowRight'?(index+1)%keys.length:event.key==='ArrowLeft'?(index+keys.length-1)%keys.length:event.key==='Home'?0:event.key==='End'?keys.length-1:null;if(next!==null){event.preventDefault();observationCategory=keys[next];renderWatchlist(state||s);rememberWatchlist();$('category-'+keys[next]).focus();}});box.append(b);
     });
   });
   const pool=s.observation?.counts,limits=s.observation?.policy;
@@ -974,8 +1022,7 @@ function renderWatchlist(s){
   renderObservationArchive(observationArchiveOffset&&observationArchiveData?observationArchiveData:s.observation);
   $('stocks').setAttribute('aria-labelledby','category-'+observationCategory);
   $('last-updated').hidden=observationCategory!=='CN';$('update-coverage').hidden=observationCategory!=='CN';
-  for(const id of ['followup-section','watchlist-performance'])if($(id))$(id).hidden=observationCategory!=='CN';
-  $('activity-section').hidden=false;
+  for(const id of ['followup-section'])if($(id))$(id).hidden=observationCategory!=='CN';
   $('watchlist-refresh-button').hidden=false;
   $('watchlist-refresh-button').dataset.run=observationCategory==='CN'?'cycle':'global_research';
   $('watchlist-note').hidden=false;
@@ -983,14 +1030,18 @@ function renderWatchlist(s){
   const update=researchUpdate({watchlist:visible.filter(r=>r.category==='CN')});
   $('last-updated').textContent='最近完成公司研究：'+(update.latest?when(update.latest):'尚无成功研究');
   $('update-coverage').textContent='当前筛选的 A股公司中，'+update.completed+' / '+update.total+' 只已完成公司研究。产业线索与公司研究分别展示。';
-  $('research-timing').textContent='当前名单与状态共 '+visible.length+' 个标的 · '+observationCategories[observationCategory]+' '+visible.filter(r=>r.category===observationCategory).length+' 个。全部跟踪包含固定现货；点击公司名称查看依据。';
-  renderChanged('stocks',[s.watchlist,s.portfolio.holdings,s.market_phase,s.next_runs,observed,visible,s.industry,observationCategory,researchListFilter,researchStatusFilter,[...s.watchlist,...observed].map(item=>quoteIsStale(item.quote,s))],box=>{
+  const count=visible.filter(r=>r.category===observationCategory).length,total=filteredResearchRows(s,researchListFilter,'ALL').length;
+  $('research-timing').textContent='查看当前持仓、最近价格与研究结论；点开公司名称，继续阅读完整依据。';
+  $('watchlist-scope').textContent=({CORE:'你固定关注的股票。默认包含全部研究状态，待复核的公司也会显示。',DYNAMIC:'研究过程中发现的公司与资产。加入观察不代表已满足买入条件。',FIXED:'持续观察的固定资产，价格与买卖区间按各自原币显示。',ALL:'固定关注、动态发现与固定资产，按市场和研究状态查找。'}[s.industry?.enabled?researchListFilter:'ALL']);
+  $('watchlist-result').textContent='显示 '+count+' / '+total+' 个标的 · '+observationCategories[observationCategory]+' · '+(researchStates[researchStatusFilter]||'全部状态')+(watchlistQuery?' · 搜索“'+watchlistQuery+'”':'');
+
+  renderChanged('stocks',[s.watchlist,s.portfolio.holdings,s.market_phase,s.next_runs,observed,visible,s.industry,observationCategory,researchListFilter,researchStatusFilter,watchlistQuery,[...s.watchlist,...observed].map(item=>quoteIsStale(item.quote,s))],box=>{
     const holdings=new Map(s.portfolio.holdings.filter(h=>h.origin!=='dynamic').map(h=>[h.symbol,h]));
     const discoveries=new Map(observed.map(t=>[t.asset,t]));
     if(observationCategory!=='CN'){
       const targets=visible.filter(t=>t.category===observationCategory).map(t=>({...t,asset:t.asset||t.symbol,links:t.links||t.discovery?.links||[]})).sort((a,b)=>(b.position?.market_value_cents||0)-(a.position?.market_value_cents||0));
       const table=watchlistTable();
-      if(!targets.length){const body=el('tbody'),row=el('tr'),cell=el('td');cell.colSpan=6;cell.append(el('p','当前名单与状态下没有'+observationCategories[observationCategory]+'标的，可切换名单或状态查看。','empty'));row.append(cell);body.append(row);table.append(body);}
+      if(!targets.length){drawWatchlistEmpty(box);return;}
       targets.forEach(target=>drawGlobalWatchlistRow(table,target,s));box.append(table);return;
     }
     const extra=observed.filter(t=>t.category==='CN'&&!manual.has(t.asset)).map(t=>({symbol:t.asset,name:t.name,quote:t.quote,discovery:t}));
@@ -998,10 +1049,10 @@ function renderWatchlist(s){
     const value=item=>holdings.get(item.symbol)?.market_value_cents??0;
     const ordered=visible.filter(w=>w.category==='CN').sort((a,b)=>value(b)-value(a));
     const t=watchlistTable();
-    if(!ordered.length)box.append(el('p','当前名单与状态下没有 A股公司，可切换筛选条件查看。','empty'));
+    if(!ordered.length){drawWatchlistEmpty(box);return;}
     for(const item of ordered){const row=el('tr'),name=el('td'),holding=el('td',null,'holding-value'),quote=el('td'),buy=el('td'),sell=el('td'),decision=el('td');
       const h=holdings.get(item.symbol),p=item.plan,l=p?.payload?.levels,discovery=discoveries.get(item.symbol),v=item.entry_allowed===false?{title:item.entry_reason||'暂停新增买入',reason:item.reason||'等待补充证据',ready:false}:item.research_status==='LEAD'?{title:'研究线索，尚不能买入',reason:item.reason,ready:false}:item.discovery?{title:discovery.status==='NEEDS_REVIEW'?'影响待复核':macroDirections[discovery.direction],reason:'动态发现标的，持续观察事件条件与后续证据。',ready:false}:researchDecision(item,s.market_phase);
-      name.append(item.discovery&&!s.industry?.enabled?el('strong',item.name):pageLink(item.name,'/stocks/'+item.symbol),el('p',item.symbol,'subtle'),el('p',h?h.qty+' 股 · '+percent(h.weight_pct):'未持仓','subtle'));
+      name.append(item.discovery&&!s.industry?.enabled?el('strong',item.name):pageLink(item.name,stockPath(item.symbol)),el('p',item.symbol,'subtle'),el('p',h?h.qty+' 股 · '+percent(h.weight_pct):'未持仓','subtle'));
       if(item.discovery)name.append(el('span',poolTierLabels[discovery.pool_tier]||'动态发现','badge'));
       if(item.research_status)name.append(el('p',researchStates[item.research_status],'subtle'));
       if(item.membership)name.append(el('span',item.membership==='CORE'?'固定关注':'动态发现','badge'));
@@ -1015,18 +1066,18 @@ function renderWatchlist(s){
       buy.append(el('strong',l?money(l.buy_low_cents)+' – '+money(l.buy_high_cents):'暂未形成'));
       sell.append(el('p',l?money(l.sell_cents)+' / '+money(l.stop_cents):'暂未形成'));
       if(p&&p.effective_status!=='ACTIVE')buy.append(el('p',label(p.effective_status)+' · 仅供回看','caution'));
-      decision.append(el('strong',v.title,v.ready?'ready':'caution'),el('p',p?'公司研究 '+shortTime(p.activated_at):item.membership==='DYNAMIC'?'公司研究尚未完成':item.discovery?'事件研究 '+shortTime(discovery.updated_at):'公司研究尚未开始','subtle'));
+      decision.append(el('strong',v.title,'decision-status '+(v.ready?'ready':'caution')),el('p',brief(v.reason),'decision-reason'),el('p',p?'公司研究 '+shortTime(p.activated_at):item.membership==='DYNAMIC'?'公司研究尚未完成':item.discovery?'事件研究 '+shortTime(discovery.updated_at):'公司研究尚未开始','subtle'));
       decision.append(el('p','组合买卖安排更新：'+(item.last_strategy_updated_at||discovery?.last_strategy_updated_at?shortTime(item.last_strategy_updated_at||discovery.last_strategy_updated_at):'尚未发布'),'subtle'));
-      row.className='watchlist-values';row.append(name,holding,quote,buy,sell,decision);
+      row.className='watchlist-values';[name,holding,quote,buy,sell,decision].forEach((cell,i)=>cell.dataset.label=['股票 / 资产','当前持仓','当前价 / 成本价','买入参考区间','卖出 / 止损参考','当前状态'][i]);row.append(name,holding,quote,buy,sell,decision);
       const summaryRow=el('tr',null,'watchlist-summary-row'),summaryCell=el('td');summaryCell.colSpan=6;
       const research=details('跟踪理由与研究摘要','watchlist-research:'+item.symbol);
-      if(item.membership)summaryCell.append(el('p',[(item.domains||[]).join('、'),item.reason||'固定关注'].filter(Boolean).join(' · ')+(item.review_at?' · 下次复核 '+shortTime(item.review_at):''),'subtle'));
+      if(item.membership)research.append(el('p',[(item.domains||[]).join('、'),item.reason||'固定关注'].filter(Boolean).join(' · ')+(item.review_at?' · 下次复核 '+shortTime(item.review_at):''),'subtle'));
       const thesis=(s.industry?.hypotheses||[]).filter(h=>h.symbol===item.symbol);
       for(const h of thesis)research.append(el('p',industryMethods[h.method]+'：'+h.payload.thesis),el('p','下一步核实：'+h.payload.next_check,'subtle'));
       const change=(s.industry?.history||[]).find(h=>h.symbol===item.symbol);if(change)research.append(el('p','最近名单变更 '+shortTime(change.at)+'：'+(change.reason||'状态已更新'),'subtle'));
-      research.append(pageLink('查看公司全部研究与历史','/stocks/'+item.symbol));
+      research.append(pageLink('查看公司全部研究与历史 →',stockPath(item.symbol)));
       research.append(el('p',overviewSummary(item,v),'watchlist-status-summary'));summaryRow.append(summaryCell);
-      if(!item.discovery)summaryCell.append(el('p',executionSummary(item,s.next_runs?.find(r=>r.kind==='slot')),'subtle'));
+      if(!item.discovery)research.append(el('p',executionSummary(item,s.next_runs?.find(r=>r.kind==='slot')),'subtle'));
       if(discovery){drawPoolStatus(research,discovery);drawObservationCauses(research,discovery);}summaryCell.append(research);
       const group=el('tbody');group.id='observed-'+item.symbol;group.tabIndex=-1;group.setAttribute('aria-label',item.name);group.append(row,summaryRow);t.append(group);
     }box.append(t);
@@ -1072,6 +1123,7 @@ async function loadInbox(){
 }
 function initPages(){
   const route=location.pathname,id=selectedSymbol?'stock-page':route==='/admin/feedback'?'admin-feedback-page':route==='/admin/settings'?'admin-settings-page':'home-page';$(id).hidden=false;$('opinion-board').hidden=route.startsWith('/admin/');if(route.startsWith('/admin/'))document.querySelector('.app-layout').classList.add('single-column');$('current-user').textContent=currentUser.role==='ADMIN'?'管理员':'访客';
+  if(selectedSymbol){const back=new URLSearchParams(location.search).get('return');if(back&&back.startsWith('#watchlist'))$('stock-back').href='/'+back;}
   $('logout').addEventListener('click',async()=>{try{await api.post('/api/logout',{});location.replace('/login');}catch(e){$('attention').textContent=e.message;$('attention').hidden=false;}});
   for(const [button,delta] of [['history-prev',-30],['history-next',30]])$(button).addEventListener('click',async()=>{historyOffset=Math.max(0,historyOffset+delta);try{await refreshStock();}catch(e){$('attention').hidden=false;$('attention').textContent=e.message;}});
   $('opinion-form').addEventListener('submit',async e=>{e.preventDefault();const b=e.currentTarget.querySelector('button');b.disabled=true;const body={page:selectedSymbol?'stock':'home',symbol:selectedSymbol||null,study_id:stockData?.stock.plan?.study_id||null,nickname:$('opinion-name').value,topic:$('opinion-topic').value,body:$('opinion-body').value};const signature=JSON.stringify([body.page,body.symbol,body.nickname,body.topic,body.body]);if(opinionAttempt?.signature!==signature)opinionAttempt={signature,id:crypto.randomUUID(),body};feedback('opinion-feedback','正在提交…','pending');try{await api.post('/api/feedback',{...opinionAttempt.body,request_id:opinionAttempt.id});$('opinion-body').value='';opinionAttempt=null;feedback('opinion-feedback','意见已送达，仅管理员可见。');}catch(e){feedback('opinion-feedback',e.message+' 再次提交不会重复保存同一条意见。','error');}finally{b.disabled=false;}});
