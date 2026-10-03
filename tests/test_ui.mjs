@@ -709,3 +709,22 @@ const dashboardMarkup=await readFile(new URL('../ashare/web/index.html',import.m
 assert.ok(dashboardMarkup.indexOf('id="score-diagnostics-section"')<dashboardMarkup.indexOf('id="proposal-section"'));
 assert.match(dashboardMarkup,/href="#score-diagnostics-section"/);
 console.log('Primary and five-day diagnostics remain separate, safe and read-only; maturity, source caveats, 30-cluster intervals and version disclosures passed.');
+
+// Historical summaries disclose their coverage and age; version IDs never imply chronology.
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,generated_at:'2000-01-01T00:00:00Z'});
+assert.match(JSON.stringify(diagnosticBox),/超过 48 小时未更新/);
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,generated_at:null});
+assert.match(JSON.stringify(diagnosticBox),/生成时间未提供/);
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,generated_at:'2999-01-01T00:00:00Z'});
+assert.match(JSON.stringify(diagnosticBox),/晚于当前时间/);
+const chronologicalDiagnostic={...diagnosticFixture,primary:{...diagnosticFixture.primary,
+  coverage:{scope:'ALL_HISTORY',registered_from:'2026-01-01T00:00:00Z',registered_through:'2026-03-01T00:00:00Z',scored_judgment_from:'2026-01-01T00:00:00Z',scored_judgment_through:'2026-02-01T00:00:00Z',observation_from:'2026-01-02',observation_through:'2026-02-28'},
+  by_build:{z_old:primaryGroups,a_new:primaryGroups},build_times:{z_old:{first_judgment_at:'2026-01-01T00:00:00Z',last_judgment_at:'2026-01-02T00:00:00Z'},a_new:{first_judgment_at:'2026-02-01T00:00:00Z',last_judgment_at:'2026-02-02T00:00:00Z'}}}};
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,chronologicalDiagnostic);
+const freshnessText=JSON.stringify(diagnosticBox);
+assert.match(freshnessText,/全历史累计/);assert.match(freshnessText,/已评分价格观察/);
+assert.ok(freshnessText.indexOf('程序版本：a_new')<freshnessText.indexOf('程序版本：z_old'));
+console.log('Diagnostic age, coverage and chronological build order passed.');
+
+await import('./test_macro_relevance_ui.mjs');
+await import('./test_review_relevance_ui.mjs');

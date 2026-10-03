@@ -413,72 +413,144 @@ function updateButtons() {
   });
   for(const id of ['save','toggle','dynamic-toggle'])if($(id)&&!$(id).dataset.saving)$(id).disabled=!connected||state?.deployment_role==='cloud';
 }
+function reviewDetails(title,key) {const d=details('',key);d.children[0].textContent=title;return d;}
+function reviewFreshness(r,at) {
+  const hours=(Date.parse(at)-Date.parse(r?.window_end))/3600000;
+  return Number.isFinite(hours)&&hours>36?'最近复盘截止于 '+when(r.window_end)+'，已超过36小时；以下为历史窗口，等待下一轮复盘。':'';
+}
+function drawReviewChecks(body,r) {
+  const summary=r.presentation?.checks,items=summary?.items||r.payload.consistency_checks||[];
+  const box=el('section',null,'review-checks');box.append(el('h3','程序核验'));
+  if(!items.length){box.append(el('p','本条旧记录没有可展示的程序检查，不能视为核验通过。','subtle'));body.append(box);return;}
+  const counts=summary?.counts||Object.fromEntries(['FAIL','INSUFFICIENT','PASS','NOT_APPLICABLE'].map(s=>[s,items.filter(c=>c.status===s).length]));
+  box.append(el('p','异常 '+(counts.FAIL||0)+' 项 · 缺少依据 '+(counts.INSUFFICIENT||0)+' 项 · 通过 '+(counts.PASS||0)+' 项 · 不适用 '+(counts.NOT_APPLICABLE||0)+' 项',(counts.FAIL||counts.INSUFFICIENT)?'caution':'subtle'));
+  if(counts.UNKNOWN)box.append(el('p','另有 '+counts.UNKNOWN+' 项状态待核对。','caution'));
+  const titles={CHECK_BUY_OUTSIDE_PLAN_BAND:'买入价格与计划区间',CHECK_BUY_WITH_PLAN_BLOCKERS:'买入时研究限制',CHECK_BUY_WITHOUT_PORTFOLIO_ALLOW:'买入时组合安排',CHECK_BUY_WHILE_HALTED:'熔断期间买入',CHECK_SELL_WITHOUT_REASON:'卖出依据',CHECK_EXECUTION_EVIDENCE:'成交依据完整性',CHECK_LATE_QUOTE_IN_REVIEW:'复盘报价是否事后补录',CHECK_SYNC_STALE:'云端账本同步',CHECK_OUTBOX_BACKLOG:'策略发布积压',CHECK_MODEL_IDENTITY:'模型版本一致性',CHECK_RESEARCH_FAILURE_RATE:'研究成功情况',CHECK_DISK_SPACE:'磁盘与数据库空间'};
+  const states={PASS:'通过',FAIL:'异常',INSUFFICIENT:'依据不足',NOT_APPLICABLE:'不适用'};
+  const list=details('查看核验项目与依据','review-checks:'+r.id);
+  for(const c of items.slice(0,24)){
+    const row=el('div',null,'review-check-row');row.append(proposalText('p',(titles[c.check]||c.check||'检查项待核对')+'：'+(states[c.status]||'状态待核对')+' · 检查 '+(c.checked??'未知')+' 项 / 异常 '+(c.failures??'未知')+' 项'));
+    if(c.detail)row.append(proposalText('p',c.detail,'subtle'));
+    for(const e of (c.examples||[]).slice(0,3)){
+      const parts=[e.symbol,e.position,e.route&&({watchlist:'自选股',global:'全球资产',dynamic:'动态研究'})[e.route],e.fill_id&&'成交 '+e.fill_id,e.reason,e.missing&&'缺少：'+e.missing,e.detail].filter(Boolean);
+      if(e.last_sync)parts.push(Object.keys(e.last_sync).length?'上次同步 '+when(e.last_sync.at)+' · '+(e.last_sync.status==='OK'?'成功':'未成功'):'尚无成功同步记录');
+      if(Number.isInteger(e.pending))parts.push('待发送 '+e.pending+' 份');
+      if(Number.isInteger(e.failed))parts.push('失败 '+e.failed+' / '+(e.total??'未知')+' 次');
+      if(Number.isFinite(e.free_gb))parts.push('磁盘可用 '+e.free_gb+' GB');
+      if(Number.isFinite(e.db_gb))parts.push('数据库 '+e.db_gb+' GB');
+      if(parts.length)row.append(proposalText('p',parts.join(' · '),'subtle'));
+    }
+    list.append(row);
+  }
+  if(summary?.omitted)list.append(el('p','另有 '+summary.omitted+' 项未显示，完整检查保留在本机复盘记录。','subtle'));
+  box.append(list,el('p','程序核验核对执行与数据；模型观点另列，不代表策略效果已得到验证。','subtle'));body.append(box);
+}
+function drawReviewFindings(body,r) {
+  const data=r.presentation?.findings;
+  if(!data){const lessons=r.payload.analysis?.lessons||[];if(lessons.length){const d=details('本次发现（旧记录，去向待核对）','lessons:'+r.id);for(const l of lessons.slice(0,5))d.append(proposalText('p',l.lesson));if(lessons.length>5)d.append(el('p','仅展示前5条，完整发现保留在本机。','subtle'));body.append(d);}return;}
+  if(!data.items?.length)return;
+  const section=el('section',null,'review-findings');section.append(el('h3','发现与跟进'));
+  const states={OPEN:'待处理',RESOLVED:'已解决',WONTFIX:'已记录不修复',DRAFT:'待整理草稿',READY:'待审查与决定',APPROVED:'已批准',ADOPTED:'已上线跟踪',REJECTED:'已驳回',RETIRED:'已退役',SUPERSEDED:'已被新版替代',UNKNOWN:'去向待核对'};
+  const current=data.items.filter(x=>x.current),history=data.items.filter(x=>!x.current);
+  function row(item,parent){const d=reviewDetails(proposalExcerpt(item.lesson,96)+' · '+(states[item.status]||'状态待核对'),'finding:'+r.id+':'+item.ordinal);d.append(proposalText('p',item.lesson));if(item.applicability)d.append(proposalText('p','待验证条件：'+item.applicability));
+    if(item.id)d.append(proposalText('p',(item.to==='engineering_issue'?'工程问题：':'改进提案：')+item.id+' · '+(states[item.status]||'状态待核对')));
+    if(item.updated_at)d.append(el('p','去向最近更新 '+when(item.updated_at),'subtle'));
+    if(item.expired)d.append(el('p','该发现已超过30日展示期限，仅供追溯；后续以对应问题或提案的当前状态为准。','subtle'));
+    else if(item.expires_at)d.append(el('p','本条发现展示至 '+when(item.expires_at)+'，期间若已处理会移入历史。','subtle'));
+    parent.append(d);}
+  current.slice(0,3).forEach(x=>row(x,section));
+  const rest=current.slice(3).concat(history);if(rest.length){const d=details('其他及历史发现（'+rest.length+' 条）','review-findings-history:'+r.id);rest.forEach(x=>row(x,d));section.append(d);}
+  if(data.omitted)section.append(el('p','另有 '+data.omitted+' 条发现保留在本机记录。','subtle'));
+  section.append(el('p','复盘发现只生成工程问题或提案草稿，不会直接进入研究规则。','subtle'));body.append(section);
+}
 function drawDailyReview(body,r) {
-  const facts=r.payload.facts,analysis=r.payload.analysis||{},p=facts.portfolio;
-  body.append(el('p',shortTime(r.window_start)+' — '+shortTime(r.window_end),'subtle'));
+  const facts=r.payload.facts||{},analysis=r.payload.analysis||{},p=facts.portfolio;
+  const daily=r.presentation?.daily||facts.daily_accounting||facts.daily_portfolio||(!facts.context_48h?p:null),context=r.presentation?.context||facts.context_48h;
+  body.append(el('p','24小时核算窗口：'+when(r.window_start)+' — '+when(r.window_end),'subtle'));
+  const freshness=reviewFreshness(r,state?.at||r.presentation?.status_at||new Date().toISOString());if(freshness)body.append(el('p',freshness,'caution'));
   if(p){
-    if(facts.daily_accounting)body.append(el('p','本日24小时盈亏 '+signed(facts.daily_accounting.totals.period_profit_cents)+' 元 · 以下逐仓回看前48小时。','subtle'));
-    const t=p.totals,metrics=el('div',null,'review-metrics');
-    for(const [title,value] of [[facts.context_48h?'48小时盈亏':'本期盈亏',t.period_profit_cents],['截止累计盈亏',t.cumulative_profit_cents],['持仓浮动盈亏',p.closing.unrealized_cents],['累计已实现',p.closing.cumulative_realized_cents]]){
+    const t=daily?.totals,closing=daily?.closing||p.closing||{},metrics=el('div',null,'review-metrics');
+    const cumulative=daily?.totals?.cumulative_profit_cents??p.totals?.cumulative_profit_cents;
+    for(const [title,value] of [['本期盈亏（24小时持仓）',t?.period_profit_cents],['截止累计盈亏（持仓口径）',cumulative],['截止持仓浮动盈亏',closing.unrealized_cents],['累计已实现（成交）',closing.cumulative_realized_cents]]){
       const metric=el('div');metric.append(el('span',title,'subtle'),el('strong',signed(value)+' 元',value>0?'profit':value<0?'loss':''));metrics.append(metric);
     }
-    body.append(metrics,el('p','截止持有 '+t.holding_count+' 个标的 · 复盘 '+t.reviewed_position_count+' 个标的（含期间平仓） · 本期 '+t.period_fill_count+' 笔成交','subtle'));
-    if(!p.opening.valuation_complete||!p.closing.valuation_complete)body.append(el('p','部分报价缺失、过时或未到收盘；相关盈亏可能不完整，请结合各仓行情时间阅读。','attention'));
-    if(p.positions.some(x=>x.opening.late_quote||x.closing.late_quote))body.append(el('p','本版含事后补齐的历史行情，按行情发生时间重算；这些价格不代表当时决策已知。','subtle'));
-    if(analysis.summary)body.append(el('p',analysis.summary,'review-summary'));
+    body.append(metrics,el('p','上述持仓损益已计成交费用，不含现金分红；不能与含分红的账户累计收益直接对照。','subtle'));
+    if(!daily)body.append(el('p','这份旧记录未提供独立24小时核算；不能用48小时金额代替。','caution'));
+    const dividendKnown=daily?.dividends_known??Object.prototype.hasOwnProperty.call(daily||{},'dividends');
+    if(dividendKnown){const cash=daily.dividend_cents??(daily.dividends||[]).reduce((n,x)=>n+(Number.isFinite(x.amount_cents)?x.amount_cents:0),0);body.append(el('p','24小时已入账现金分红 '+signed(cash)+' 元（另计）。除息造成的价格调整须结合分红阅读。','subtle'));}
+    else body.append(el('p','本条记录未展示现金分红明细，需结合账户与分红记录核对。','subtle'));
+    body.append(el('p','截止持有 '+(p.totals?.holding_count??'未知')+' 个标的 · 24小时 '+(t?.period_fill_count??'未知')+' 笔成交','subtle'));
+    if(!p.opening?.valuation_complete||!p.closing?.valuation_complete||daily?.opening?.valuation_complete===false||daily?.closing?.valuation_complete===false)body.append(el('p','部分报价缺失、过时或未到收盘；相关盈亏可能不完整，请结合各仓行情时间阅读。','attention'));
+    if((p.positions||[]).some(x=>x.opening?.late_quote||x.closing?.late_quote))body.append(el('p','本版含事后补齐的历史行情，按行情发生时间重算；这些价格不代表当时决策已知。','subtle'));
+    if(context)body.append(el('p','研究回看前48小时：'+when(context.window_start)+' — '+when(context.window_end)+' · 持仓损益 '+signed(context.totals?.period_profit_cents)+' 元。滚动窗口会重叠，不能逐日相加。','subtle'));
+    drawReviewChecks(body,r);
+    if(analysis.summary){const d=details('模型复盘摘要（待验证）','review-summary:'+r.id);d.append(proposalText('p',analysis.summary,'review-summary'));body.append(d);}
     const verdicts={SUPPORTED:'观点获得支持',CONTRADICTED:'观点已被反证',MIXED:'部分支持，部分反证',PENDING:'仍待验证',INSUFFICIENT:'研究依据不足'};
     const qualities={RECENT:'截止前有效报价',CLOSE:'收盘后报价',INTRADAY_LAST:'盘中末次报价',STALE:'历史旧报价',MISSING:'报价缺失',NO_POSITION:'已无持仓'};
-    for(const position of p.positions){
-      const c=position.closing,a=(analysis.positions||[]).find(x=>x.position_key===position.key),card=el('article',null,'review-position');
-      const head=el('div',null,'section-head');head.append(el('h3',position.name+' · '+position.symbol),el('span',a?verdicts[a.verdict]:'逐仓分析待补齐','badge'));card.append(head);
-      card.append(el('p','截止 '+(c.qty/(c.qty_scale||1)).toLocaleString('zh-CN',{maximumFractionDigits:8})+' 股 / 份 · 买入均价 '+costPrice(c.average_cost_cents)+' 元 · 截止报价 '+money(c.price_cents)+' 元','subtle'));
-      card.append(el('p','本期 '+signed(position.period_profit_cents)+' 元 · 浮动 '+signed(c.unrealized_cents)+' 元 · 累计已实现 '+signed(position.cumulative_realized_cents)+' 元'));
-      if(c.qty)card.append(el('p',(qualities[c.quality]||c.quality)+' '+(c.quote_at?shortTime(c.quote_at):'')+(c.late_quote?' · 补录于 '+shortTime(c.quote_first_seen_at):''),'subtle'));
-      if(a){card.append(el('p',a.reason));addList(card,'获得支持',a.supported_points);addList(card,'被反证',a.contradicted_points);addList(card,'仍待验证',a.pending_points);card.append(el('p','下一步验证：'+a.next_check));}
-      const records=(p.research||[]).filter(x=>position.research_ids.includes(x.id));
-      if(records.length){const d=details('核对当时研究','review-research:'+r.id+':'+position.key);for(const record of records){
-        d.append(el('h4',(record.role==='ENTRY'?'买入依据':'截止前跟踪研究')+' · '+shortTime(record.at)));
-        const source=record.analysis||{},decision=source.decision||{};
-        d.append(el('p',source.analysis||source.mechanism||record.plan?.thesis||'原始研究未提供文字摘要。'));
-        if(decision.trigger)d.append(el('p','触发条件：'+decision.trigger));if(decision.invalidation)d.append(el('p','反证条件：'+decision.invalidation));
-      }card.append(d);}body.append(card);
+    const positions=p.positions||[],extra=details('其余持仓回看（'+Math.max(0,Math.min(positions.length,20)-3)+' 个）','review-positions:'+r.id);
+    for(const [index,position] of positions.slice(0,20).entries()){
+      const c=position.closing||{},a=(analysis.positions||[]).find(x=>x.position_key===position.key),card=el('article',null,'review-position');
+      const head=el('div',null,'section-head');head.append(el('h3',position.name+' · '+position.symbol),el('span',a?'模型：'+(verdicts[a.verdict]||'结论待核对'):'模型分析待补齐','badge'));card.append(head);
+      card.append(el('p',(context?'48小时持仓损益 ':'本期持仓损益 ')+signed(position.period_profit_cents)+' 元 · 截止浮动 '+signed(c.unrealized_cents)+' 元'));
+      if(c.qty)card.append(el('p',(qualities[c.quality]||c.quality||'行情待核对')+' '+(c.quote_at?when(c.quote_at):'')+(c.late_quote?' · 补录于 '+when(c.quote_first_seen_at):''),'subtle'));
+      if(a?.next_check)card.append(proposalText('p','模型建议下次核对：'+proposalExcerpt(a.next_check,180),'review-next-check'));
+      const detail=details('持仓事实与模型依据','review-position:'+r.id+':'+position.key);
+      detail.append(el('p','截止 '+((c.qty||0)/(c.qty_scale||1)).toLocaleString('zh-CN',{maximumFractionDigits:8})+' 股 / 份 · 买入均价 '+costPrice(c.average_cost_cents)+' 元 · 截止报价 '+money(c.price_cents)+' 元','subtle'),el('p','累计已实现（成交） '+signed(position.cumulative_realized_cents)+' 元'));
+      if(a){detail.append(proposalText('p','模型判断：'+a.reason));addList(detail,'模型认为获得支持',a.supported_points);addList(detail,'模型认为被反证',a.contradicted_points);addList(detail,'仍待验证',a.pending_points);if(a.next_check?.length>180)detail.append(proposalText('p','完整下次核对事项：'+a.next_check));}
+      const records=(p.research||[]).filter(x=>(position.research_ids||[]).includes(x.id));
+      if(records.length){const d=details('核对当时研究（'+records.length+' 份）','review-research:'+r.id+':'+position.key);for(const record of records.slice(0,8)){
+        d.append(el('h4',(record.role==='ENTRY'?'买入依据':'截止前跟踪研究')+' · '+when(record.at)));
+        const source=record.analysis||{},decision=source.decision||{};d.append(proposalText('p',proposalExcerpt(source.analysis||source.mechanism||record.plan?.thesis||'原始研究未提供文字摘要。',1200)));
+        if(decision.trigger)d.append(proposalText('p','触发条件：'+decision.trigger));if(decision.invalidation)d.append(proposalText('p','反证条件：'+decision.invalidation));
+      }if(records.length>8)d.append(el('p','页面保留8份研究摘要，其余记录可在本机复盘材料追溯。','subtle'));detail.append(d);}
+      card.append(detail);(index<3?body:extra).append(card);
     }
-    body.append(el('p','本期盈亏 = 本期已实现 + 期末浮动 − 期初浮动，已计成交费用。短期盈亏不足以单独证明研究有效。','subtle'));
+    if(positions.length>3)body.append(extra);if(positions.length>20)body.append(el('p','页面展示20个持仓摘要，另有 '+(positions.length-20)+' 个保留在本机完整复盘。','subtle'));
+    body.append(el('p','持仓损益 = 期内已实现 + 期末浮动 − 期初浮动，已计成交费用。短期盈亏不足以单独证明研究有效。','subtle'));
   }else{
-    const stats=facts.statistics||{};
-    body.append(el('p',analysis.summary||'旧版仅保存交易统计。'),el('p',(stats.fill_count||0)+' 笔成交 · 已实现 '+signed(stats.realized_pnl_cents)+' 元','subtle'));
+    const stats=facts.statistics||{};body.append(el('p','旧版仅保存交易统计，不能据此还原全仓收益。','subtle'),el('p',(stats.fill_count||0)+' 笔成交 · 已实现 '+signed(stats.realized_pnl_cents)+' 元','subtle'));drawReviewChecks(body,r);
+    if(analysis.summary){const d=details('旧版模型摘要','review-summary:'+r.id);d.append(proposalText('p',analysis.summary));body.append(d);}
   }
-  if(facts.context_48h){const c=facts.context_48h,d=details('前48小时持仓回看','review-48:'+r.id);d.append(el('p',shortTime(c.window_start)+' — '+shortTime(c.window_end),'subtle'),el('p','48小时盈亏 '+signed(c.totals.period_profit_cents)+' 元 · '+c.positions.length+' 个标的'));c.positions.forEach(x=>d.append(el('p',x.name+' · '+signed(x.period_profit_cents)+' 元')));d.append(el('p','滚动窗口可能重叠，每日收益按上方24小时单独统计。','subtle'));body.append(d);}
   if(r.model_status==='DEFERRED')body.append(el('p','盈亏事实已保存，逐仓分析尚未完成。'+(readableError(r.payload.analysis_error)||'研究服务未能完成本次分析。')+(r.automatic_retries_remaining?'系统会在空闲时重试，最多剩余 '+r.automatic_retries_remaining+' 次。':'可点击“更新复盘”重试最新周期。'),'attention'));
   else if(r.model_status==='NOT_RUN')body.append(el('p','盈亏核算已完成，模型分析尚未运行。','subtle'));
-  const lessons=analysis.lessons||[];if(lessons.length){const d=details('本次经验（待验证）','lessons:'+r.id);lessons.forEach(l=>d.append(el('p',l.lesson)));body.append(d);}
-  body.append(el('p','第 '+r.revision+' 版 · 生成于 '+shortTime(r.ready_at),'subtle'));
+  drawReviewFindings(body,r);
+  body.append(el('p','第 '+r.revision+' 版 · 生成于 '+when(r.ready_at),'subtle'));
 }
 function supervisionLabel(item) {
   const status={PENDING:'待审查',RUNNING:'审查中',DEFERRED:'待审查 · 等待重试',STALE:'材料已变化 · 旧结论仅供追溯'};
   if(item.status!=='SUCCEEDED')return status[item.status]||'待审查';
-  const verdict={RECOMMEND:'建议通过',REVISE:'退回修改建议',INSUFFICIENT:'证据不足',REJECT:'建议驳回'};
+  const verdict={RECOMMEND:'建议通过（非批准）',REVISE:'退回修改建议',INSUFFICIENT:'证据不足',REJECT:'建议驳回'};
   return '已审查 · '+(verdict[item.verdict]||'已记录')+(item.approval==='WAITING_USER'?' · 等待你批准':'');
 }
 function drawSupervision(box,data) {
-  const items=data?.items||[];
+  const items=(data?.items||[]).slice(0,30),current=items.filter(x=>x.status!=='STALE'&&x.display_bucket!=='HISTORY'),history=items.filter(x=>x.status==='STALE'||x.display_bucket==='HISTORY');
   if(!items.length)box.append(el('p','评估批次或完整提案形成后自动排队审查。','subtle'));
-  for(const error of data?.discovery?.errors||[])box.append(el('p','材料待核实：'+error,'caution'));
-  for(const item of items){
-    const row=el('article',null,'review');
-    row.append(el('h3',item.title),el('p',supervisionLabel(item),item.status==='DEFERRED'?'caution':'subtle'));
-    if(item.summary)row.append(el('p',traderText(item.summary)));
-    if(item.error)row.append(el('p',readableError(item.error),'caution'));
-    if(item.status==='DEFERRED')row.append(el('p',item.attempts>=3?'自动重试已用完，待人工核查。':'下次重试不早于 '+shortTime(item.next_attempt_at),'subtle'));
-    row.append(el('p',({BATCH:'运行与评估',PROPOSAL:'方案审查',FOLLOWUP:'上线后复核'})[item.kind]+' · '+(item.reviewer==='chatgpt'?'ChatGPT':item.reviewer)+' · '+shortTime(item.finished_at||item.created_at),'subtle'));
-    const d=details('查看审查依据','supervision:'+item.id);
-    for(const c of item.result?.checks||[])d.append(el('p',({evidence:'证据',version:'版本对应',attribution:'效果归因',counterexamples:'反证',validation:'检验方案',risk:'风险边界'})[c.id]+'：'+c.reason));
-    for(const c of item.result?.counterexamples||[])d.append(el('p','可能推翻结论：'+c));
-    for(const step of item.result?.next_steps||[])d.append(el('p','后续：'+step));
-    d.append(el('p','本次审查针对提交时保存的材料，后续材料变化后需重新核对。','subtle'));
-    if(item.batch_id)d.append(el('p','包含当期运行与效果评估记录。','subtle'));
-    row.append(d);box.append(row);
+  for(const error of (data?.discovery?.errors||[]).slice(0,3))box.append(el('p','材料待核实：'+error,'caution'));
+  if((data?.discovery?.error_count||data?.discovery?.errors?.length||0)>3)box.append(el('p','还有其他材料待核实，完整原因可在本机监督记录查看。','subtle'));
+  if(items.length)box.append(el('p','页面展示 '+items.length+' / '+(data?.reviews_total??items.length)+' 条审查 · 每个对象优先最近一次。','subtle'));
+  function draw(item,parent,compact=false){
+    const row=el('article',null,'review supervision-card');row.append(proposalText('h3',proposalExcerpt(item.title||item.subject_id||'审查事项',100)),el('p',supervisionLabel(item),item.status==='DEFERRED'?'caution':'subtle'));
+    const stale=item.status==='STALE';
+    if(!stale&&item.summary)row.append(proposalText('p',proposalExcerpt(item.summary,240)));
+    if(!stale&&item.error)row.append(el('p',readableError(item.error),'caution'));
+    if(item.status==='DEFERRED')row.append(el('p',item.attempts>=3?'自动重试已用完，待人工核查。':'下次重试不早于 '+when(item.next_attempt_at),'subtle'));
+    row.append(el('p',(({BATCH:'运行与评估',PROPOSAL:'方案审查',FOLLOWUP:'上线后复核'})[item.kind]||'审查')+' · '+(item.reviewer==='chatgpt'?'ChatGPT':item.reviewer||'审查员')+' · '+when(item.finished_at||item.created_at),'subtle'));
+    const d=details(stale?'查看失效记录标识':'查看审查依据与下一步','supervision:'+item.id);d.append(proposalText('p','审查编号：'+item.id));
+    if(stale)d.append(el('p','材料已变化，原建议不再作为当前行动依据。完整旧结论保留在本机供追溯。','subtle'));
+    else{
+      if(item.summary?.length>240)d.append(proposalText('p',item.summary));
+      for(const c of (item.result?.checks||[]).slice(0,6))d.append(proposalText('p',(({evidence:'证据',version:'版本对应',attribution:'效果归因',counterexamples:'反证',validation:'检验方案',risk:'风险边界'})[c.id]||'核对')+'：'+c.reason));
+      for(const c of (item.result?.counterexamples||[]).slice(0,5))d.append(proposalText('p','可能推翻结论：'+c));
+      for(const step of (item.result?.next_steps||[]).slice(0,5))d.append(proposalText('p',(compact?'历史建议：':'后续建议：')+step));
+      d.append(el('p','本次审查针对提交时保存的材料，后续材料变化后需重新核对。监督建议不等于用户批准。','subtle'));
+    }
+    row.append(d);parent.append(row);
   }
+  current.slice(0,3).forEach(item=>draw(item,box));
+  if(current.length>3){const d=details('其他当前审查（'+(current.length-3)+' 条）','supervision:more');current.slice(3).forEach(item=>{const entry=reviewDetails(proposalExcerpt(item.title||item.subject_id,90)+' · '+supervisionLabel(item),'supervision-entry:'+item.id);draw(item,entry);d.append(entry);});box.append(d);}
+  if(history.length){const d=details('历史及失效审查（'+history.length+' 条）','supervision:history');history.forEach(item=>{const entry=reviewDetails(proposalExcerpt(item.title||item.subject_id,90)+' · '+supervisionLabel(item),'supervision-entry:'+item.id);draw(item,entry,true);d.append(entry);});box.append(d);}
+  const omitted=Math.max(0,data?.reviews_omitted||0)+(Math.max(0,(data?.items?.length||0)-30));
+  if(omitted)box.append(el('p','另有 '+omitted+' 条历史或未列出记录保留在本机，可按审查编号继续核对。页面不删除记录。','subtle'));
 }
 function proposalReviewLabel(review) {
   if(!review)return '尚未提交监督审查';
@@ -547,14 +619,18 @@ function proposalExperimentText(experiment) {
 function drawProposals(box,data) {
   if(!data){box.append(el('p','提案摘要尚未同步。服务更新并同步后会在这里显示。','empty'));return;}
   if(data.error)box.append(proposalText('p','提案摘要暂未读取成功：'+data.error,'caution'));
-  const items=Array.isArray(data.items)?data.items:[];
+  const all=Array.isArray(data.items)?data.items:[],items=all.slice(0,20);
   if(!items.length){box.append(el('p',data.error?'稍后刷新查看提案摘要；暂不能确认是否存在提案。':'当前没有改进提案。复盘或评估形成候选后，会在这里显示证据、检验方案和监督进度。','empty'));return;}
-  box.append(el('p','显示 '+items.length+' / '+(Number.isFinite(data.total)?data.total:items.length)+' 份提案 · 可在 ChatGPT 中引用提案编号继续讨论。','subtle'));
-  for(const item of items){
+  box.append(el('p','显示 '+items.length+' / '+(Number.isFinite(data.total)?data.total:all.length)+' 份提案 · 可在 ChatGPT 中引用提案编号继续讨论。','subtle'));
+  const historical=x=>x.display_bucket==='HISTORY'||['REJECTED','RETIRED','SUPERSEDED'].includes(x.status);
+  const current=items.filter(x=>!historical(x)&&!x.observation_only),observations=items.filter(x=>!historical(x)&&x.observation_only),history=items.filter(historical);
+  function draw(item,target){
     const card=el('article',null,'proposal-card'),head=el('div',null,'proposal-head');
     const state={DRAFT:'草稿',READY:'待审查与决定',APPROVED:'已批准',ADOPTED:'已采纳',REJECTED:'已驳回',RETIRED:'已退役',SUPERSEDED:'已被新版替代'}[item.status]||'状态待核对';
-    head.append(proposalText('h3',item.title||'未命名提案'),el('span',state,'badge proposal-status'));
-    card.append(head,proposalText('p',(item.id||'编号待补齐')+' · '+shortTime(item.created_at),'subtle proposal-id'));
+    head.append(proposalText('h3',proposalExcerpt(item.title||'未命名提案',100)),el('span',state,'badge proposal-status'));
+    card.append(head,proposalText('p',(item.id||'编号待补齐')+' · '+when(item.created_at),'subtle proposal-id'));
+    if(item.progress_at)card.append(el('p','最近验证证据或状态进展 '+when(item.progress_at),'subtle'));
+    if(item.display_reason)card.append(proposalText('p',item.display_reason,'subtle'));
     const overview=el('div',null,'proposal-overview'),evidence=item.evidence||{},review=item.supervision;
     proposalField(overview,'计划改动',proposalExcerpt(item.change,180),'尚未说明具体改动。');
     proposalField(overview,'证据摘要',proposalExcerpt(evidence.text),'尚未整理可用的证据摘要。');
@@ -567,6 +643,7 @@ function drawProposals(box,data) {
     const next=typeof item.next_step==='string'&&item.next_step.trim()?item.next_step:item.status==='DRAFT'?'继续整理证据与检验方案，完成后再提交审查。':'核对提案材料与监督状态，策略变更仍需明确批准。';
     card.append(proposalText('p','下一步：'+next,'proposal-next'));
     const detail=details('查看证据、检验方案与监督详情','proposal:'+item.id),body=el('div',null,'proposal-detail');
+    proposalField(body,'完整标题',item.title);
     proposalField(body,'具体改动',item.change);
     proposalField(body,'要验证的判断',item.hypothesis);
     const scope=item.applicability||{},scopeParts=[];
@@ -592,8 +669,16 @@ function drawProposals(box,data) {
     if(review?.id)supervision.append(proposalText('p','审查编号：'+review.id,'subtle'));
     if(review?.summary&&review.current!==false&&review.status!=='STALE')supervision.append(proposalText('p',review.summary));
     supervision.append(el('p','监督建议不等于批准。策略变更仍需 Dean 明确确认，之后才能实施。','subtle'));body.append(supervision);
-    detail.append(body);card.append(detail);box.append(card);
+    detail.append(body);card.append(detail);target.append(card);
   }
+  function rows(list,parent){for(const item of list){const d=reviewDetails(proposalExcerpt(item.title||'未命名提案',90)+' · '+(item.id||''),'proposal-entry:'+item.id);draw(item,d);parent.append(d);}}
+  current.slice(0,3).forEach(item=>draw(item,box));
+  if(current.length>3){const d=details('其他当前提案（'+(current.length-3)+' 份）','proposals:more');rows(current.slice(3),d);box.append(d);}
+  if(observations.length){const d=details('待整理的复盘观察（'+observations.length+' 份）','proposals:observations');d.append(el('p','这些是尚未形成完整检验方案的观察；重复叙述不算新的验证证据。','subtle'));rows(observations,d);box.append(d);}
+  if(history.length){const d=details('历史提案（本页 '+history.length+' 份）','proposals:history');rows(history,d);box.append(d);}
+  const omitted=Math.max(0,(data.total??all.length)-items.length);
+  if(omitted)box.append(el('p','另有 '+omitted+' 份未在本页列出。完整提案、历史版本和证据保留在本机，可按提案编号继续核对。','subtle'));
+  if(data.selection_notice)box.append(proposalText('p',data.selection_notice,'subtle'));
 }
 function diagnosticCount(value) {return Number.isInteger(value)&&value>=0?String(value):'待核对';}
 function diagnosticBps(value) {return Number.isFinite(value)?(value>0?'+':'')+value.toFixed(1)+' 基点':'尚无可用统计';}
@@ -627,6 +712,19 @@ function drawDiagnosticGroups(box,groups) {
   }
   if(!shown)box.append(el('p','尚无到期可评分样本；等待观察期结束并取得所需行情。','empty'));
 }
+function diagnosticTimeRange(start,end,dateOnly=false) {
+  const readable=value=>typeof value==='string'&&Number.isFinite(Date.parse(value))?(dateOnly?value.slice(0,10):when(value)):'未提供';
+  return readable(start)+' 至 '+readable(end);
+}
+function drawDiagnosticCoverage(box,coverage) {
+  box.append(el('p','统计范围：全历史累计，非最近 5 日新增样本。','diagnostic-scope'));
+  if(!coverage||coverage.scope!=='ALL_HISTORY'){
+    box.append(el('p','该摘要尚未提供覆盖日期，等待下一次评估更新；不能据此判断近期效果。','diagnostic-caution'));return;
+  }
+  box.append(el('p','登记判断：'+diagnosticTimeRange(coverage.registered_from,coverage.registered_through)+'；已评分判断：'+diagnosticTimeRange(coverage.scored_judgment_from,coverage.scored_judgment_through)+'。','subtle'));
+  box.append(el('p','已评分价格观察：'+diagnosticTimeRange(coverage.observation_from,coverage.observation_through,true)+'。覆盖日期描述记录跨度，不表示期间每天都有样本。','subtle'));
+  if(typeof coverage.last_scored_at==='string'&&Number.isFinite(Date.parse(coverage.last_scored_at)))box.append(el('p','最近新增到期评分：'+when(coverage.last_scored_at)+'（北京时间）。','subtle'));
+}
 function drawDiagnosticTrack(box,data,auxiliary) {
   const section=el('section',null,'diagnostic-track'+(auxiliary?' diagnostic-auxiliary':''));
   section.append(el('h3',auxiliary?'5 日辅助诊断':'原评分记录'),el('span',auxiliary?'仅供诊断 · 不参与批准':'保留原评分口径','badge'));
@@ -637,6 +735,7 @@ function drawDiagnosticTrack(box,data,auxiliary) {
     section.append(el('p','辅助诊断口径待核对，暂不展示统计结果。','caution'));box.append(section);return;
   }
   section.append(proposalText('p',auxiliary?'在 5 个交易日／观测日线窗口查看短期价格变化；不含交易费用与汇率影响，不代表策略有效。':'股票采用原定 '+diagnosticCount(data.horizon_days)+' 个交易日口径；全球资产保留各自的原观察期限。','diagnostic-scope'));
+  drawDiagnosticCoverage(section,data.coverage);
   if(typeof data.notice==='string'&&data.notice)section.append(proposalText('p',data.notice,'diagnostic-notice'));
   const routes={watchlist:'自选股',portfolio:'组合',global:'全球资产',dynamic:'动态研究'},states={OPEN:'待成熟或补齐行情',SCORED:'已评分',UNSCORABLE:'暂不可评分',EXCLUDED:'已排除'};
   const counts=el('div',null,'diagnostic-counts');
@@ -658,10 +757,17 @@ function drawDiagnosticTrack(box,data,auxiliary) {
     drawDiagnosticGroups(groupDetails,data.groups);section.append(groupDetails);
   }else drawDiagnosticGroups(section,data.groups);
   const builds=Object.entries(data.by_build&&typeof data.by_build==='object'?data.by_build:{});
+  const buildTime=build=>{const time=Date.parse(data.build_times?.[build]?.last_judgment_at);return Number.isFinite(time)?time:0;};
+  builds.sort(([left],[right])=>buildTime(right)-buildTime(left));
   if(builds.length){
     const versionDetails=details('按程序版本查看（'+builds.length+' 个）','diagnostics:'+(auxiliary?'quick':'primary'));
+    const dated=builds.every(([build])=>Number.isFinite(Date.parse(data.build_times?.[build]?.last_judgment_at)));
+    versionDetails.append(el('p',dated?'按已评分判断的最新时间排列；展示最近版本，完整历史保留在本机。':'部分旧摘要缺少版本覆盖时间，当前顺序不能代表版本新旧。','subtle'));
     for(const [build,groups] of builds){
-      const version=el('section',null,'diagnostic-build');version.append(proposalText('h4','程序版本：'+build));drawDiagnosticGroups(version,groups);versionDetails.append(version);
+      const version=el('section',null,'diagnostic-build');version.append(proposalText('h4','程序版本：'+build));
+      const timing=data.build_times?.[build];
+      if(timing)version.append(el('p','已评分判断覆盖：'+diagnosticTimeRange(timing.first_judgment_at,timing.last_judgment_at)+'。','subtle'));
+      drawDiagnosticGroups(version,groups);versionDetails.append(version);
     }
     section.append(versionDetails);
   }
@@ -673,15 +779,20 @@ function drawScoreDiagnostics(box,data) {
   if(data.status==='ERROR'){box.append(el('p','评分诊断暂未生成成功；原评分记录保留，等待后续评估与同步。','caution'));return;}
   if(data.status==='NOT_RUN'){box.append(el('p','尚未运行本轮评分诊断，等待下一次评估；暂无辅助诊断结果。','empty'));return;}
   if(data.status!=='READY'||data.version!=='quick-diagnostics-v1'){box.append(el('p','评分诊断格式待核对，暂不展示统计结果。','caution'));return;}
-  if(typeof data.generated_at==='string'&&Number.isFinite(Date.parse(data.generated_at)))box.append(el('p','最近生成：'+when(data.generated_at)+'（北京时间）','subtle'));
+  const generated=typeof data.generated_at==='string'?Date.parse(data.generated_at):NaN;
+  if(Number.isFinite(generated)){
+    box.append(el('p','最近生成：'+when(data.generated_at)+'（北京时间）','subtle'));
+    if(Date.now()-generated>48*3600000)box.append(el('p','统计摘要已超过 48 小时未更新，仅代表当时记录；待下一次评估与同步后再核对近期变化。','diagnostic-caution'));
+    else if(generated-Date.now()>5*60000)box.append(el('p','摘要生成时间晚于当前时间，请核对时钟；暂不能确认统计时效。','diagnostic-caution'));
+  }else box.append(el('p','摘要生成时间未提供，暂不能确认统计时效。','diagnostic-caution'));
   if(typeof data.notice==='string'&&data.notice)box.append(proposalText('p',data.notice,'diagnostic-notice'));
   const tracks=el('div',null,'diagnostic-tracks');drawDiagnosticTrack(tracks,data.primary,false);drawDiagnosticTrack(tracks,data.quick,true);box.append(tracks);
-  if(Number.isInteger(data.omitted_builds)&&data.omitted_builds>0)box.append(el('p','页面另有 '+data.omitted_builds+' 个版本分组未展开；完整记录可在本机核对。','subtle'));
+  if(Number.isInteger(data.omitted_builds)&&data.omitted_builds>0)box.append(el('p','页面另有 '+data.omitted_builds+' 个版本分组未载入；完整记录保留在本机，汇总仍覆盖全历史。','subtle'));
 }
 function renderActivity(s) {
   if($('supervision'))renderChanged('supervision',s.supervision||{items:[]},box=>drawSupervision(box,s.supervision));
   if($('proposals'))renderChanged('proposals',s.supervision?.proposals??null,box=>drawProposals(box,s.supervision?.proposals));
-  if($('score-diagnostics'))renderChanged('score-diagnostics',s.supervision?.diagnostics??null,box=>drawScoreDiagnostics(box,s.supervision?.diagnostics));
+  if($('score-diagnostics'))renderChanged('score-diagnostics',{data:s.supervision?.diagnostics??null,hour:Math.floor(Date.parse(s.at)/3600000)},box=>drawScoreDiagnostics(box,s.supervision?.diagnostics));
   const market=s.market_phase==='CONTINUOUS';
   const nextSlot=s.next_runs.find(r=>r.kind==='slot');
   $('slot-timing').textContent=(market?'交易时段':'当前休市')+(nextSlot?' · 下次检查 '+shortTime(nextSlot.scheduled_at):'');
@@ -693,11 +804,13 @@ function renderActivity(s) {
   });
   table('decisions',['时间','股票 / 操作','提交结果','依据'],s.decisions.map(d=>[shortTime(d.at),d.symbol+' '+label(d.action),label(d.status),decisionReason(d.reason)]));
   table('fills',['时间','股票 / 方向','股数 / 均价','费用 / 已实现盈亏'],s.fills.map(f=>[shortTime(f.occurred_at),f.symbol+' '+label(f.side),f.qty+' / '+money(f.price_cents),money(f.fee_cents)+' / '+(f.side==='SELL'?signed(f.realized_cents):'尚未卖出')]));
-  renderChanged('reviews',s.reviews,box=>{
+  renderChanged('reviews',{items:s.reviews,hour:Math.floor(Date.parse(s.at)/3600000)},box=>{
     if(!s.reviews.length){box.append(el('p','还没有复盘记录，首次复盘完成后显示。','empty'));return;}
-    s.reviews.forEach((r,index)=>{const body=el('div',null,'review');drawDailyReview(body,r);
-      if(!index)box.append(body);else{const det=details('较早复盘 · '+shortTime(r.window_end),'review:'+r.id);det.append(body);box.append(det);}
+    s.reviews.slice(0,5).forEach((r,index)=>{const body=el('div',null,'review');drawDailyReview(body,r);
+      if(!index)box.append(body);else{const det=details('较早复盘 · '+when(r.window_end),'review:'+r.id);det.append(body);box.append(det);}
     });
+    const total=s.reviews[0]?.history?.total??s.reviews.length;
+    box.append(el('p','展示最近 '+Math.min(s.reviews.length,5)+' / '+total+' 个复盘周期，每个周期保留最新修订。'+(total>Math.min(s.reviews.length,5)?'其余周期及修订保留在本机完整复盘记录。':''),'subtle'));
   });
 }
 function researchUpdate(s) {
@@ -1002,7 +1115,17 @@ async function showObservation(asset,category){
   const target=$('observed-'+asset);if(target){target.scrollIntoView({block:'center',behavior:'smooth'});target.focus({preventScroll:true});}
 }
 function showMacroEvent(id){
-  selectBoard('dynamic',{remember:true});const target=$('macro-event-'+id);
+  selectBoard('dynamic',{remember:true});
+  const g=state?.dynamic?.global;
+  if(g){
+    const groups={current:(g.items||[]).filter(macroProminent),followup:g.followup_items||[],history:g.history_items||[...(g.items||[]).filter(e=>!macroProminent(e)),...(g.archived_items||[])]};
+    for(const [kind,events] of Object.entries(groups)){
+      const index=events.findIndex(e=>e.id===id);if(index<0)continue;
+      macroPages[kind]=Math.floor(index/5);renderingCache.delete({current:'macro-cases',followup:'macro-followup',history:'macro-archive'}[kind]);
+      renderGlobalMacro(state.dynamic);break;
+    }
+  }
+  const target=$('macro-event-'+id);
   if(target){const history=target.closest('#macro-history');if(history)history.open=true;target.scrollIntoView({block:'start',behavior:'smooth'});target.focus({preventScroll:true});}
 }
 function drawLogicChain(parent,impact,key){
@@ -1018,14 +1141,15 @@ function drawLogicChain(parent,impact,key){
   if(impact.conditions)parent.append(el('p','成立条件：'+impact.conditions,'impact-condition'));
   if(impact.invalidation)parent.append(el('p','失效条件：'+impact.invalidation,'impact-condition'));
 }
-function drawImpactAssessment(parent,value,key){
+function drawImpactAssessment(parent,value,key,options={}){
   const v=value||{state:'PENDING',admitted:false,reason:'等待独立影响评估，暂不占用活跃名额'};
   if(v.method_gate){parent.append(el('p',v.admitted?'产业研究初步证据通过；买入前仍需核对公司、价格与资金条件':'产业研究仍待补充证据或复核','subtle'));return;}
   const block=el('section',null,'impact-assessment');block.setAttribute('aria-label','独立影响评估');
   const labels={PENDING:'待评估',BACKGROUND:'背景资料',NEEDS_EVIDENCE:'待补证据',HISTORICALLY_WEAK:'历史反应偏弱',ADMITTED:'通过影响评估'};
-  block.append(el('p',labels[v.state]||'待评估','impact-assessment-title'),el('p',v.reason,'subtle'));
+  block.append(el('p',(options.historical?'当时评估：':'')+(labels[v.state]||'待评估'),'impact-assessment-title'),el('p',v.reason,'subtle'));
   const a=v.assessment,h=v.history;
   if(a){
+    if(a.direction)block.append(el('p',(options.historical?'当时独立评估方向：':'独立评估方向：')+(macroDirections[a.direction]||'方向待确认')));
     block.append(el('p',a.basis));
     if(a.impact_basis&&a.impact_basis!=='ECONOMIC'){
       const x=a.expectation_test;
@@ -1060,7 +1184,7 @@ function drawObservationCauses(parent,target){
     drawImpactAssessment(article,cause.materiality,'observed:'+target.asset+':'+cause.event_id);
     drawLogicChain(article,cause.impact,'observed:'+target.asset+':'+cause.event_id);
     article.append(link('查看新闻原文',cause.url));
-    if([...(state?.dynamic?.global?.items||[]),...(state?.dynamic?.global?.archived_items||[])].some(e=>e.id===cause.event_id)){
+    if([...(state?.dynamic?.global?.items||[]),...(state?.dynamic?.global?.followup_items||[]),...(state?.dynamic?.global?.history_items||[]),...(state?.dynamic?.global?.archived_items||[])].some(e=>e.id===cause.event_id)){
       const jump=el('button','查看动态','text-button');jump.type='button';jump.addEventListener('click',()=>showMacroEvent(cause.event_id));article.append(jump);
     }
     causes.append(article);
@@ -1388,31 +1512,111 @@ function renderDynamic(s){
 
 const macroRegions={GLOBAL:'全球',US:'美国',EUROPE:'欧洲',JAPAN:'日本',CHINA:'中国',ASIA:'亚洲',MIDDLE_EAST:'中东',OCEANIA:'大洋洲',LATIN_AMERICA:'拉丁美洲',AFRICA:'非洲',EMERGING:'新兴市场'};
 const macroDirections={UP:'上行压力',DOWN:'下行压力',MIXED:'双向影响',UNCLEAR:'方向待确认'};
-function drawMacroEvent(box,event,assets){
-  const a=event.analysis,card=el('article',null,'macro-card'),head=el('div',null,'section-head');
+function macroDisplayLifecycle(event){
+  const life=event.lifecycle;if(!life)return null;
+  const current=Date.now();
+  if(life.actionable&&Number.isFinite(Date.parse(life.expires_at))&&current>=Date.parse(life.expires_at)){
+    return {...life,state:'ENDED_UNCONFIRMED',label:'观察已到期 · 待同步核对',stale:true,
+      reason:'本页按当前时间发现观察期限已过；缓存中的旧评估不能作为当前依据。',
+      next_step:'等待本机同步最新状态；旧判断及缺失结果仅供追溯，不计成功或失败。'};
+  }
+  if(life.actionable&&life.state!=='REVIEW_DUE'&&Number.isFinite(Date.parse(life.review_due_at))&&current>=Date.parse(life.review_due_at)){
+    return {...life,state:'REVIEW_DUE_UNCONFIRMED',label:'已到复核期 · 待同步核对',stale:true,
+      reason:'当前时间已到复核期限，缓存中的旧评估不能作为当前依据。',
+      next_step:'核实新的证据，并等待本机同步最新复核状态。'};
+  }
+  return life;
+}
+function macroDirectionSummary(impacts,assets){
+  return impacts.map(i=>(assets[i.asset]?.name||i.asset)+'：'+(macroDirections[i.direction]||'方向待确认')).join('；');
+}
+function drawMacroRevisions(parent,event,assets){
+  const revision=event.revisions;if(!revision||(!revision.total&&!revision.source_replacements?.length))return;
+  const box=details('修订经过与替代来源','macro-revisions:'+event.id);
+  if(revision.total)box.append(el('p','研究共修订 '+revision.total+' 次，展示最近 '+revision.items.length+' 次。','subtle'));
+  for(const change of revision.items||[]){
+    box.append(el('p',shortTime(change.at)+' · '+(change.changed.length?change.changed.join('、'):'研究重新生成，主要结论字段未变')));
+    if(change.before_headline!==change.after_headline)box.append(el('p','主题：'+change.before_headline+' → '+change.after_headline,'subtle'));
+    const before=macroDirectionSummary(change.before_directions,assets),after=macroDirectionSummary(change.after_directions,assets);
+    if(before!==after)box.append(el('p','此前：'+before),el('p','修订后：'+after));
+  }
+  if(revision.source_replacement_total)box.append(el('p','原文共有 '+revision.source_replacement_total+' 条后续修订，展示最近 '+revision.source_replacements.length+' 条，最新版本优先。','subtle'));
+  for(const source of revision.source_replacements||[]){
+    box.append(link((source.source_status==='REVISED'?'历史中间修订：':'最新修订来源：')+source.title,source.url),el('p','发现修订 '+shortTime(source.first_seen_at),'subtle'));
+    const all=[...(state?.dynamic?.global?.items||[]),...(state?.dynamic?.global?.followup_items||[]),...(state?.dynamic?.global?.history_items||[])];
+    if(source.event_id&&all.some(e=>e.id===source.event_id)){
+      const button=el('button','查看后续研究','text-button');button.type='button';button.addEventListener('click',()=>showMacroEvent(source.event_id));box.append(button);
+    }
+  }
+  parent.append(box);
+}
+function drawMacroEvent(box,event,assets,options={}){
+  const a=event.analysis,life=macroDisplayLifecycle(event),compact=!!options.compact;
+  const historical=options.historical||event.status==='INVALIDATED'||life?.stale||['ENDED','BACKGROUND'].includes(life?.state);
+  const card=el('article',null,'macro-card'+(compact?' macro-library-card':'')),head=el('div',null,'section-head');
   card.id='macro-event-'+event.id;card.tabIndex=-1;
-  head.append(el('h3',a.headline),el('span',event.status==='INVALIDATED'?'原文已修订':event.theme_label,'badge'));card.append(head);
-  card.append(el('p',a.regions.map(r=>macroRegions[r]||r).join(' · ')+' · '+({DAYS:'未来数日',MONTHS:'未来数月',UNCERTAIN:'期限待确认'}[a.horizon])+' · 新闻发布 '+shortTime(event.published_at),'subtle'));
-  card.append(el('p',a.facts,'macro-facts'),el('h4','受影响标的与方向','macro-impact-heading'));
+  head.append(el('h3',a.headline),el('span',life?.label||(event.status==='INVALIDATED'?'原判断已失效':event.theme_label),'badge'));card.append(head);
+  card.append(el('p',a.regions.map(r=>macroRegions[r]||r).join(' · ')+' · '+(historical?'当时研究期限：':'研究期限：')+({DAYS:'数日',MONTHS:'数月',UNCERTAIN:'待确认'}[a.horizon])+' · 新闻发布 '+shortTime(event.published_at),'subtle'));
+  if(life){
+    card.append(el('p',life.reason,'macro-lifecycle'),el('p','复核期限 '+shortTime(life.review_due_at)+' · 观察结束 '+shortTime(life.expires_at),'subtle'));
+    card.append(el('p',life.next_step,'macro-next-step'));
+  }else if(historical)card.append(el('p','历史判断仅供回看，当前状态以最新研究为准。','macro-lifecycle'));
+  if(compact){
+    card.append(el('p',brief(a.facts),'macro-library-summary'));
+    card.append(el('p',(historical?'当时推演：':'初步推演：')+macroDirectionSummary(a.impacts,assets),'subtle'));
+    const reviewed=a.impacts.filter(i=>i.materiality?.assessment?.direction).map(i=>({asset:i.asset,direction:i.materiality.assessment.direction}));
+    if(reviewed.length)card.append(el('p',(historical?'当时独立评估：':'独立评估：')+macroDirectionSummary(reviewed,assets),'subtle'));
+    if(a.impacts.some(i=>i.materiality?.assessment?.direction&&i.materiality.assessment.direction!==i.direction))card.append(el('p','初步推演与独立评估存在方向分歧，请分别核对依据。','caution'));
+    const outcomes=(event.reactions||[]).filter(r=>r.observation);
+    if(outcomes.length){
+      card.append(el('p','已记录观察：'+outcomes.slice(0,3).map(r=>r.name+' '+(r.observation.change>0?'+':'')+r.observation.change+r.observation.change_unit).join('；'),'macro-library-summary'));
+      card.append(el('p','日级相关变化，不等于因果验证或交易收益。','subtle'));
+    }else if(event.reactions?.length)card.append(el('p','观察缺口：'+event.reactions[0].waiting,'subtle'));
+    if(event.revisions?.total||event.revisions?.source_replacement_total)card.append(el('p','研究修订 '+(event.revisions.total||0)+' 次 · 原文后续修订 '+(event.revisions.source_replacement_total||0)+' 条，详情可追溯。','subtle'));
+  }
+  const body=compact?details('查看完整判断、证据与修订','macro-body:'+event.id):card;
+  if(!compact)body.append(el('p',a.facts,'macro-facts'));
+  else body.append(el('p',a.facts));
+  body.append(el('h4',historical?'当时的标的影响判断':'受影响标的与方向','macro-impact-heading'));
   const impacts=el('ul',null,'macro-impacts');impacts.setAttribute('aria-label','受影响标的与方向');
   for(const impact of a.impacts){
-    const row=el('li',null,'macro-impact'),title=el('div',null,'section-head'),direction=el('span',macroDirections[impact.direction],'macro-direction');direction.dataset.direction=impact.direction;
-    title.append(el('strong',assets[impact.asset]?.name||impact.asset),direction);row.append(title,el('p','初步推演：'+(impactStrengths[impact.strength]||impactStrengths.UNKNOWN),'impact-strength'));
-    drawImpactAssessment(row,impact.materiality,'macro:'+event.id+':'+impact.asset);
+    const row=el('li',null,'macro-impact'),title=el('div',null,'section-head'),direction=el('span',(historical?'当时推演：':'初步推演：')+macroDirections[impact.direction],'macro-direction');direction.dataset.direction=impact.direction;
+    title.append(el('strong',assets[impact.asset]?.name||impact.asset),direction);row.append(title,el('p','初步影响规模：'+(impactStrengths[impact.strength]||impactStrengths.UNKNOWN),'impact-strength'));
+    drawImpactAssessment(row,impact.materiality,'macro:'+event.id+':'+impact.asset,{historical});
+    if(impact.materiality?.assessment?.direction&&impact.materiality.assessment.direction!==impact.direction)row.append(el('p','两次判断方向不同，评估通过不代表支持初稿方向。','caution'));
     drawLogicChain(row,impact,'macro:'+event.id+':'+impact.asset);
-    const observed=state?.observation?.items.find(t=>t.asset===impact.asset)||state?.observation?.membership?.[impact.asset];
+    const observed=state?.observation?.items?.find(t=>t.asset===impact.asset)||state?.observation?.membership?.[impact.asset];
     if(observed){const tier=observed.pool_tier||observed.tier,jump=el('button',['COOLING','ARCHIVED'].includes(tier)?'查看候补 / 归档记录':tier==='FOCUS'?'重点研究 · 查看公司与资产':'已加入公司与资产 · 查看','text-button');jump.type='button';jump.addEventListener('click',()=>showObservation(impact.asset,observed.category));row.append(jump);}
     impacts.append(row);
   }
-  card.append(impacts,el('p','不确定性：'+a.uncertainty,'macro-uncertainty'));
-  const detail=details('分析依据与后续观察','macro:'+event.id);
+  body.append(impacts,el('p','不确定性：'+a.uncertainty,'macro-uncertainty'));
+  const detail=details(historical?'原分析依据与已记录观察':'分析依据与后续观察','macro:'+event.id);
   detail.append(el('p','传导机制：'+a.transmission),el('p','预期差：'+a.expectation_basis),el('p','反证：'+a.invalidation));
-  addList(detail,'后续观察',a.impacts.map(i=>(assets[i.asset]?.name||i.asset)+'：'+i.watch));
+  addList(detail,historical?'当时拟观察的条件':'后续观察',a.impacts.map(i=>(assets[i.asset]?.name||i.asset)+'：'+i.watch));
   for(const report of event.related_reports||[])detail.append(link('同一事件报道：'+report.source+' · '+report.title,report.url));
   for(const cite of event.citations){detail.append(link(cite.source+' · '+cite.title,cite.url),el('blockquote',cite.quote));}
-  detail.append(el('p',event.basis==='RETROSPECTIVE'?'历史补采研究：形成判断时事件已经发生，存在回看偏差。':'前向跟踪：从本次研究完成后观察对应指标。','subtle'));
+  detail.append(el('p',event.basis==='RETROSPECTIVE'?'历史补采研究：形成判断时事件已经发生，存在回看偏差。':'前向口径：从该次研究完成后观察对应指标。','subtle'));
   for(const r of event.reactions){const o=r.observation;if(o){detail.append(el('p',r.name+' · '+o.baseline.date+' → '+o.end.date+' · '+(o.change>0?'+':'')+o.change+o.change_unit),link('查看指标来源',o.url),el('p',o.method,'subtle'));}else detail.append(el('p',r.name+'：'+r.waiting,'subtle'));}
-  detail.append(el('p','研究更新 '+shortTime(event.created_at)+'；市场方向是条件判断，不代表已提交交易。','subtle'));card.append(detail);box.append(card);
+  detail.append(el('p','研究更新 '+shortTime(event.created_at)+'；市场方向是条件判断，不代表已提交交易。','subtle'));body.append(detail);
+  drawMacroRevisions(body,event,assets);
+  if(compact)card.append(body);box.append(card);
+}
+const macroPages={current:0,followup:0,history:0};
+function renderMacroPage(box,events,kind,assets,total=events.length,asOf=null){
+  const size=5,pages=Math.max(1,Math.ceil(events.length/size));macroPages[kind]=Math.min(macroPages[kind]||0,pages-1);
+  const draw=()=>{
+    box.replaceChildren();const page=macroPages[kind],start=page*size;
+    const caption=total>events.length?'共 '+total+' 条，本次仅载入最近 '+events.length+' 条；其余记录继续保留，本页未载入。':'共 '+total+' 条，每页最多 '+size+' 条。';
+    box.append(el('p',caption+(asOf?' 状态核对截至 '+shortTime(asOf)+'；到期提醒按当前时间更新。':''),'subtle'));
+    if(!events.length){box.append(el('p',kind==='followup'?'暂无仍在观察期内的待跟进事项。':'暂无记录。','empty'));return;}
+    events.slice(start,start+size).forEach(e=>drawMacroEvent(box,e,assets,{compact:true,historical:kind==='history'}));
+    if(pages>1){
+      const nav=el('nav',null,'macro-pagination');nav.setAttribute('aria-label',kind==='current'?'重要动态分页':kind==='followup'?'待跟进分页':'历史研究分页');
+      const prev=el('button','上一页'),next=el('button','下一页');prev.type=next.type='button';prev.disabled=page===0;next.disabled=page===pages-1;
+      prev.addEventListener('click',()=>{macroPages[kind]=Math.max(0,macroPages[kind]-1);draw();});next.addEventListener('click',()=>{macroPages[kind]=Math.min(pages-1,macroPages[kind]+1);draw();});
+      nav.append(prev,el('span','第 '+(page+1)+' / '+pages+' 页'),next);box.append(nav);
+    }
+  };draw();
 }
 function renderNewsScreening(box,screening){
   if(!screening)return;
@@ -1445,15 +1649,21 @@ function macroProminent(event){
 function renderGlobalMacro(d){
   const g=d.global||{items:[],assets:{},markets:[],sources:[],news_counts:{},observation_counts:{},event_count:0};
   renderChanged('macro-screening',g.news_screening,box=>renderNewsScreening(box,g.news_screening));
-  const prominent=g.items.filter(macroProminent);
-  renderChanged('macro-cases',[g.items,g.assets,state?.observation?.membership,state?.observation?.items.map(t=>[t.asset,t.pool_tier])],box=>{
-    if(!prominent.length){box.append(el('p','近48小时暂无通过筛选且已完成研究的重要动态。新闻每30分钟更新，既往研究与待补证据的事件可在下方查看。','empty'));return;}
-    prominent.forEach(e=>drawMacroEvent(box,e,g.assets));
+  const prominent=g.items.filter(macroProminent),asOf=g.library?.as_of||g.window_end,clock=[asOf,Math.floor(Date.now()/3600000)];
+  renderChanged('macro-cases',[g.items,g.assets,state?.observation?.membership,clock],box=>{
+    if(!prominent.length){box.append(el('p','近48小时暂无通过筛选且已完成研究的重要动态。新闻每30分钟更新，仍有跟进价值的事项和历史记录分别在下方查看。','empty'));return;}
+    renderMacroPage(box,prominent,'current',g.assets,prominent.length,asOf);
   });
-  const archived=[...g.items.filter(e=>!macroProminent(e)),...(g.archived_items||[])];
+  const legacy=[...g.items.filter(e=>!macroProminent(e)),...(g.archived_items||[])];
+  const followup=g.followup_items||[],archived=g.history_items||legacy,library=g.library||{};
+  if($('macro-followup-section')){
+    $('macro-followup-section').hidden=!followup.length;
+    if($('macro-followup-title'))$('macro-followup-title').textContent='当前待跟进（'+(library.followup_total??followup.length)+'）';
+    renderChanged('macro-followup',[followup,g.assets,state?.observation?.membership,library.followup_total,clock],box=>renderMacroPage(box,followup,'followup',g.assets,library.followup_total??followup.length,asOf));
+  }
   $('macro-history').hidden=!archived.length;
-  $('macro-history-title').textContent='既往研究、待补证据与修订记录（'+archived.length+'）';
-  renderChanged('macro-archive',[archived,g.assets,state?.observation?.membership],box=>archived.forEach(e=>drawMacroEvent(box,e,g.assets)));
+  $('macro-history-title').textContent='历史研究与修订（'+(library.history_total??archived.length)+'）';
+  renderChanged('macro-archive',[archived,g.assets,state?.observation?.membership,library.history_total,clock],box=>renderMacroPage(box,archived,'history',g.assets,library.history_total??archived.length,asOf));
   $('macro-execution-note').textContent=g.execution||'全球市场结论用于研究；当前账户仅接入普通沪深主板模拟交易，执行计划单独核验。';
   renderChanged('dynamic-learning',[g.event_count,g.observation_counts,g.news_counts,g.impact_learning],box=>{
     const impact=g.impact_learning;

@@ -3,6 +3,8 @@
 No lifecycle transitions, source-file reads, live statistics or model calls occur here.
 """
 import json
+from .storage import now, normalize_time
+from .review_presentation import age_days
 
 from .proposal_evidence import summary as evidence_summary
 from .proposal_experiment import summary as experiment_summary
@@ -113,32 +115,94 @@ def card(store, row):
             'readiness': readiness, 'next_step': _next_step(row['status'], readiness, review, experiment)}
 
 
-def cards(store):
-    # Keep the active forward experiment visible even after newer drafts arrive.
-    # Pending decisions follow, then drafts and live changes; closed history
-    # remains queryable with proposals show even when it falls outside this list.
-    total = store.db.execute('SELECT count(*) FROM strategy_proposals').fetchone()[0]
-    rows = store.db.execute('''SELECT * FROM strategy_proposals ORDER BY
-        CASE WHEN EXISTS (
-            SELECT 1 FROM experiment_designs d JOIN experiment_events e ON e.experiment_id=d.id
-            WHERE d.proposal_id=strategy_proposals.id AND e.status='RUNNING'
-            AND e.id=(SELECT max(latest.id) FROM experiment_events latest WHERE latest.experiment_id=d.id)
-        ) THEN 0 ELSE 1 END,
-        CASE status WHEN 'READY' THEN 0 WHEN 'DRAFT' THEN 1 WHEN 'APPROVED' THEN 2
-        WHEN 'ADOPTED' THEN 3 ELSE 4 END, created_at DESC, id LIMIT ?''', (MAX_CARDS,)).fetchall()
+def cards(store, at=None):
+    # Scalar selection across the full index keeps old, actionable work visible.
+    # Repeated narrative observations/last_seen_at are not new validation evidence.
+    at = normalize_time(at or now())
+    descriptors = [dict(row) for row in store.db.execute('''SELECT p.id,p.status,p.source,p.created_at,
+        max(p.created_at,coalesce(p.decided_at,''),coalesce(d.created_at,''),coalesce(e.at,''),
+            coalesce((SELECT max(created_at) FROM selfcheck_evidence WHERE proposal_id=p.id),'')) progress_at,
+        e.status experiment_status FROM strategy_proposals p
+        LEFT JOIN experiment_designs d ON d.proposal_id=p.id
+        LEFT JOIN experiment_events e ON e.id=(SELECT max(id) FROM experiment_events WHERE experiment_id=d.id)''')]
+    for row in descriptors:
+        live = row['experiment_status'] == 'RUNNING' and row['status'] in ('DRAFT', 'READY')
+        old = (age_days(row['progress_at'], at) or 0) > 14
+        history = row['status'] in ('REJECTED', 'RETIRED', 'SUPERSEDED') or (old and row['status'] in ('DRAFT', 'ADOPTED') and not live)
+        row.update(display_bucket='HISTORY' if history else 'CURRENT', active_experiment=live,
+                   display_priority=0 if live else {'APPROVED': 1, 'READY': 2, 'ADOPTED': 3, 'DRAFT': 4}.get(row['status'], 5))
+    descriptors.sort(key=lambda r: r['id'])
+    descriptors.sort(key=lambda r: r['progress_at'], reverse=True)
+    descriptors.sort(key=lambda r: (r['display_bucket'] == 'HISTORY', r['display_priority']))
+    total = len(descriptors)
     items = []
-    for row in rows:
+    for meta in descriptors[:MAX_CARDS]:
+        row = store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (meta['id'],)).fetchone()
         item = card(store, row)
+        item.update(display_bucket=meta['display_bucket'], progress_at=meta['progress_at'],
+                    active_experiment=meta['active_experiment'],
+                    observation_only=meta['source']=='review' and item.get('readiness', {}).get('status')=='INCOMPLETE')
+        if meta['display_bucket']=='HISTORY':
+            item['display_reason'] = '超过14日没有新的验证证据或状态进展；原记录和状态保留。' if meta['status'] in ('DRAFT', 'ADOPTED') else '该提案已关闭或被新版替代，仅供追溯。'
         if size(items + [item]) > CARD_BUDGET:
             break
         items.append(item)
-    return {'items': items, 'total': total, 'shown': len(items)}
+    result = {'items': items, 'total': total, 'shown': len(items)}
+    if total:
+        result.update(current_total=sum(r['display_bucket']=='CURRENT' for r in descriptors),
+                      history_total=sum(r['display_bucket']=='HISTORY' for r in descriptors), omitted=total-len(items),
+                      selection_notice='优先展示运行中的实验、已批准待上线和待决定提案。草稿或已采纳方案超过14日无新验证证据/状态进展移至历史展示；重复复盘叙述不刷新期限，原记录不变。')
+    return result
+
+
+def _review_selection(store, supplied, at):
+    from .supervision import listing
+    rows = store.db.execute('''SELECT r.id,r.subject_id,r.status,r.created_at,r.finished_at,p.status proposal_status
+        FROM supervision_reviews r LEFT JOIN strategy_proposals p ON p.id=r.subject_id
+        ORDER BY r.created_at DESC,r.rowid DESC''').fetchall()
+    if not rows:
+        return supplied, len(supplied)
+    selected = {}
+    for row in rows:
+        selected.setdefault(row['subject_id'], dict(row))
+    def priority(row):
+        closed = row['status']=='STALE' or row['proposal_status'] in ('REJECTED','RETIRED','SUPERSEDED')
+        return (closed, {'RUNNING':0,'DEFERRED':1,'PENDING':2,'SUCCEEDED':3}.get(row['status'],4))
+    candidates = sorted(selected.values(), key=priority)
+    public = []
+    current_count = history_count = 0
+    for row in candidates:
+        definitely_history = row['status']=='STALE' or row['proposal_status'] in ('REJECTED','RETIRED','SUPERSEDED')
+        definitely_history = definitely_history or (row['status']=='SUCCEEDED' and (age_days(row['finished_at'] or row['created_at'],at) or 0)>14)
+        if definitely_history and history_count >= 10:
+            continue  # Old completed records do not require repeated hash reads.
+        values = listing(store, limit=1, subject_id=row['subject_id'])
+        if not values:
+            continue
+        item = values[0]
+        history = item['status']=='STALE' or item.get('proposal_status') in ('REJECTED','RETIRED','SUPERSEDED')
+        history = history or (item['status']=='SUCCEEDED' and (age_days(item['finished_at'] or item['created_at'],at) or 0)>14)
+        item['display_bucket'] = 'HISTORY' if history else 'CURRENT'
+        # The stored status can become stale without a database mutation. Verify
+        # freshness before it consumes the current-work budget.
+        if history and history_count < 10:
+            public.append(item)
+            history_count += 1
+        elif not history and current_count < 20:
+            public.append(item)
+            current_count += 1
+        if current_count >= 20 and history_count >= 10:
+            break
+    public.sort(key=lambda r: r['display_bucket']=='HISTORY')
+    return public, len(rows)
 
 
 def attach(store, summary):
     """Keep the complete signed display below the existing 1 MB receiver limit."""
+    at = now()
+    selected, total = _review_selection(store, summary['items'], at)
     reviews = []
-    for item in summary['items']:
+    for item in selected:
         if size(reviews + [item]) > REVIEW_BUDGET:
             break
         reviews.append(item)
@@ -151,4 +215,7 @@ def attach(store, summary):
     else:
         discovery = None
     return {**summary, 'items': reviews, 'discovery': discovery,
-            'reviews_omitted': len(summary['items']) - len(reviews), 'proposals': cards(store)}
+            'reviews_total': total, 'reviews_shown': len(reviews),
+            'reviews_omitted': total - len(reviews),
+            'reviews_selection_notice': '每个审查对象仅展示最近一次；优先待处理，已失效或完成超过14日的审查折叠为历史。完整尝试记录保留在本机。',
+            'proposals': cards(store, at=at)}

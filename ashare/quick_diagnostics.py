@@ -6,6 +6,7 @@ frozen proposal/self-check evidence are neither rewritten nor augmented here.
 import json
 import math
 import re
+from datetime import date
 
 from .storage import now, normalize_time, json_write, digest
 
@@ -31,6 +32,32 @@ def _count(value):
     return value if type(value) is int and 0 <= value <= 1_000_000_000 else 0
 
 
+def _time(value):
+    try:
+        return normalize_time(value) if isinstance(value, str) and len(value) <= 64 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _day(value):
+    try:
+        return date.fromisoformat(value).isoformat() if isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value) else None
+    except ValueError:
+        return None
+
+
+def _coverage(value):
+    value = value if isinstance(value, dict) else {}
+    return {'scope': 'ALL_HISTORY', **{key: _time(value.get(key)) for key in
+        ('registered_from', 'registered_through', 'scored_judgment_from', 'scored_judgment_through', 'last_scored_at')},
+        **{key: _day(value.get(key)) for key in ('observation_from', 'observation_through')}}
+
+
+def _build_time(value):
+    value = value if isinstance(value, dict) else {}
+    return {key: _time(value.get(key)) for key in ('first_judgment_at', 'last_judgment_at', 'last_scored_at')}
+
+
 def _stats(value):
     value = value if isinstance(value, dict) else {}
     result = {k: _count(value.get(k)) for k in ('n', 'time_clusters')}
@@ -54,12 +81,20 @@ def _comparison(value, *, quick=False):
     value = value if isinstance(value, dict) else {}
     counts = value.get('counts') if isinstance(value.get('counts'), dict) else {}
     builds = value.get('by_build') if isinstance(value.get('by_build'), dict) else {}
-    ids = sorted(k for k in builds if isinstance(k, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', k))
+    ids = [k for k in builds if isinstance(k, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', k)]
+    timing = value.get('build_times') if isinstance(value.get('build_times'), dict) else {}
+    timing = {k: _build_time(timing.get(k)) for k in ids}
+    # Build hashes are random, not a chronology. Unknown dates keep their input
+    # order for old summaries; never label that legacy order as newest-first.
+    ids.sort(key=lambda k: timing[k]['last_judgment_at'] or '', reverse=True)
+    shown = ids[:MAX_BUILDS]
     result = {'method': QUICK_SCORE_METHOD if quick else SCORE_METHOD,
               'horizon_days': 5 if quick else _count(value.get('horizon_days')),
               'counts': {k: _count(v) for k, v in counts.items()
-                         if re.fullmatch(r'(watchlist|portfolio|global):(OPEN|SCORED|UNSCORABLE)', k)},
-              'groups': _groups(value.get('groups')), 'by_build': {k: _groups(builds[k]) for k in ids[-MAX_BUILDS:]},
+                         if isinstance(k, str) and re.fullmatch(r'(watchlist|portfolio|global):(OPEN|SCORED|UNSCORABLE)', k)},
+              'coverage': _coverage(value.get('coverage')),
+              'groups': _groups(value.get('groups')), 'by_build': {k: _groups(builds[k]) for k in shown},
+              'build_times': {k: timing[k] for k in shown},
               'mixed_builds': value.get('mixed_builds') is True,
               'omitted_builds': _count(value.get('omitted_builds')) + max(0, len(ids) - MAX_BUILDS),
               'notice': QUICK_NOTICE if quick else '原有评分方法与期限保持不变；自选股及组合通常20个交易日，全球按原登记期限。原评分同样是价格观察，不能单独确认策略盈利。'}
@@ -91,7 +126,9 @@ def public(value):
         arm = max(('primary', 'quick'), key=lambda key: len(result[key]['by_build']))
         if not result[arm]['by_build']:
             break
-        del result[arm]['by_build'][next(iter(result[arm]['by_build']))]
+        oldest = next(reversed(result[arm]['by_build']))
+        del result[arm]['by_build'][oldest]
+        del result[arm]['build_times'][oldest]
         result[arm]['omitted_builds'] += 1
     result['omitted_builds'] = sum(result[k]['omitted_builds'] for k in ('primary', 'quick'))
     return result
@@ -107,14 +144,42 @@ def view(store):
 
 def collect(store, config, at=None):
     """Read-only snapshot of both methods, without scoring or governance writes."""
-    from .evaluation import comparisons, quick_comparisons, registry_counts, QUICK_SCORE_METHOD
+    from .evaluation import comparisons, quick_comparisons, registry_counts, SCORE_METHOD, QUICK_SCORE_METHOD
     at = normalize_time(at or now())
     primary = comparisons(store, config, at=at)
     primary['counts'] = registry_counts(store, at=at)
     quick = quick_comparisons(store, config, at=at)
     quick['counts'] = registry_counts(store, method=QUICK_SCORE_METHOD, at=at)
+    for comparison, method in ((primary, SCORE_METHOD), (quick, QUICK_SCORE_METHOD)):
+        comparison.update(_timing(store, method, at))
     return public({'version': VERSION, 'status': 'READY', 'generated_at': at,
                    'primary': primary, 'quick': quick})
+
+
+def _timing(store, method, at):
+    """Read scalar coverage dates only; never rewrite scores or registry rows.
+
+    Coverage describes all registered/scored records before the snapshot, not
+    independent samples. Per-build recency is the latest scored judgment time,
+    so rescoring/backfilling an old build cannot make it look like a new build.
+    """
+    registered = store.db.execute('''SELECT min(created_at) registered_from,
+        max(created_at) registered_through FROM signal_registry
+        WHERE route IN ('watchlist','portfolio','global') AND created_at<=?''', (at,)).fetchone()
+    source = ''' FROM signal_registry r JOIN signal_scores s ON s.signal_id=r.id
+        WHERE s.method=? AND s.status='SCORED' AND r.created_at<=? AND s.scored_at<=?
+        AND r.route IN ('watchlist','portfolio','global')'''
+    scored = store.db.execute('''SELECT min(r.created_at) scored_judgment_from,
+        max(r.created_at) scored_judgment_through, max(s.scored_at) last_scored_at,
+        min(CASE WHEN json_valid(s.score_json) THEN json_extract(s.score_json,'$.entry_date') END) observation_from,
+        max(CASE WHEN json_valid(s.score_json) THEN json_extract(s.score_json,'$.exit_date') END) observation_through'''
+        + source, (method, at, at)).fetchone()
+    builds = store.db.execute('''SELECT coalesce(nullif(r.build_id,''),'UNKNOWN') build,
+        min(r.created_at) first_judgment_at, max(r.created_at) last_judgment_at,
+        max(s.scored_at) last_scored_at''' + source + ' GROUP BY build', (method, at, at))
+    return {'coverage': {**dict(registered), **dict(scored)},
+            'build_times': {row['build']: {k: row[k] for k in
+                ('first_judgment_at', 'last_judgment_at', 'last_scored_at')} for row in builds}}
 
 
 def run(store, config, at=None):
@@ -156,7 +221,10 @@ def markdown(value):
     lines = ['## 5 日辅助诊断（不参与批准）', '', NOTICE, '', QUICK_NOTICE, '']
     if value['status'] != 'READY':
         return '\n'.join(lines + ['尚未生成可用诊断。'])
-    lines += [f"统计时间：{value['generated_at']}；原期限评分见前面的结论注册表。", '',
+    coverage = value['quick']['coverage']
+    lines += [f"统计时间：{value['generated_at']}；全历史累计，非最近5日新增样本；原期限评分见前面的结论注册表。",
+              f"登记覆盖：{coverage['registered_from'] or '未提供'} 至 {coverage['registered_through'] or '未提供'}；"
+              f"已评分价格观察覆盖：{coverage['observation_from'] or '未提供'} 至 {coverage['observation_through'] or '未提供'}。", '',
               '| 版本 | 比较项 / 分组 | 每日样本 | 不重叠样本 / 时间簇 | 5日平均超额 | 95%聚类近似区间 |',
               '|---|---|---|---|---|---|']
     names = {'trend_filter': '趋势过滤', 'research_veto': '研究否决', 'portfolio_allow': '组合放行', 'global_stance': '全球方向'}

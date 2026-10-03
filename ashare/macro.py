@@ -161,27 +161,42 @@ def research(store,config,news,at,model_fn=None):
 
 def measure(store,at):
  count=0
- for row in store.db.execute("SELECT e.*,n.published_at FROM macro_events e JOIN dynamic_news n ON n.id=e.news_id WHERE e.status!='INVALIDATED' ORDER BY e.created_at LIMIT 600").fetchall():
-  e=dict(row);payload=json.loads(e['payload_json']);anchor=(e['created_at'] if e['basis']=='FORWARD' else e['published_at'])[:10]
-  for impact in payload['impacts']:
-   asset=impact['asset'];spec=ASSETS.get(asset,{})
-   if not spec.get('series') or store.db.execute('SELECT 1 FROM macro_observations WHERE event_id=? AND asset=?',(e['id'],asset)).fetchone():continue
+ # Select missing event/asset outcomes, not a fixed prefix of event history.
+ # Completed, unsupported, and permanently incomplete older events cannot keep
+ # newer measurable events out of the scan. Existing observations stay immutable.
+ supported=[asset for asset,spec in ASSETS.items() if spec.get('series')]
+ if not supported:return 0
+ marks=','.join('?' for _ in supported)
+ rows=store.db.execute("""SELECT e.id,e.created_at,e.basis,n.published_at,
+  json_extract(i.value,'$.asset') AS asset FROM macro_events e
+  JOIN dynamic_news n ON n.id=e.news_id JOIN json_each(e.payload_json,'$.impacts') i
+  WHERE e.status!='INVALIDATED' AND e.created_at<=? AND n.published_at<=? AND n.first_seen_at<=?
+  AND json_extract(i.value,'$.asset') IN ("""+marks+""")
+  AND NOT EXISTS (SELECT 1 FROM macro_observations o WHERE o.event_id=e.id AND o.asset=json_extract(i.value,'$.asset'))
+  ORDER BY e.created_at,e.id,asset""",(at,at,at,*supported)).fetchall()
+ markets={}
+ for row in rows:
+  e=dict(row);anchor=(e['created_at'] if e['basis']=='FORWARD' else e['published_at'])[:10]
+  asset=e['asset'];spec=ASSETS[asset]
+  if asset not in markets:
    r=store.db.execute("SELECT * FROM macro_markets WHERE asset=? AND status='OK' AND checked_at<=?",(asset,at)).fetchone()
-   if not r:continue
-   p=json.loads(r['payload_json']);before=[x for x in p['points'] if x['date']<anchor];after=[x for x in p['points'] if anchor<x['date']<at[:10]]
-   if not before or len(after)<3:continue
-   base,end=before[-1],after[2]
-   if (datetime.fromisoformat(anchor)-datetime.fromisoformat(base['date'])).days>7 or (datetime.fromisoformat(end['date'])-datetime.fromisoformat(anchor)).days>14:continue
-   unit=spec.get('change_unit','%')
-   if unit=='%' and base['value']<=0:continue
-   change=(end['value']-base['value'])*100 if unit=='bp' else (end['value']/base['value']-1)*100
-   observation={'baseline':base,'end':end,'change':round(change,3),'change_unit':unit,'value_unit':spec['unit'],'url':p['url'],'series':p['series'],'raw_path':p['raw_path'],
-    'method':'事件/研究日前最近观测至之后第3个观测日；日级指标、发布有延迟，不是交易收益或因果验证；使用获取时的数据版本'}
-   with store.db:store.db.execute('INSERT OR IGNORE INTO macro_observations VALUES(?,?,?,?,?)',(e['id'],asset,at,e['basis'],encode(observation)))
-   count+=1
+   markets[asset]=json.loads(r['payload_json']) if r else None
+  p=markets[asset]
+  if not p:continue
+  before=[x for x in p['points'] if x['date']<anchor];after=[x for x in p['points'] if anchor<x['date']<at[:10]]
+  if not before or len(after)<3:continue
+  base,end=before[-1],after[2]
+  if (datetime.fromisoformat(anchor)-datetime.fromisoformat(base['date'])).days>7 or (datetime.fromisoformat(end['date'])-datetime.fromisoformat(anchor)).days>14:continue
+  unit=spec.get('change_unit','%')
+  if unit=='%' and base['value']<=0:continue
+  change=(end['value']-base['value'])*100 if unit=='bp' else (end['value']/base['value']-1)*100
+  observation={'baseline':base,'end':end,'change':round(change,3),'change_unit':unit,'value_unit':spec['unit'],'url':p['url'],'series':p['series'],'raw_path':p['raw_path'],
+   'method':'事件/研究日前最近观测至之后第3个观测日；日级指标、发布有延迟，不是交易收益或因果验证；使用获取时的数据版本'}
+  with store.db:written=store.db.execute('INSERT OR IGNORE INTO macro_observations VALUES(?,?,?,?,?)',(e['id'],asset,at,e['basis'],encode(observation))).rowcount
+  count+=written
  return count
 
-def view(store,at):
+def view(store,at,config=None):
  at=normalize_time(at)
  from .observation import registry
  assets=registry(store)
@@ -191,31 +206,39 @@ def view(store,at):
  assessments=context(store,at)
  screened={r['news_id']:json.loads(r['payload_json']) for r in store.db.execute('SELECT news_id,payload_json FROM macro_news_triage WHERE version=? AND created_at<=?',(TRIAGE_VERSION,at))}
  start=normalize_time((datetime.fromisoformat(at)-timedelta(hours=48)).isoformat())
- # Use the source's publication time: late research must not promote old news
- # into today's list. Keep all current events, independently of the archive cap.
- query='''SELECT e.*,n.source,n.title,n.url,n.published_at FROM macro_events e JOIN dynamic_news n ON n.id=e.news_id
-  WHERE e.created_at<=? AND n.published_at<=? AND n.first_seen_at<=? AND '''
- current=store.db.execute(query+"n.published_at>=? AND e.status!='INVALIDATED' AND NOT EXISTS (SELECT 1 FROM macro_news_queue q JOIN macro_events rep ON rep.news_id=q.representative_id WHERE q.news_id=e.news_id AND q.representative_id!=e.news_id AND rep.status!='INVALIDATED') ORDER BY n.published_at DESC,e.created_at DESC,e.id",(at,at,at,start)).fetchall()
- archive=store.db.execute(query+"(n.published_at<? OR e.status='INVALIDATED') ORDER BY n.published_at DESC,e.created_at DESC,e.id LIMIT 40",(at,at,at,start)).fetchall()
- items=[];archived=[]
- for index,row in enumerate([*current,*archive]):
-  e=dict(row);e['screening']=screened.get(e['news_id']);e['analysis']=json.loads(e.pop('payload_json'));e['theme_label']=THEMES[e['theme']];reactions=[]
+ from .macro_presentation import select_rows,observation_waiting,next_step,revisions
+ selection=select_rows(store,at,start,config,assessments,screened)
+ enriched={}
+ # Full analysis is loaded only for the current 48-hour window and the bounded
+ # library slices. Counts and lifecycle routing use lightweight event metadata.
+ for row in [*selection['items'],*selection['archived_items'],*selection['followup_items'],*selection['history_items']]:
+  if row['id'] in enriched:continue
+  e=dict(row);e['screening']=screened.get(e['news_id'])
+  e['analysis']=json.loads(store.db.execute('SELECT payload_json FROM macro_events WHERE id=?',(e['id'],)).fetchone()[0])
+  e['theme_label']=THEMES[e['theme']];reactions=[]
   for impact in e['analysis']['impacts']:
    impact['materiality']=assessments.get((e['id'],impact['asset']))
    asset=impact['asset'];spec=assets.get(asset,{'name':asset});r=store.db.execute('SELECT payload_json FROM macro_observations WHERE event_id=? AND asset=? AND ready_at<=?',(e['id'],asset,at)).fetchone()
    reactions.append({'asset':asset,'name':spec['name'],'observation':json.loads(r[0]) if r else None,
-    'waiting':'等待事件后数据发布并形成完整观察窗口' if spec.get('series') else '该市场历史序列尚未接入，保留定性研究'})
+    'waiting':observation_waiting(spec,e,at)})
   e['reactions']=reactions
-  e['related_reports']=[dict(r) for r in store.db.execute('SELECT n.title,n.source,n.url,n.published_at FROM macro_news_queue q JOIN dynamic_news n ON n.id=q.news_id WHERE q.representative_id=? AND q.news_id!=? AND n.status!=? ORDER BY n.published_at DESC LIMIT 10',(e['news_id'],e['news_id'],'REVISED'))]
+  e['related_reports']=[dict(r) for r in store.db.execute('SELECT n.title,n.source,n.url,n.published_at FROM macro_news_queue q JOIN dynamic_news n ON n.id=q.news_id WHERE q.representative_id=? AND q.news_id!=? AND n.status!=? AND n.published_at<=? AND n.first_seen_at<=? ORDER BY n.published_at DESC LIMIT 10',(e['news_id'],e['news_id'],'REVISED',at,at))]
   e['citations']=[{'quote':q['quote'],**dict(store.db.execute('SELECT title,url,source FROM dynamic_news WHERE id=?',(q['news_id'],)).fetchone())} for q in e['analysis']['evidence']]
-  (items if index<len(current) else archived).append(e)
+  e['lifecycle']={**e['lifecycle'],'next_step':next_step(e)}
+  e['revisions']=revisions(store,e,at)
+  enriched[e['id']]=e
+ items=[enriched[e['id']] for e in selection['items']]
+ archived=[enriched[e['id']] for e in selection['archived_items']]
+ followup=[enriched[e['id']] for e in selection['followup_items']]
+ history=[enriched[e['id']] for e in selection['history_items']]
+
  markets=[]
  for asset,spec in ASSETS.items():
   r=store.db.execute('SELECT * FROM macro_markets WHERE asset=?',(asset,)).fetchone();p=json.loads(r['payload_json']) if r else {}
   markets.append({'asset':asset,**spec,'status':r['status'] if r else 'PENDING' if spec.get('series') else 'QUALITATIVE','checked_at':r['checked_at'] if r else None,
    'latest':p.get('points',[None])[-1],'url':p.get('url'),'error':r['error'] if r else None})
- used=set(ASSETS)|{i['asset'] for e in items+archived for i in e['analysis']['impacts']}
- return {'items':items,'archived_items':archived,'window_hours':48,'window_start':start,'window_end':at,'assets':{a:assets[a] for a in used if a in assets},'markets':markets,'news_counts':dict(store.db.execute('SELECT status,count(*) FROM macro_news GROUP BY status')),
+ used=set(ASSETS)|{i['asset'] for e in enriched.values() for i in e['analysis']['impacts']}
+ return {'items':items,'archived_items':archived,'followup_items':followup,'history_items':history,'library':selection['library'],'window_hours':48,'window_start':start,'window_end':at,'assets':{a:assets[a] for a in used if a in assets},'markets':markets,'news_counts':dict(store.db.execute('SELECT status,count(*) FROM macro_news GROUP BY status')),
   'article_coverage':__import__('ashare.news_evidence',fromlist=['summary']).summary(store,at),
   'impact_learning':impact_summary(store,at,assessments),'news_screening':triage_summary(store,at),'source_coverage':coverage(store,at),
   'event_count':store.db.execute('SELECT count(*) FROM macro_events').fetchone()[0],
