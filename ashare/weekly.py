@@ -12,6 +12,9 @@ def run_daily(store, config, at=None):
     from .shadow import run as run_shadow
     at = normalize_time(at or now())
     result = {'at': at, 'registry': score(store, config, at), 'shadow': run_shadow(store, config, at), 'counts': registry_counts(store)}
+    if config.get('deployment_role') != 'cloud':
+        from .quick_diagnostics import safe_run
+        result['quick_diagnostics'] = safe_run(store, config, at)
     from .selfcheck import run as selfcheck
     result['selfcheck'] = selfcheck(store, config, at)
     if config.get('deployment_role') != 'cloud':
@@ -34,6 +37,7 @@ def collect(store, config, at=None, days=7):
     from .governance import issues, proposals
     from .maintenance import disk_status
     from .selfcheck import status as selfcheck_status
+    from .quick_diagnostics import view as diagnostic_view
     at = normalize_time(at or now())
     since = normalize_time((datetime.fromisoformat(at) - timedelta(days=days)).isoformat())
     week_start = local(since).date().isoformat()
@@ -43,6 +47,7 @@ def collect(store, config, at=None, days=7):
     portfolio_runs = {r['status']: r['n'] for r in store.db.execute('SELECT status,count(*) n FROM portfolio_runs WHERE started_at>=? GROUP BY status', (since,))}
     renewed = store.db.execute("SELECT count(*) FROM plan_events WHERE at>=? AND reason LIKE 'RENEWED:%'", (since,)).fetchone()[0]
     return {'generated_at': at, 'window': {'from': since, 'to': at}, 'horizon_days': config.get('evaluation_horizon_days', 20),
+            'quick_diagnostics': diagnostic_view(store),
             'selfcheck': selfcheck_status(store),
             'registry': {'counts': registry_counts(store), 'all_time': comparisons(store, config), 'scored_this_week': store.db.execute(
                 "SELECT count(*) FROM signal_scores WHERE method=? AND status='SCORED' AND scored_at>=?", (SCORE_METHOD, since)).fetchone()[0]},
@@ -87,6 +92,9 @@ def markdown(report, title=None, period='本周'):
                 s = stats['non_overlapping']
                 if s['n']:
                     lines.append(f"| {build} | {names.get(key, key)} | {label} | {s['n']} / {s.get('time_clusters', 0)} | {_pct(s.get('mean_bps'))} |")
+    if report.get('quick_diagnostics'):
+        from .quick_diagnostics import markdown as diagnostic_markdown
+        lines += ['', diagnostic_markdown(report['quick_diagnostics']), '']
     health = report['shadow'].get('status', {})
     lines += ['', f"对照回放：{health.get('status', 'UNKNOWN')}；已完整计算至 {health.get('through')}；请求至 {health.get('requested_through')}。",
               f"待补数据：{json.dumps(health.get('missing', []), ensure_ascii=False)}", health.get('limitations', '')]

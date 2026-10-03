@@ -595,9 +595,93 @@ function drawProposals(box,data) {
     detail.append(body);card.append(detail);box.append(card);
   }
 }
+function diagnosticCount(value) {return Number.isInteger(value)&&value>=0?String(value):'待核对';}
+function diagnosticBps(value) {return Number.isFinite(value)?(value>0?'+':'')+value.toFixed(1)+' 基点':'尚无可用统计';}
+function diagnosticHasSamples(groups) {
+  return Object.values(groups&&typeof groups==='object'?groups:{}).some(rows=>rows&&typeof rows==='object'&&
+    Object.values(rows).some(stats=>Number.isInteger(stats?.daily?.n)&&stats.daily.n>0));
+}
+function drawDiagnosticGroups(box,groups) {
+  if(!diagnosticHasSamples(groups)){box.append(el('p','尚无到期可评分样本；等待观察期结束并取得所需行情。','empty'));return;}
+  const titles={trend_filter:'自选股 · 趋势条件',research_veto:'自选股 · 研究判断',portfolio_allow:'组合 · 增持判断',global_stance:'全球资产 · 方向判断'};
+  const labels={trend_ok:'符合趋势条件',trend_fail:'未符合趋势条件',WATCH:'继续观察',NOT_WATCH:'非观察判断',ALLOW:'允许增持',NOT_ALLOW:'未允许增持',LONG:'看多',WAIT:'等待'};
+  let shown=0;
+  for(const [name,rows] of Object.entries(groups&&typeof groups==='object'?groups:{})){
+    if(!rows||typeof rows!=='object'||Array.isArray(rows))continue;
+    const group=el('section',null,'diagnostic-group');group.append(proposalText('h4',titles[name]||name));
+    for(const [label,stats] of Object.entries(rows)){
+      if(!stats||typeof stats!=='object')continue;
+      const row=el('div',null,'diagnostic-row'),daily=stats.daily||{},non=stats.non_overlapping||{};
+      row.append(proposalText('h5',labels[label]||label));
+      row.append(proposalText('p','逐日去重：'+diagnosticCount(daily.n)+' 份观察'+(daily.n>0?'；平均超额 '+diagnosticBps(daily.mean_bps):''),'subtle'));
+      row.append(proposalText('p','持有期不重叠：'+diagnosticCount(non.n)+' 份观察；'+diagnosticCount(non.time_clusters??(non.n===0?0:null))+' 个时间簇。'));
+      if(non.n>0){
+        row.append(proposalText('p','平均超额 '+diagnosticBps(non.mean_bps)+(Number.isFinite(non.hit_rate)&&non.hit_rate>=0&&non.hit_rate<=1?'；超额为正占比 '+(non.hit_rate*100).toFixed(1)+'%':'')));
+        const ci=non.ci95_bps,clusters=non.time_clusters;
+        if(Number.isInteger(clusters)&&clusters>=30&&clusters<=non.n&&Array.isArray(ci)&&ci.length===2&&ci.every(Number.isFinite)&&ci[0]<=ci[1])row.append(proposalText('p','95% 聚类近似区间：'+diagnosticBps(ci[0])+' 至 '+diagnosticBps(ci[1]),'subtle'));
+        else row.append(el('p',Number.isInteger(clusters)&&clusters<30?'不足 30 个时间簇，不展示区间；尚不能判断效果。':'区间尚不能估计；当前仅作描述统计。','diagnostic-caution'));
+      }else row.append(el('p',non.n===0?'尚无到期可评分样本。':'样本统计待核对。','subtle'));
+      group.append(row);shown++;
+    }
+    if(group.children.length>1)box.append(group);
+  }
+  if(!shown)box.append(el('p','尚无到期可评分样本；等待观察期结束并取得所需行情。','empty'));
+}
+function drawDiagnosticTrack(box,data,auxiliary) {
+  const section=el('section',null,'diagnostic-track'+(auxiliary?' diagnostic-auxiliary':''));
+  section.append(el('h3',auxiliary?'5 日辅助诊断':'原评分记录'),el('span',auxiliary?'仅供诊断 · 不参与批准':'保留原评分口径','badge'));
+  if(!data||typeof data!=='object'){
+    section.append(el('p','本项统计尚未同步，暂不能确认样本状态。','empty'));box.append(section);return;
+  }
+  if(auxiliary&&(data.method!=='decision-time-v2-q5'||data.horizon_days!==5||data.auxiliary_only!==true||data.approval_eligible!==false)){
+    section.append(el('p','辅助诊断口径待核对，暂不展示统计结果。','caution'));box.append(section);return;
+  }
+  section.append(proposalText('p',auxiliary?'在 5 个交易日／观测日线窗口查看短期价格变化；不含交易费用与汇率影响，不代表策略有效。':'股票采用原定 '+diagnosticCount(data.horizon_days)+' 个交易日口径；全球资产保留各自的原观察期限。','diagnostic-scope'));
+  if(typeof data.notice==='string'&&data.notice)section.append(proposalText('p',data.notice,'diagnostic-notice'));
+  const routes={watchlist:'自选股',portfolio:'组合',global:'全球资产',dynamic:'动态研究'},states={OPEN:'待成熟或补齐行情',SCORED:'已评分',UNSCORABLE:'暂不可评分',EXCLUDED:'已排除'};
+  const counts=el('div',null,'diagnostic-counts');
+  for(const [key,n] of Object.entries(data.counts&&typeof data.counts==='object'?data.counts:{})){
+    const [route,state]=key.split(':');counts.append(proposalText('span',(routes[route]||route)+' · '+(states[state]||state||'状态待核对')+' '+diagnosticCount(n),'badge'));
+  }
+  if(counts.children.length)section.append(counts);
+  if(data.sample_sources&&typeof data.sample_sources==='object'){
+    const sources=el('div',null,'diagnostic-notice');
+    for(const [key,title,unit] of [['scored_rows','评分条数','条'],['daily_samples','每日去重样本','份']]){
+      const values=data.sample_sources[key]||{};
+      sources.append(proposalText('p',title+'（来源）：判断时冻结 '+diagnosticCount(values.LIVE)+' '+unit+'；历史补登记 '+diagnosticCount(values.LEGACY)+' '+unit+'；来源未核实 '+diagnosticCount(values.UNCLASSIFIED)+' '+unit+'。'));
+    }
+    sources.append(el('p','判断时冻结表示记录来源，不等于已完成前向实验；每日去重后也不代表样本相互独立。'));section.append(sources);
+  }
+  if(data.mixed_builds)section.append(el('p','汇总包含多个程序版本，不用于直接判断改动效果。请展开下方版本分组分别查看。','diagnostic-caution'));
+  if(diagnosticHasSamples(data.groups)){
+    const groupDetails=details('查看分组统计','diagnostics:'+(auxiliary?'quick':'primary')+':groups');
+    drawDiagnosticGroups(groupDetails,data.groups);section.append(groupDetails);
+  }else drawDiagnosticGroups(section,data.groups);
+  const builds=Object.entries(data.by_build&&typeof data.by_build==='object'?data.by_build:{});
+  if(builds.length){
+    const versionDetails=details('按程序版本查看（'+builds.length+' 个）','diagnostics:'+(auxiliary?'quick':'primary'));
+    for(const [build,groups] of builds){
+      const version=el('section',null,'diagnostic-build');version.append(proposalText('h4','程序版本：'+build));drawDiagnosticGroups(version,groups);versionDetails.append(version);
+    }
+    section.append(versionDetails);
+  }
+  box.append(section);
+}
+function drawScoreDiagnostics(box,data) {
+  box.append(el('p','原评分与 5 日诊断独立展示，样本不能相加。辅助诊断不参与自动批准，也不会改变研究或交易规则。','diagnostic-boundary'));
+  if(!data){box.append(el('p','评分诊断尚未同步。服务完成评估并同步后会在这里显示。','empty'));return;}
+  if(data.status==='ERROR'){box.append(el('p','评分诊断暂未生成成功；原评分记录保留，等待后续评估与同步。','caution'));return;}
+  if(data.status==='NOT_RUN'){box.append(el('p','尚未运行本轮评分诊断，等待下一次评估；暂无辅助诊断结果。','empty'));return;}
+  if(data.status!=='READY'||data.version!=='quick-diagnostics-v1'){box.append(el('p','评分诊断格式待核对，暂不展示统计结果。','caution'));return;}
+  if(typeof data.generated_at==='string'&&Number.isFinite(Date.parse(data.generated_at)))box.append(el('p','最近生成：'+when(data.generated_at)+'（北京时间）','subtle'));
+  if(typeof data.notice==='string'&&data.notice)box.append(proposalText('p',data.notice,'diagnostic-notice'));
+  const tracks=el('div',null,'diagnostic-tracks');drawDiagnosticTrack(tracks,data.primary,false);drawDiagnosticTrack(tracks,data.quick,true);box.append(tracks);
+  if(Number.isInteger(data.omitted_builds)&&data.omitted_builds>0)box.append(el('p','页面另有 '+data.omitted_builds+' 个版本分组未展开；完整记录可在本机核对。','subtle'));
+}
 function renderActivity(s) {
   if($('supervision'))renderChanged('supervision',s.supervision||{items:[]},box=>drawSupervision(box,s.supervision));
   if($('proposals'))renderChanged('proposals',s.supervision?.proposals??null,box=>drawProposals(box,s.supervision?.proposals));
+  if($('score-diagnostics'))renderChanged('score-diagnostics',s.supervision?.diagnostics??null,box=>drawScoreDiagnostics(box,s.supervision?.diagnostics));
   const market=s.market_phase==='CONTINUOUS';
   const nextSlot=s.next_runs.find(r=>r.kind==='slot');
   $('slot-timing').textContent=(market?'交易时段':'当前休市')+(nextSlot?' · 下次检查 '+shortTime(nextSlot.scheduled_at):'');
@@ -787,7 +871,7 @@ function rememberWatchlist(){if(typeof location!=='undefined'&&location.pathname
 function stockPath(symbol){return '/stocks/'+encodeURIComponent(symbol)+'?return='+encodeURIComponent(watchlistHash());}
 function parseWorkspaceHash(hash){
   const [raw,query='']=hash.replace(/^#/,'').split('?'),params=new URLSearchParams(query);
-  const board=['fill-history','proposal-section','supervision-section'].includes(raw)?'activity':raw==='portfolio-section'||raw==='watchlist-performance'?'holdings':raw.replace(/-section$/,'');
+  const board=['fill-history','score-diagnostics-section','proposal-section','supervision-section'].includes(raw)?'activity':raw==='portfolio-section'||raw==='watchlist-performance'?'holdings':raw.replace(/-section$/,'');
   return {board:boards.includes(board)?board:'watchlist',list:['CORE','DYNAMIC','FIXED','ALL'].includes(params.get('list'))?params.get('list'):'CORE',status:['ALL',...Object.keys(researchStates)].includes(params.get('status'))?params.get('status'):'ALL',market:observationCategories[params.get('market')]?params.get('market'):'CN',query:(params.get('q')||'').slice(0,80)};
 }
 function selectBoard(board,{focus=false,remember=false}={}) {

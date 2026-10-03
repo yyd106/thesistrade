@@ -54,6 +54,8 @@ def main():
     ev=sub.add_parser('evaluate', help='给到期的结论打分并推进对照账本（不调用模型）')
     ev.add_argument('--backfill', action='store_true', help='先把注册表上线前的历史研究、组合与全球判断补登记（按原时间）')
     sub.add_parser('weekly-report', help='生成周度评估报告（不调用模型）')
+    qd = sub.add_parser('diagnostics', help='固定5日辅助诊断：run生成，show只读；不改原评分或批准提案')
+    qd.add_argument('action', choices=['run', 'show'])
     sc = sub.add_parser('self-check', help='长期自检：run诊断，propose整理候选，status/show查询；不调用模型或改策略')
     sc.add_argument('action', choices=['run', 'propose', 'status', 'show'])
     sc.add_argument('id', nargs='?')
@@ -226,6 +228,13 @@ def extended(args, config):
             finally:store.close()
         result = execute(config, 'evaluate' if command == 'evaluate' else 'weekly_report', use_model=False)
         return {**extra, **result} if extra else result
+    if command == 'diagnostics':
+        from . import quick_diagnostics
+        store = Store(config['data_dir'])
+        try:
+            return quick_diagnostics.run(store, config) if args.action == 'run' else quick_diagnostics.view(store)
+        finally:
+            store.close()
     if command in ('self-check', 'experiments'):
         from . import selfcheck, experiments
         store = Store(config['data_dir'])

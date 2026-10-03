@@ -111,6 +111,8 @@ cd /Users/dean/Documents/Codex/Agents/ashare-agent
 ./agent evaluation start
 ./agent evaluation note <编号> --file 小结.md
 ./agent evaluation list
+./agent diagnostics run                   # 固定5日辅助诊断；不改原评分或批准提案
+./agent diagnostics show                  # 原评分/5日分开显示的程序统计摘要
 ./agent notices new --kind DECISION --title "标题" --body-file 正文.md
 ./agent notices list
 ./agent reports sync

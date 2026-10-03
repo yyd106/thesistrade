@@ -405,8 +405,10 @@ def listing(store, limit=30, *, subject_id=None):
 
 def view(store):
     from .proposal_presentation import attach
+    from .quick_diagnostics import view as diagnostic_view
     r = store.db.execute("SELECT value FROM service_state WHERE key='supervision_discovery'").fetchone()
-    return attach(store, {'items': listing(store), 'discovery': json.loads(r[0]) if r else None})
+    return {**attach(store, {'items': listing(store), 'discovery': json.loads(r[0]) if r else None}),
+            'diagnostics': diagnostic_view(store)}
 
 
 def worker(config, rid, cancel):

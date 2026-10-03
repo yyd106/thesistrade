@@ -625,3 +625,87 @@ assert.equal(proposalBox.querySelectorAll('details[data-key]').find(n=>n.dataset
 assert.ok(!proposalBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='proposal:CP_evidence_02').open);
 context.document.getElementById=originalGetById;
 console.log('Read-only proposal evidence, literal identifiers, safe text, recommendation/approval separation, stale review, incomplete/empty states, compact summaries and stable disclosures passed.');
+
+// Auxiliary diagnostics never replace primary scores or imply approval or independent samples.
+const drawScoreDiagnostics=vm.runInContext('drawScoreDiagnostics',context);
+const diagnosticStats=(mean,n=8,clusters=3,ci=[-999,999])=>({daily:{n:n+4,mean_bps:mean+1},non_overlapping:{n,time_clusters:clusters,mean_bps:mean,hit_rate:.625,ci95_bps:ci}});
+const primaryGroups={trend_filter:{trend_ok:diagnosticStats(120),trend_fail:{daily:{n:0},non_overlapping:{n:0}}}};
+const quickGroups={trend_filter:{trend_ok:diagnosticStats(-45),trend_fail:{daily:{n:0},non_overlapping:{n:0}}}};
+const diagnosticFixture={version:'quick-diagnostics-v1',status:'READY',generated_at:'2026-10-03T10:00:00Z',notice:'跨期限样本可能重复，不能相加。',
+  primary:{method:'decision-time-v2',horizon_days:20,counts:{'watchlist:OPEN':14,'watchlist:SCORED':8},groups:primaryGroups,by_build:{build_01:primaryGroups},mixed_builds:false,notice:'保留原到期评分。'},
+  quick:{method:'decision-time-v2-q5',horizon_days:5,auxiliary_only:true,approval_eligible:false,counts:{'watchlist:OPEN':3,'watchlist:SCORED':8},groups:quickGroups,by_build:{'<img src=x onerror=alert(1)>':quickGroups},mixed_builds:true,notice:'历史补记与上线后前向记录均保留来源；历史补记不作前向证据。'},omitted_builds:2};
+const diagnosticBefore=JSON.stringify(diagnosticFixture);
+let diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,diagnosticFixture);
+let diagnosticOutput=JSON.stringify(diagnosticBox),diagnosticNodes=descendants(diagnosticBox);
+const diagnosticTracks=diagnosticNodes.filter(n=>n.className?.split(' ').includes('diagnostic-track'));
+assert.equal(diagnosticTracks.length,2);
+assert.match(JSON.stringify(diagnosticTracks[0]),/原评分记录|保留原评分口径/);
+assert.match(JSON.stringify(diagnosticTracks[0]),/原定 20 个交易日口径/);
+assert.match(JSON.stringify(diagnosticTracks[0]),/全球资产保留各自的原观察期限/);
+assert.match(JSON.stringify(diagnosticTracks[0]),/\+120\.0 基点/);
+assert.doesNotMatch(JSON.stringify(diagnosticTracks[0]),/-45\.0 基点/);
+assert.match(JSON.stringify(diagnosticTracks[1]),/5 日辅助诊断/);
+assert.match(JSON.stringify(diagnosticTracks[1]),/-45\.0 基点/);
+assert.doesNotMatch(JSON.stringify(diagnosticTracks[1]),/\+120\.0 基点/);
+for(const text of ['不参与自动批准','不代表策略有效','不含交易费用与汇率影响','样本不能相加','历史补记不作前向证据','待成熟或补齐行情 14','不足 30 个时间簇','尚无到期可评分样本','另有 2 个版本分组'])assert.ok(diagnosticOutput.includes(text));
+assert.doesNotMatch(diagnosticOutput,/999\.0|95% 聚类近似区间|NaN|undefined|策略已批准|20日收益确认/);
+assert.ok(diagnosticNodes.some(n=>n.tag==='h4'&&n.textContent==='程序版本：<img src=x onerror=alert(1)>'));
+assert.ok(diagnosticNodes.every(n=>!['img','script','button','a'].includes(n.tag)&&!n.innerHTML));
+assert.ok(diagnosticNodes.filter(n=>n.tag==='details').every(n=>!n.open));
+for(const track of ['primary','quick'])assert.ok(diagnosticNodes.some(n=>n.tag==='details'&&n.dataset.key==='diagnostics:'+track+':groups'&&n.children[0].textContent==='查看分组统计'));
+assert.equal(JSON.stringify(diagnosticFixture),diagnosticBefore);
+assert.equal(workspaceView('#score-diagnostics-section').board,'activity');
+
+// Eight empty labels collapse into a single maturity message in each track.
+const emptyDiagnosticGroups=Object.fromEntries(['trend_filter','research_veto','portfolio_allow','global_stance'].map(name=>[name,{WAIT:{daily:{n:0},non_overlapping:{n:0}},LONG:{daily:{n:0},non_overlapping:{n:0}}}]));
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,
+  primary:{...diagnosticFixture.primary,groups:emptyDiagnosticGroups,by_build:{}},quick:{...diagnosticFixture.quick,groups:emptyDiagnosticGroups,by_build:{}}});
+for(const track of descendants(diagnosticBox).filter(n=>n.className?.split(' ').includes('diagnostic-track'))){
+  assert.equal(descendants(track).filter(n=>n.className==='empty').length,1);
+  assert.equal(descendants(track).filter(n=>n.className==='diagnostic-row').length,0);
+  assert.ok(!descendants(track).some(n=>n.dataset.key?.endsWith(':groups')));
+  assert.match(JSON.stringify(track),/等待观察期结束并取得所需行情/);
+}
+
+// Registry score rows and daily deduplicated samples have different denominators.
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,quick:{...diagnosticFixture.quick,
+  sample_sources:{scored_rows:{LIVE:17,LEGACY:9,UNCLASSIFIED:2},daily_samples:{LIVE:11,LEGACY:4,UNCLASSIFIED:1}}}});
+const sourceDiagnostic=descendants(diagnosticBox).filter(n=>n.className?.split(' ').includes('diagnostic-track'))[1];
+assert.match(JSON.stringify(sourceDiagnostic),/评分条数（来源）：判断时冻结 17 条；历史补登记 9 条；来源未核实 2 条/);
+assert.match(JSON.stringify(sourceDiagnostic),/每日去重样本（来源）：判断时冻结 11 份；历史补登记 4 份；来源未核实 1 份/);
+assert.match(JSON.stringify(sourceDiagnostic),/不等于已完成前向实验；每日去重后也不代表样本相互独立/);
+assert.doesNotMatch(JSON.stringify(sourceDiagnostic),/独立前向样本|前向实验样本 17/);
+
+// An interval is withheld even if the server supplies one for fewer than 30 clusters.
+const intervalGroups={research_veto:{WATCH:diagnosticStats(10,35,30,[-12.5,32.5])}};
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,quick:{...diagnosticFixture.quick,groups:intervalGroups,by_build:{},mixed_builds:false}});
+assert.match(JSON.stringify(diagnosticBox),/95% 聚类近似区间：-12\.5 基点 至 \+32\.5 基点/);
+for(const invalid of [[32.5,-12.5],[NaN,10],[1,2,3]]){
+  diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,quick:{...diagnosticFixture.quick,groups:{research_veto:{WATCH:diagnosticStats(10,35,30,invalid)}},by_build:{}}});
+  assert.doesNotMatch(JSON.stringify(diagnosticBox),/95% 聚类近似区间|NaN/);
+}
+for(const [data,message] of [[undefined,/尚未同步/],[{status:'NOT_RUN'},/尚未运行本轮评分诊断/],[{status:'ERROR'},/暂未生成成功.*原评分记录保留/],[{status:'READY',version:'unknown'},/格式待核对/]]){
+  diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,data);assert.match(JSON.stringify(diagnosticBox),message);
+  assert.doesNotMatch(JSON.stringify(diagnosticBox),/平均超额/);
+}
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,quick:{...diagnosticFixture.quick,approval_eligible:true}});
+assert.match(JSON.stringify(diagnosticBox),/辅助诊断口径待核对/);
+assert.doesNotMatch(JSON.stringify(diagnosticBox),/-45\.0 基点/);
+
+// Refreshes preserve separate primary and auxiliary version disclosures.
+diagnosticBox=new FakeElement('section');diagnosticBox.querySelectorAll=selector=>descendants(diagnosticBox).filter(n=>n.tag==='details'&&n.dataset.key&&(!selector.includes('[open]')||n.open));
+context.document.getElementById=id=>id==='score-diagnostics'?diagnosticBox:originalGetById(id);
+renderChanged('score-diagnostics',diagnosticFixture,box=>drawScoreDiagnostics(box,diagnosticFixture));
+diagnosticBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='diagnostics:quick').open=true;
+diagnosticBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='diagnostics:quick:groups').open=true;
+const updatedDiagnostic={...diagnosticFixture,generated_at:'2026-10-03T10:01:00Z'};
+renderChanged('score-diagnostics',updatedDiagnostic,box=>drawScoreDiagnostics(box,updatedDiagnostic));
+assert.equal(diagnosticBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='diagnostics:quick').open,true);
+assert.equal(diagnosticBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='diagnostics:quick:groups').open,true);
+assert.ok(!diagnosticBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='diagnostics:primary').open);
+assert.ok(!diagnosticBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='diagnostics:primary:groups').open);
+context.document.getElementById=originalGetById;
+const dashboardMarkup=await readFile(new URL('../ashare/web/index.html',import.meta.url),'utf8');
+assert.ok(dashboardMarkup.indexOf('id="score-diagnostics-section"')<dashboardMarkup.indexOf('id="proposal-section"'));
+assert.match(dashboardMarkup,/href="#score-diagnostics-section"/);
+console.log('Primary and five-day diagnostics remain separate, safe and read-only; maturity, source caveats, 30-cluster intervals and version disclosures passed.');

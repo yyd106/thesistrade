@@ -14,6 +14,8 @@ from .calendar import last_completed_day, completed_bar_cutoff, trading_day, loc
 
 BENCHMARK = 'sh000300'
 SCORE_METHOD = 'decision-time-v2'
+QUICK_SCORE_METHOD = 'decision-time-v2-q5'
+QUICK_HORIZON_DAYS = 5
 # Blockers that come from the model's judgment, as opposed to data completeness or price rules.
 RESEARCH_BLOCKERS = ('RESEARCH_VETO', 'MODEL_NOT_READY')
 
@@ -204,15 +206,30 @@ def score_global_row(row, closes):
 
 def score(store, config, at=None):
     """Score every open registry row whose horizon has elapsed. Idempotent; model-free."""
+    return _score(store, at, method=SCORE_METHOD)
+
+
+def score_quick(store, config, at=None):
+    """Append a separate five-day price diagnostic, without changing the original contract.
+
+    This method is fixed in code: strategy configuration and the judgment's original
+    horizon cannot change it. It is never a substitute for the original score.
+    """
+    return _score(store, at, method=QUICK_SCORE_METHOD, days=QUICK_HORIZON_DAYS)
+
+
+def _score(store, at, *, method, days=None):
     at = normalize_time(at or now())
     bench = _benchmark_bars(store)
     cache = {}
     scored = pending = unscorable = 0
     stale = normalize_time((datetime.fromisoformat(at) - timedelta(days=120)).isoformat())
     rows = store.db.execute('''SELECT r.* FROM signal_registry r WHERE NOT EXISTS
-        (SELECT 1 FROM signal_scores s WHERE s.signal_id=r.id AND s.method=?) ORDER BY created_at''', (SCORE_METHOD,)).fetchall()
+        (SELECT 1 FROM signal_scores s WHERE s.signal_id=r.id AND s.method=?) ORDER BY created_at''', (method,)).fetchall()
     with store.db:
         for row in rows:
+            if days is not None:
+                row = {**dict(row), 'horizon_days': days}
             if row['route'] == 'global' or (row['route'] == 'portfolio' and not row['benchmark']):
                 key = ('g', row['symbol'])
                 if key not in cache:
@@ -230,9 +247,14 @@ def score(store, config, at=None):
                     pending += 1
                     continue
             status = result.pop('status')
+            if method == QUICK_SCORE_METHOD:
+                result.update(method=method, horizon_days=QUICK_HORIZON_DAYS,
+                              auxiliary_only=True, approval_eligible=False)
             # The original registry and any v1 score remain untouched for audit/reversion.
-            store.db.execute('INSERT OR IGNORE INTO signal_scores VALUES(?,?,?,?,?)',
-                             (row['id'], SCORE_METHOD, status, encode(result), at))
+            inserted = store.db.execute('INSERT OR IGNORE INTO signal_scores VALUES(?,?,?,?,?)',
+                                        (row['id'], method, status, encode(result), at)).rowcount
+            if method == QUICK_SCORE_METHOD and not inserted:
+                continue
             scored += status == 'SCORED'
             unscorable += status == 'UNSCORABLE'
     return {'scored': scored, 'pending': pending, 'unscorable': unscorable}
@@ -298,21 +320,54 @@ def describe(samples, field='excess_bps'):
             'ci95_bps': [round(mean - half, 1), round(mean + half, 1)] if half is not None else None}
 
 
-def load(store, route, since=None):
+def load(store, route, since=None, *, method=SCORE_METHOD, at=None):
     sql = """SELECT r.*,s.score_json current_score FROM signal_registry r JOIN signal_scores s
         ON s.signal_id=r.id AND s.method=? WHERE r.route=? AND s.status='SCORED'""" + (' AND r.created_at>=?' if since else '')
+    params = [method, route] + ([since] if since else [])
+    if at is not None:
+        at = normalize_time(at)
+        sql += ' AND r.created_at<=? AND s.scored_at<=?'
+        params.extend((at, at))
     rows = []
-    for r in store.db.execute(sql, (SCORE_METHOD, route, since) if since else (SCORE_METHOD, route)):
+    for r in store.db.execute(sql, params):
         rows.append({**dict(r), 'judgment': json.loads(r['judgment_json']), 'score': json.loads(r['current_score'])})
     return rows
 
 
-def comparisons(store, config, since=None):
+def comparisons(store, config, since=None, *, at=None):
     """Descriptive comparisons. Select windows BEFORE any comparison or build split."""
-    days = horizon(config)
+    return _comparisons(store, since, method=SCORE_METHOD, days=horizon(config), at=at)
+
+
+def quick_comparisons(store, config, since=None, *, at=None):
+    """Five-day descriptive groups kept separate from scoring and approval evidence."""
+    result = _comparisons(store, since, method=QUICK_SCORE_METHOD, days=QUICK_HORIZON_DAYS, at=at)
+    sources = {r['id']: r['provenance'] for r in store.db.execute(
+        'SELECT id,provenance FROM judgment_contracts' + (' WHERE frozen_at<=?' if at is not None else ''),
+        (normalize_time(at),) if at is not None else ())}
+    rows = [s for route in ('watchlist', 'portfolio', 'global')
+            for s in load(store, route, since, method=QUICK_SCORE_METHOD, at=at)]
+
+    def counts(samples):
+        totals = {'LIVE': 0, 'LEGACY': 0, 'UNCLASSIFIED': 0}
+        for sample in samples:
+            source = sources.get(sample['id'])
+            totals[source if source in ('LIVE', 'LEGACY') else 'UNCLASSIFIED'] += 1
+        return totals
+
+    result.update(auxiliary_only=True, approval_eligible=False,
+        sample_sources={'scored_rows': counts(rows), 'daily_samples': counts(daily_samples(rows)),
+            'notice': 'LIVE 为判断产生时冻结的记录，仍不等于前向实验；LEGACY 为历史补登记；UNCLASSIFIED 为没有可识别冻结来源的记录。'},
+        notice='固定5日辅助价格诊断，与原评分分开保存和展示，不参与自动候选或批准，不确认实际收益、经营事实或前向实验效果。'
+               'A股为可用判断后的首次交易开盘至含入场日的第5个交易日收盘；全球沿用原收盘代理，为6个已完成收盘点之间的5期变化，未计费用和汇率，不能与A股直接比较。'
+               '日样本去重、重叠窗口选择和跨标的时间聚类均在分组及分版本前完成；不足30个时间簇不显示区间。区间为聚类近似，不证明因果或未来盈利。')
+    return result
+
+
+def _comparisons(store, since, *, method, days, at=None):
     out = {}
 
-    cohorts = {route: time_clusters(daily_samples(load(store, route, since)))
+    cohorts = {route: time_clusters(daily_samples(load(store, route, since, method=method, at=at)))
                for route in ('watchlist', 'portfolio', 'global')}
     kept_ids = {s['id'] for samples in cohorts.values() for s in non_overlapping(samples, days)}
 
@@ -337,12 +392,19 @@ def comparisons(store, config, since=None):
         return dict(out)
     pooled = groups()
     builds = sorted({s.get('build_id') or 'UNKNOWN' for ss in cohorts.values() for s in ss})
-    return {'method': SCORE_METHOD, 'horizon_days': days, 'groups': pooled,
+    return {'method': method, 'horizon_days': days, 'groups': pooled,
             'by_build': {b: groups(b) for b in builds}, 'mixed_builds': len(builds) > 1,
             'notice': '汇总仅作描述；采样在分组和分版本前完成。同标的持有期不重叠仍不等于独立，跨标的重叠窗口归为同一时间簇；不足30簇不显示区间。区间为聚类近似，未证明因果或未来盈利。全球组持有期不同且不含费用汇率，不作直接优劣结论。'}
 
 
-def registry_counts(store):
-    return {f"{r['route']}:{r['current_status']}": r['n'] for r in store.db.execute('''SELECT r.route,
+def registry_counts(store, *, method=SCORE_METHOD, at=None):
+    sql = '''SELECT r.route,
         coalesce(s.status,'OPEN') current_status,count(*) n FROM signal_registry r LEFT JOIN signal_scores s
-        ON s.signal_id=r.id AND s.method=? GROUP BY r.route,current_status''', (SCORE_METHOD,))}
+        ON s.signal_id=r.id AND s.method=?'''
+    params = [method]
+    if at is not None:
+        at = normalize_time(at)
+        sql += ' AND s.scored_at<=? WHERE r.created_at<=?'
+        params.extend((at, at))
+    sql += ' GROUP BY r.route,current_status'
+    return {f"{r['route']}:{r['current_status']}": r['n'] for r in store.db.execute(sql, params)}
