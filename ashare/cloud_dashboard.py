@@ -53,8 +53,13 @@ def status(store,config):
             item['quote']=latest_quote(store,item['asset'],at)
         p=active_plan(store,item['asset'],at)
         item['trade_plan']={**p,'payload':json.loads(p['payload_json'])} if p else None
-    cache['reviews']=value(store,'display_reviews',cache['reviews'])
+    # The independent display overlay compares generation times with both old
+    # delivery paths. Keep legacy behavior until the new channel is present.
+    if not value(store,'display_review_news'):
+        cache['reviews']=value(store,'display_reviews',cache['reviews'])
     cache['supervision']=value(store,'display_supervision',cache.get('supervision',{'items':[]}))
+    from .page_display import apply as apply_page_display
+    apply_page_display(store,cache)
     result={**cache,'version':__version__,'at':at,'mode':'paper','live_execution':False,'model_auth':'LOCAL_RESEARCH','deployment_role':'cloud',
       'research_lease':lease(store,config,at),'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,'market_phase':phase(at),
       'account':a,'portfolio':portfolio(store,config,a,at),'trade_effects':trade_effects(store,config,at),'portfolio_strategy':view(store,config,at),

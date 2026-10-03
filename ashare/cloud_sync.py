@@ -292,6 +292,11 @@ def handle(store,config,path,body,at):
         from .notices import receive
         return receive(store,body,at)
     if path=='/api/sync/reviews':
+        if 'page_display' in body:
+            if set(body) != {'page_display'}:
+                raise ValueError('独立展示摘要不能混入账本、策略或监督数据')
+            from .page_display import receive
+            return receive(store,body['page_display'],at)
         for t in ('reviews','lessons','research_methods','research_improvements'):ledger.upsert(store,t,body.get(t,[]),immutable=True)
         if 'display' in body:put(store,'display_reviews',body['display'])
         if 'supervision' in body:
@@ -351,6 +356,11 @@ def sync_once(config):
                 deliver_supervision(store,config)
             except Exception as exc:
                 with store.db:put(store,'supervision_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
+            try:
+                deliver_page_display(store,config)
+            except Exception as exc:
+                # A stale page must never stop accounting or renew strategy authority.
+                with store.db:put(store,'page_display_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
             return answer or {'status':'SYNCED'}
     except Exception as exc:
         if str(exc).startswith('BUSY:'):return {'status':'BUSY'}
@@ -372,6 +382,29 @@ def deliver_supervision(store,config):
     with store.db:
         put(store,'supervision_sent_hash',fingerprint)
         put(store,'supervision_sync',{'at':now(),'status':'OK'})
+    return answer
+
+
+def deliver_page_display(store,config):
+    """Publish only bounded review/news presentation, independently of research."""
+    from .page_display import FEATURE, collect
+    if role(config)!='research' or not remote_supports(store,FEATURE):return None
+    packet=collect(store,config)
+    fingerprint=packet['content_hash']
+    if value(store,'page_display_sent_hash')==fingerprint:return None
+    answer=request(config,'/api/sync/reviews',{'page_display':packet})
+    receipt=answer.get('page_display') or {}
+    if answer.get('status')!='ACCEPTED' or receipt.get('status') not in ('UPDATED','UNCHANGED','IGNORED_STALE'):
+        raise ValueError('云端未确认复盘与新闻展示摘要')
+    if receipt.get('status')=='IGNORED_STALE':
+        with store.db:put(store,'page_display_sync',{'at':now(),'status':'SUPERSEDED','generated_at':receipt.get('generated_at')})
+        return answer
+    if receipt.get('content_hash')!=fingerprint or receipt.get('generated_at')!=packet['generated_at']:
+        raise ValueError('云端展示摘要回执与本次发送不一致')
+    with store.db:
+        put(store,'page_display_sent_hash',fingerprint)
+        put(store,'page_display_sync',{'at':now(),'status':'OK','generated_at':packet['generated_at'],
+            'content_hash':fingerprint,'review_bytes':len(canonical(packet['reviews'])),'news_bytes':len(canonical(packet['macro']))})
     return answer
 
 

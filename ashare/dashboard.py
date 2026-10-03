@@ -73,32 +73,8 @@ def status(config, *, overview=False):
                 'open_orders':[{k:o[k] for k in ('id','side','qty','filled_qty','limit_cents','status','created_at')}
                     for o in a['orders'] if o['symbol']==item['symbol'] and o.get('origin')!='dynamic'],
                 'latest_study':dict(latest) if latest else None,'last_research_at':successful,'quote':store.latest_quote(item['symbol'],at)})
-        reviews=[]
-        from .review_presentation import projection as review_projection
-        for r in store.db.execute('''SELECT r.* FROM reviews r WHERE NOT EXISTS(
-            SELECT 1 FROM reviews newer WHERE newer.window_start=r.window_start AND newer.window_end=r.window_end
-            AND newer.revision>r.revision) ORDER BY r.window_end DESC LIMIT 5'''):
-            d=dict(r);d['payload']=json.loads(d.pop('payload_json'))
-            retry_count=store.db.execute("SELECT count(*) FROM jobs WHERE kind='review' AND id LIKE ?",('review-retry:'+r['window_end']+':%',)).fetchone()[0]
-            d['automatic_retries_remaining']=max(0,2-retry_count) if config['scheduler_enabled'] and config['model_enabled'] and r['window_end']==normalize_time(review_window(at,config['review_time'])[1].isoformat()) else 0
-            display=review_projection(store,d,d['payload'],at)
-            if overview:
-                p=d['payload'];d['payload']={'facts':{'statistics':p['facts']['statistics']},'analysis':p['analysis'],
-                    'analysis_error':p.get('analysis_error')}
-                if 'daily_portfolio' in p['facts']:
-                    d['payload']['facts']['daily_accounting']=display['daily']
-                if 'context_48h' in p['facts']:
-                    d['payload']['facts']['context_48h']={k:p['facts']['context_48h'][k] for k in ('window_start','window_end','totals','positions','learning_notice')}
-                if 'portfolio' in p['facts']:
-                    portfolio_facts=p['facts']['portfolio']
-                    d['payload']['facts']['portfolio']={k:portfolio_facts[k] for k in ('version','scope','positions','opening','closing','totals','valuation_notice','research')}
-            d['payload']['consistency_checks']=display['checks']['items']
-            d['payload']['routing']=[{'lesson':v['ordinal'],**{k:v.get(k) for k in ('to','id','status','updated_at')}} for v in display['findings']['items']]
-            d['presentation']=display
-            reviews.append(d)
-        if reviews:
-            total=store.db.execute('SELECT count(*) FROM (SELECT window_start,window_end FROM reviews GROUP BY window_start,window_end)').fetchone()[0]
-            reviews[0]['history']={'total':total,'shown':len(reviews),'omitted':max(0,total-len(reviews))}
+        from .review_presentation import listing as review_listing
+        reviews=review_listing(store,config,at,overview=overview)
         from .portfolio_strategy import view as portfolio_strategy_view
         from .followups import view as followup_view
         from .dynamic import view as dynamic_view

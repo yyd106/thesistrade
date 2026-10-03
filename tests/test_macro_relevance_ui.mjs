@@ -86,6 +86,16 @@ assert.equal(cards('macro-cases')[0].id,'macro-event-current-5');
 render({global:{...fixture,library:{...fixture.library,as_of:'2030-01-01T11:00:00Z'}}});
 assert.equal(cards('macro-cases')[0].id,'macro-event-current-5');
 
+// A bounded transport must keep the true totals visible, even with no rows loaded.
+render({global:{...fixture,library:{...fixture.library,current_total:65}}});
+assert.match(visibleText(nodes.get('macro-cases')),/共 65 条，本次仅载入最近 8 条/);
+render({global:{...fixture,items:[],followup_items:[],history_items:[],library:{...fixture.library,current_total:65}}});
+assert.match(visibleText(nodes.get('macro-cases')),/共 65 条，本次仅载入最近 0 条/);
+assert.match(visibleText(nodes.get('macro-followup')),/本次摘要未载入/);
+assert.equal(nodes.get('macro-followup-section').hidden,false);
+assert.equal(nodes.get('macro-history').hidden,false);
+render({global:fixture});
+
 // The cloud can retain an old signed snapshot while the local machine is offline.
 // Device time must retire its authority even when data and server snapshot do not change.
 clock=Date.parse('2030-01-04T09:00:00Z');

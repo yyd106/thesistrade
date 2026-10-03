@@ -450,6 +450,7 @@ function drawReviewFindings(body,r) {
   if(!data){const lessons=r.payload.analysis?.lessons||[];if(lessons.length){const d=details('本次发现（旧记录，去向待核对）','lessons:'+r.id);for(const l of lessons.slice(0,5))d.append(proposalText('p',l.lesson));if(lessons.length>5)d.append(el('p','仅展示前5条，完整发现保留在本机。','subtle'));body.append(d);}return;}
   if(!data.items?.length)return;
   const section=el('section',null,'review-findings');section.append(el('h3','发现与跟进'));
+  if(r.presentation?.status_at)section.append(el('p','处理状态核对截至 '+when(r.presentation.status_at)+'；离线时保留最近一次记录。','subtle'));
   const states={OPEN:'待处理',RESOLVED:'已解决',WONTFIX:'已记录不修复',DRAFT:'待整理草稿',READY:'待审查与决定',APPROVED:'已批准',ADOPTED:'已上线跟踪',REJECTED:'已驳回',RETIRED:'已退役',SUPERSEDED:'已被新版替代',UNKNOWN:'去向待核对'};
   const current=data.items.filter(x=>x.current),history=data.items.filter(x=>!x.current);
   function row(item,parent){const d=reviewDetails(proposalExcerpt(item.lesson,96)+' · '+(states[item.status]||'状态待核对'),'finding:'+r.id+':'+item.ordinal);d.append(proposalText('p',item.lesson));if(item.applicability)d.append(proposalText('p','待验证条件：'+item.applicability));
@@ -1483,7 +1484,7 @@ function drawDynamicCase(box,c){
 function renderDynamic(s){
   const d=s.dynamic;if(!d)return;
   const active=d.items.filter(c=>['READY','RESEARCH','HOLDING'].includes(c.status)||c.position.qty);
-  $('dynamic-count').textContent='近48小时 · '+(d.global?.items.filter(macroProminent).length||0)+' 个事件';
+  $('dynamic-count').textContent='近48小时 · '+(d.global?.library?.current_total??d.global?.items.filter(macroProminent).length??0)+' 个事件';
   renderGlobalMacro(d);
   $('dynamic-toggle').textContent=d.enabled?'暂停新闻跟踪':'开启新闻跟踪';
   const job=s.active_jobs?.find(j=>j.kind==='dynamic_cycle')||d.last_run?.status==='RUNNING';
@@ -1608,7 +1609,7 @@ function renderMacroPage(box,events,kind,assets,total=events.length,asOf=null){
     box.replaceChildren();const page=macroPages[kind],start=page*size;
     const caption=total>events.length?'共 '+total+' 条，本次仅载入最近 '+events.length+' 条；其余记录继续保留，本页未载入。':'共 '+total+' 条，每页最多 '+size+' 条。';
     box.append(el('p',caption+(asOf?' 状态核对截至 '+shortTime(asOf)+'；到期提醒按当前时间更新。':''),'subtle'));
-    if(!events.length){box.append(el('p',kind==='followup'?'暂无仍在观察期内的待跟进事项。':'暂无记录。','empty'));return;}
+    if(!events.length){box.append(el('p',total>0?'本次摘要未载入这些记录，请在本机追溯完整内容。':kind==='followup'?'暂无仍在观察期内的待跟进事项。':'暂无记录。','empty'));return;}
     events.slice(start,start+size).forEach(e=>drawMacroEvent(box,e,assets,{compact:true,historical:kind==='history'}));
     if(pages>1){
       const nav=el('nav',null,'macro-pagination');nav.setAttribute('aria-label',kind==='current'?'重要动态分页':kind==='followup'?'待跟进分页':'历史研究分页');
@@ -1650,18 +1651,18 @@ function renderGlobalMacro(d){
   const g=d.global||{items:[],assets:{},markets:[],sources:[],news_counts:{},observation_counts:{},event_count:0};
   renderChanged('macro-screening',g.news_screening,box=>renderNewsScreening(box,g.news_screening));
   const prominent=g.items.filter(macroProminent),asOf=g.library?.as_of||g.window_end,clock=[asOf,Math.floor(Date.now()/3600000)];
-  renderChanged('macro-cases',[g.items,g.assets,state?.observation?.membership,clock],box=>{
-    if(!prominent.length){box.append(el('p','近48小时暂无通过筛选且已完成研究的重要动态。新闻每30分钟更新，仍有跟进价值的事项和历史记录分别在下方查看。','empty'));return;}
-    renderMacroPage(box,prominent,'current',g.assets,prominent.length,asOf);
+  renderChanged('macro-cases',[g.items,g.assets,state?.observation?.membership,g.library?.current_total,clock],box=>{
+    if(!(g.library?.current_total??prominent.length)){box.append(el('p','近48小时暂无通过筛选且已完成研究的重要动态。新闻每30分钟更新，仍有跟进价值的事项和历史记录分别在下方查看。','empty'));return;}
+    renderMacroPage(box,prominent,'current',g.assets,g.library?.current_total??prominent.length,asOf);
   });
   const legacy=[...g.items.filter(e=>!macroProminent(e)),...(g.archived_items||[])];
   const followup=g.followup_items||[],archived=g.history_items||legacy,library=g.library||{};
   if($('macro-followup-section')){
-    $('macro-followup-section').hidden=!followup.length;
+    $('macro-followup-section').hidden=!(library.followup_total??followup.length);
     if($('macro-followup-title'))$('macro-followup-title').textContent='当前待跟进（'+(library.followup_total??followup.length)+'）';
     renderChanged('macro-followup',[followup,g.assets,state?.observation?.membership,library.followup_total,clock],box=>renderMacroPage(box,followup,'followup',g.assets,library.followup_total??followup.length,asOf));
   }
-  $('macro-history').hidden=!archived.length;
+  $('macro-history').hidden=!(library.history_total??archived.length);
   $('macro-history-title').textContent='历史研究与修订（'+(library.history_total??archived.length)+'）';
   renderChanged('macro-archive',[archived,g.assets,state?.observation?.membership,library.history_total,clock],box=>renderMacroPage(box,archived,'history',g.assets,library.history_total??archived.length,asOf));
   $('macro-execution-note').textContent=g.execution||'全球市场结论用于研究；当前账户仅接入普通沪深主板模拟交易，执行计划单独核验。';
