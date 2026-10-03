@@ -522,3 +522,69 @@ const returnView=workspaceView(new URL(returnPath,'http://localhost').searchPara
 assert.equal(returnView.list,'DYNAMIC');assert.equal(returnView.status,'ARCHIVED');assert.equal(returnView.query,'归档');
 assert.equal(navigationFixture.fixed_watchlist.length,1);assert.equal(navigationFixture.industry.members.length,4);
 console.log('Stable Watchlist defaults, review visibility, scoped search, empty recovery, independent account/activity views and detail return passed.');
+
+// Proposal evidence remains read-only, literal text; review recommendations never imply approval.
+const drawProposals=vm.runInContext('drawProposals',context),proposalReviewLabel=vm.runInContext('proposalReviewLabel',context);
+const proposalFixture={id:'CP_evidence_01',title:'<img src=x onerror=alert(1)> 改进提案',kind:'PROMPT',status:'DRAFT',created_at:'2026-10-03T04:00:00Z',
+  hypothesis:'等待后续观察验证归因',change:'补齐研究引用；保持交易约束',test_plan:'在固定时间范围核对基线与候选',failure_criteria:'未优于基线则不采纳',rollback:'恢复先前已批准版本',
+  applicability:{route:'watchlist',build_id:'build_01',environment:'不同市场环境'},counter_explanations:['可能只是共同市场变化'],
+  evidence:{text:'<script>untrustedEvidence()</script> 12 个样本，尚不能判断',status:'INSUFFICIENT',references:['selfcheck:SC_01','javascript:alert(1)'],additional_count:2,limitations:['独立时间簇仍不足']},
+  experiment:{id:'EXP_01',status:'DESIGNED'},supervision:{id:'SR_01',status:'SUCCEEDED',verdict:'RECOMMEND',summary:'检验安排可提交讨论',current:true},
+  readiness:{status:'READY',reason:''},next_step:'完善草稿后提交审查'};
+const descendants=node=>[node,...node.children.flatMap(child=>descendants(child))];
+let proposalBox=new FakeElement('section');drawProposals(proposalBox,{items:[proposalFixture],total:1,shown:1});
+let proposalOutput=JSON.stringify(proposalBox),proposalNodes=descendants(proposalBox);
+for(const text of ['草稿','尚不足以判断','建议通过（非批准）','已登记设计 · 未运行','独立时间簇仍不足','未优于基线则不采纳','恢复先前已批准版本','可能只是共同市场变化','Dean 明确确认'])assert.ok(proposalOutput.includes(text));
+assert.ok(proposalNodes.some(n=>n.tag==='h3'&&n.textContent===proposalFixture.title));
+assert.ok(proposalNodes.some(n=>n.tag==='p'&&n.textContent===proposalFixture.evidence.text));
+assert.ok(proposalNodes.some(n=>n.tag==='li'&&n.textContent==='selfcheck:SC_01'));
+assert.ok(proposalNodes.some(n=>n.className==='subtle proposal-id'&&n.textContent.startsWith('CP_evidence_01')));
+assert.ok(proposalNodes.every(n=>!['img','script','button','a'].includes(n.tag)&&!n.innerHTML));
+assert.equal(proposalNodes.find(n=>n.className==='badge proposal-status').textContent,'草稿');
+assert.doesNotMatch(proposalOutput,/等待你批准|undefined|\[object Object\]/);
+assert.match(proposalReviewLabel({status:'SUCCEEDED',verdict:'RECOMMEND',current:true}),/非批准/);
+for(const staleReview of [{status:'STALE',current:true},{status:'SUCCEEDED',current:false}]){
+  const stale={...proposalFixture,supervision:{...proposalFixture.supervision,...staleReview,summary:'建议通过，等待批准'}};
+  proposalBox=new FakeElement('section');drawProposals(proposalBox,{items:[stale],total:1});
+  assert.match(JSON.stringify(proposalBox),/材料已变化/);
+  assert.doesNotMatch(JSON.stringify(proposalBox),/建议通过|等待批准/);
+}
+for(const [input,message] of [[undefined,/尚未同步/],[{items:[],total:0},/当前没有改进提案/],[{items:[],error:'同步暂未完成'},/暂未读取成功/]]){
+  proposalBox=new FakeElement('section');drawProposals(proposalBox,input);assert.match(JSON.stringify(proposalBox),message);
+  if(input?.error)assert.doesNotMatch(JSON.stringify(proposalBox),/当前没有改进提案/);
+}
+const incomplete={...proposalFixture,evidence:{status:'INVALID'},test_plan:'',failure_criteria:'',rollback:'',supervision:{status:'DEFERRED',current:true},readiness:{status:'INCOMPLETE',reason:'证据格式待修正'},experiment:null};
+proposalBox=new FakeElement('section');drawProposals(proposalBox,{items:[incomplete],total:1});
+for(const text of ['格式待修正','材料待补齐','尚未填写，需补齐','等待重试','尚未登记实验设计'])assert.ok(JSON.stringify(proposalBox).includes(text));
+const longEvidence='完整研究摘要。'.repeat(90),longChange='需要检验的改动。'.repeat(40);
+proposalBox=new FakeElement('section');drawProposals(proposalBox,{items:[{...proposalFixture,change:longChange,evidence:{...proposalFixture.evidence,text:longEvidence}}],total:1});
+const overviewNode=descendants(proposalBox).find(n=>n.className==='proposal-overview');
+assert.ok(descendants(overviewNode).filter(n=>n.tag==='p').every(n=>n.textContent.length<=261));
+assert.ok(descendants(proposalBox).some(n=>n.tag==='p'&&n.textContent===longEvidence));
+assert.ok(descendants(proposalBox).some(n=>n.tag==='p'&&n.textContent===longChange));
+assert.equal(workspaceView('#proposal-section').board,'activity');assert.equal(workspaceView('#supervision-section').board,'activity');
+const frozenExperiment={id:'EXP_frozen_01',status:'DESIGNED',primary_metric:'verifiable_prediction_rate',enrollment:{start_after:'2026-10-04T04:00:00Z',window_days:50,embargo_days:40,windows:2,minimum_pairs:30},baseline_build:'baseline_01',budget:{arms:2,major_changes:1,max_model_calls:120,max_retries:2,max_wait_days:180},controls:['SAME_INFORMATION_TIME','SAME_EXECUTION_AND_COSTS','ISOLATED_LEDGER','PURGE_UNMATURED_LABELS','KEEP_ALL_FAILURES','NO_PRODUCTION_PROMOTION']};
+proposalBox=new FakeElement('section');drawProposals(proposalBox,{items:[{...proposalFixture,experiment:frozenExperiment}],total:1});
+const frozenOutput=JSON.stringify(proposalBox);
+for(const text of ['已登记设计 · 未运行','可核验预测比例','2 个观察窗口','每个 50 个自然日','窗口间隔离 40 个自然日','30 对配对观察','达到数量不代表样本相互独立','设计最早可启动时间','不代表实际启动时间','基线版本：baseline_01'])assert.ok(frozenOutput.includes(text));
+assert.doesNotMatch(frozenOutput,/运行中|已完成|verifiable_prediction_rate|NaN/);
+const experimentText=vm.runInContext('proposalExperimentText',context);
+assert.match(experimentText({...frozenExperiment,primary_metric:'paired_net_excess_bps'}),/扣费后配对超额（基点）/);
+assert.match(experimentText({...frozenExperiment,status:'REJECTED'}),/已否决/);
+assert.doesNotMatch(experimentText({...frozenExperiment,status:'REJECTED'}),/状态待核对|未运行/);
+assert.equal(experimentText({id:'EXP_legacy',status:'DESIGNED'}),'EXP_legacy · 已登记设计 · 未运行');
+assert.equal(experimentText({id:'',status:'INVALID'}),'实验编号待补齐 · 设计材料需核对');
+
+// A refresh, new evidence or reordered cards must preserve only the selected proposal's disclosure.
+proposalBox=new FakeElement('section');proposalBox.querySelectorAll=selector=>descendants(proposalBox).filter(n=>n.tag==='details'&&n.dataset.key&&(!selector.includes('[open]')||n.open));
+const originalGetById=context.document.getElementById;context.document.getElementById=id=>id==='proposals'?proposalBox:originalGetById(id);
+const renderChanged=vm.runInContext('renderChanged',context),otherProposal={...proposalFixture,id:'CP_evidence_02',title:'另一份提案',supervision:null};
+let proposalData={items:[proposalFixture,otherProposal],total:2};
+renderChanged('proposals',proposalData,box=>drawProposals(box,proposalData));
+proposalBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='proposal:CP_evidence_01').open=true;
+proposalData={items:[otherProposal,{...proposalFixture,title:'补齐后的提案'}],total:2};
+renderChanged('proposals',proposalData,box=>drawProposals(box,proposalData));
+assert.equal(proposalBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='proposal:CP_evidence_01').open,true);
+assert.ok(!proposalBox.querySelectorAll('details[data-key]').find(n=>n.dataset.key==='proposal:CP_evidence_02').open);
+context.document.getElementById=originalGetById;
+console.log('Read-only proposal evidence, literal identifiers, safe text, recommendation/approval separation, stale review, incomplete/empty states, compact summaries and stable disclosures passed.');

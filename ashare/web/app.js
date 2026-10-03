@@ -480,8 +480,89 @@ function drawSupervision(box,data) {
     row.append(d);box.append(row);
   }
 }
+function proposalReviewLabel(review) {
+  if(!review)return '尚未提交监督审查';
+  if(review.current===false||review.status==='STALE')return '材料已变化 · 旧结论仅供追溯';
+  const status={PENDING:'待审查',RUNNING:'审查中',DEFERRED:'等待重试'};
+  if(review.status!=='SUCCEEDED')return status[review.status]||'审查状态待核对';
+  return '已审查 · '+({RECOMMEND:'建议通过（非批准）',INSUFFICIENT:'证据不足',REVISE:'建议修改',REJECT:'建议驳回'}[review.verdict]||'结论待核对');
+}
+function proposalText(tag,value,cls) {
+  // These are evidence and immutable identifiers: keep literal text, never HTML.
+  const node=el(tag,null,cls);node.textContent=typeof value==='string'?value:'';return node;
+}
+function proposalField(box,title,value,empty='尚未填写，需补齐。') {
+  const section=el('section',null,'proposal-field');
+  section.append(el('h4',title),proposalText('p',typeof value==='string'&&value.trim()?value:empty));box.append(section);
+}
+function proposalExcerpt(value,limit=260) {return typeof value==='string'&&value.length>limit?value.slice(0,limit)+'…':value;}
+function proposalExperimentText(experiment) {
+  if(!experiment)return '尚未登记实验设计。';
+  const lines=[(experiment.id||'实验编号待补齐')+' · '+({DESIGNED:'已登记设计 · 未运行',RUNNING:'运行中',COMPLETED:'已完成',CANCELLED:'已取消',REJECTED:'已否决',INVALID:'设计材料需核对'}[experiment.status]||'状态待核对')];
+  if(typeof experiment.primary_metric==='string'&&experiment.primary_metric)lines.push('主要指标：'+({verifiable_prediction_rate:'可核验预测比例',paired_net_excess_bps:'扣费后配对超额（基点）'}[experiment.primary_metric]||experiment.primary_metric));
+  const enrollment=experiment.enrollment||{},windows=[];
+  if(Number.isInteger(enrollment.windows))windows.push(enrollment.windows+' 个观察窗口');
+  if(Number.isInteger(enrollment.window_days))windows.push('每个 '+enrollment.window_days+' 个自然日');
+  if(Number.isInteger(enrollment.embargo_days))windows.push('窗口间隔离 '+enrollment.embargo_days+' 个自然日');
+  if(windows.length)lines.push('设计观察期：'+windows.join('；')+'。');
+  if(Number.isInteger(enrollment.minimum_pairs))lines.push('最低观察量：'+enrollment.minimum_pairs+' 对配对观察；达到数量不代表样本相互独立。');
+  if(typeof enrollment.start_after==='string'&&Number.isFinite(Date.parse(enrollment.start_after)))lines.push('设计最早可启动时间：'+when(enrollment.start_after)+'（北京时间）；这是设计下限，不代表实际启动时间。');
+  if(typeof experiment.baseline_build==='string'&&experiment.baseline_build)lines.push('基线版本：'+experiment.baseline_build);
+  return lines.join('\n');
+}
+function drawProposals(box,data) {
+  if(!data){box.append(el('p','提案摘要尚未同步。服务更新并同步后会在这里显示。','empty'));return;}
+  if(data.error)box.append(proposalText('p','提案摘要暂未读取成功：'+data.error,'caution'));
+  const items=Array.isArray(data.items)?data.items:[];
+  if(!items.length){box.append(el('p',data.error?'稍后刷新查看提案摘要；暂不能确认是否存在提案。':'当前没有改进提案。复盘或评估形成候选后，会在这里显示证据、检验方案和监督进度。','empty'));return;}
+  box.append(el('p','显示 '+items.length+' / '+(Number.isFinite(data.total)?data.total:items.length)+' 份提案 · 可在 ChatGPT 中引用提案编号继续讨论。','subtle'));
+  for(const item of items){
+    const card=el('article',null,'proposal-card'),head=el('div',null,'proposal-head');
+    const state={DRAFT:'草稿',READY:'待审查与决定',APPROVED:'已批准',ADOPTED:'已采纳',REJECTED:'已驳回',RETIRED:'已退役',SUPERSEDED:'已被新版替代'}[item.status]||'状态待核对';
+    head.append(proposalText('h3',item.title||'未命名提案'),el('span',state,'badge proposal-status'));
+    card.append(head,proposalText('p',(item.id||'编号待补齐')+' · '+shortTime(item.created_at),'subtle proposal-id'));
+    const overview=el('div',null,'proposal-overview'),evidence=item.evidence||{},review=item.supervision;
+    proposalField(overview,'计划改动',proposalExcerpt(item.change,180),'尚未说明具体改动。');
+    proposalField(overview,'证据摘要',proposalExcerpt(evidence.text),'尚未整理可用的证据摘要。');
+    card.append(overview);
+    const states=el('div',null,'proposal-states');
+    states.append(el('span','证据：'+({RECORDED:'已记录 · 效果待检验',INSUFFICIENT:'尚不足以判断',MISSING:'待补充',INVALID:'格式待修正'}[evidence.status]||'待核对'),'badge'),el('span','监督：'+proposalReviewLabel(review),'badge'));
+    card.append(states);
+    if(item.readiness?.status==='INCOMPLETE')card.append(proposalText('p','材料待补齐：'+(item.readiness.reason||'请查看下方检验方案与证据缺口。'),'proposal-warning'));
+    const next=typeof item.next_step==='string'&&item.next_step.trim()?item.next_step:item.status==='DRAFT'?'继续整理证据与检验方案，完成后再提交审查。':'核对提案材料与监督状态，策略变更仍需明确批准。';
+    card.append(proposalText('p','下一步：'+next,'proposal-next'));
+    const detail=details('查看证据、检验方案与监督详情','proposal:'+item.id),body=el('div',null,'proposal-detail');
+    proposalField(body,'具体改动',item.change);
+    proposalField(body,'要验证的判断',item.hypothesis);
+    const scope=item.applicability||{},scopeParts=[];
+    if(scope.route)scopeParts.push('适用路线：'+scope.route);
+    if(scope.environment)scopeParts.push('适用环境：'+scope.environment);
+    if(scope.build_id)scopeParts.push('程序版本：'+scope.build_id);
+    proposalField(body,'适用范围',scopeParts.join('；'),'尚未说明适用范围。');
+    proposalField(body,'检验方案',item.test_plan);
+    proposalField(body,'失败条件',item.failure_criteria);
+    proposalField(body,'回退方式',item.rollback);
+    const evidenceDetail=el('section',null,'proposal-field');evidenceDetail.append(el('h4','证据与局限'));
+    if(evidence.text)evidenceDetail.append(proposalText('p',evidence.text));
+    const limits=(evidence.limitations||[]).filter(v=>typeof v==='string');
+    for(const limitation of limits)evidenceDetail.append(proposalText('p',limitation,'proposal-warning'));
+    const references=(evidence.references||[]).filter(v=>typeof v==='string');
+    if(references.length){const refs=el('ul');for(const reference of references)refs.append(proposalText('li',reference));evidenceDetail.append(refs);}
+    if(!references.length&&!limits.length)evidenceDetail.append(el('p','未提供进一步的证据引用或局限说明。','subtle'));
+    if(evidence.additional_count>0)evidenceDetail.append(el('p','另有 '+evidence.additional_count+' 条证据记录，可按提案编号在本机核对。','subtle'));
+    body.append(evidenceDetail);
+    proposalField(body,'其他可能的解释',(item.counter_explanations||[]).filter(v=>typeof v==='string').join('\n'),'尚未记录反例或其他解释，仍需检查。');
+    proposalField(body,'前向实验',proposalExperimentText(item.experiment));
+    const supervision=el('section',null,'proposal-field');supervision.append(el('h4','独立监督'),el('p',proposalReviewLabel(review)));
+    if(review?.id)supervision.append(proposalText('p','审查编号：'+review.id,'subtle'));
+    if(review?.summary&&review.current!==false&&review.status!=='STALE')supervision.append(proposalText('p',review.summary));
+    supervision.append(el('p','监督建议不等于批准。策略变更仍需 Dean 明确确认，之后才能实施。','subtle'));body.append(supervision);
+    detail.append(body);card.append(detail);box.append(card);
+  }
+}
 function renderActivity(s) {
   if($('supervision'))renderChanged('supervision',s.supervision||{items:[]},box=>drawSupervision(box,s.supervision));
+  if($('proposals'))renderChanged('proposals',s.supervision?.proposals??null,box=>drawProposals(box,s.supervision?.proposals));
   const market=s.market_phase==='CONTINUOUS';
   const nextSlot=s.next_runs.find(r=>r.kind==='slot');
   $('slot-timing').textContent=(market?'交易时段':'当前休市')+(nextSlot?' · 下次检查 '+shortTime(nextSlot.scheduled_at):'');
@@ -671,7 +752,7 @@ function rememberWatchlist(){if(typeof location!=='undefined'&&location.pathname
 function stockPath(symbol){return '/stocks/'+encodeURIComponent(symbol)+'?return='+encodeURIComponent(watchlistHash());}
 function parseWorkspaceHash(hash){
   const [raw,query='']=hash.replace(/^#/,'').split('?'),params=new URLSearchParams(query);
-  const board=raw==='fill-history'?'activity':raw==='portfolio-section'||raw==='watchlist-performance'?'holdings':raw.replace(/-section$/,'');
+  const board=['fill-history','proposal-section','supervision-section'].includes(raw)?'activity':raw==='portfolio-section'||raw==='watchlist-performance'?'holdings':raw.replace(/-section$/,'');
   return {board:boards.includes(board)?board:'watchlist',list:['CORE','DYNAMIC','FIXED','ALL'].includes(params.get('list'))?params.get('list'):'CORE',status:['ALL',...Object.keys(researchStates)].includes(params.get('status'))?params.get('status'):'ALL',market:observationCategories[params.get('market')]?params.get('market'):'CN',query:(params.get('q')||'').slice(0,80)};
 }
 function selectBoard(board,{focus=false,remember=false}={}) {

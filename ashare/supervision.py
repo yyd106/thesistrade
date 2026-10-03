@@ -107,17 +107,30 @@ def batch_input(store, bid):
 
 
 def proposal_input(store, pid):
+    from .proposal_evidence import summary
+    from .proposal_experiment import summary as experiment_summary
     row = store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (pid,)).fetchone()
     if not row:
         raise ValueError('没有该提案')
     p = json.loads(row['payload_json'])
-    if any(not isinstance(p.get(k), str) or not p[k].strip() for k in FIELDS):
+    if not isinstance(p, dict) or any(not isinstance(p.get(k), str) or not p[k].strip() for k in FIELDS if k != 'evidence'):
         raise ValueError('提案检验方案不完整')
-    # Explicit summary fields only: never follow evidence paths into source documents or the DB.
+    evidence = summary(store, dict(row), p)
+    if evidence['status'] in ('MISSING', 'INVALID'):
+        raise ValueError('提案证据不可审查：' + evidence['text'])
+    # Explicit summary fields only; structured refs resolve to frozen aggregates,
+    # never paths, raw research or judgment bodies.
     result = {k: row[k] for k in ('id', 'kind', 'target', 'title', 'created_at')}
-    result.update({k: p[k] for k in FIELDS})
+    result.update({k: p[k] for k in FIELDS if k != 'evidence'})
+    result['evidence'] = evidence['text']
+    if evidence['source'] != 'TEXT' or evidence['additional_count']:
+        result['evidence_summary'] = evidence
+    # Unchanged legacy string proposals keep their previous snapshot/hash.
     if 'guidance' in p:
         result['guidance'] = p['guidance']
+    experiment = experiment_summary(store, pid)
+    if experiment is not None:
+        result['experiment'] = experiment
     result['proposal_hash'] = sha(result)
     return result
 
@@ -206,6 +219,10 @@ def packet(data, phase, first=None):
     refs = ['manifest', *facts]
     result = {'phase': phase, 'kind': data['kind'], 'subject_id': data['subject_id'],
               'manifest': {k: batch.get(k) for k in ('batch_id', 'manifest_hash', 'source_hashes', 'period', 'build_id')}, **facts}
+    evidence = (data.get('proposal') or {}).get('evidence_summary')
+    if evidence:
+        result['proposal_evidence'] = evidence
+        refs.append('proposal_evidence')
     if phase == 'FACTS':
         result['instruction'] = '只根据程序记录先形成判断；尚未提供作者提案，不猜测其内容。'
     else:
@@ -284,15 +301,17 @@ def run(store, config, rid, *, model_fn=None, cancel_event=None, clock=now):
         row = store.db.execute('SELECT * FROM supervision_reviews WHERE id=?', (rid,)).fetchone()
         if not row:
             raise ValueError('没有该审查')
-        if row['status'] in ('SUCCEEDED', 'STALE'):
+        if row['status'] == 'STALE':
             return {'status': row['status'], 'id': rid}
-        if busy(store) or (cancel_event and cancel_event.is_set()):
-            return {'status': 'WAITING_RESEARCH', 'id': rid}
         data = json.loads(row['input_json'])
         if not _current(store, config, data):
             with store.db:
                 store.db.execute("UPDATE supervision_reviews SET status='STALE' WHERE id=?", (rid,))
             return {'status': 'STALE', 'id': rid}
+        if row['status'] == 'SUCCEEDED':
+            return {'status': row['status'], 'id': rid}
+        if busy(store) or (cancel_event and cancel_event.is_set()):
+            return {'status': 'WAITING_RESEARCH', 'id': rid}
         attempt = row['attempts'] + 1
         folder = store.root / 'workflow' / 'supervision' / rid / (str(attempt) + '-' + uuid.uuid4().hex[:8])
         json_write(folder / 'input.json', data)
@@ -358,14 +377,16 @@ def retry(store, rid):
     return {'status': 'PENDING', 'id': rid}
 
 
-def listing(store, limit=30):
+def listing(store, limit=30, *, subject_id=None):
     rows = []
-    for r in store.db.execute('SELECT * FROM supervision_reviews ORDER BY created_at DESC,rowid DESC LIMIT ?', (limit,)):
+    where = ' WHERE subject_id=?' if subject_id is not None else ''
+    params = (subject_id, limit) if subject_id is not None else (limit,)
+    for r in store.db.execute('SELECT * FROM supervision_reviews' + where + ' ORDER BY created_at DESC,rowid DESC LIMIT ?', params):
         data = json.loads(r['input_json']); final = json.loads(r['result_json'] or '{}')
         p = data['proposal'] or {}; b = data['batch'] or {}
         verdict = final.get('result', {}).get('verdict')
         state = r['status']
-        if state == 'SUCCEEDED' and not _current(store, {'model_name': data['model']['name'], 'model_reasoning_effort': data['model']['effort']}, data):
+        if state != 'STALE' and not _current(store, {'model_name': data['model']['name'], 'model_reasoning_effort': data['model']['effort']}, data):
             state = 'STALE'
         lifecycle = None
         if r['kind'] != 'BATCH':
@@ -383,8 +404,9 @@ def listing(store, limit=30):
 
 
 def view(store):
+    from .proposal_presentation import attach
     r = store.db.execute("SELECT value FROM service_state WHERE key='supervision_discovery'").fetchone()
-    return {'items': listing(store), 'discovery': json.loads(r[0]) if r else None}
+    return attach(store, {'items': listing(store), 'discovery': json.loads(r[0]) if r else None})
 
 
 def worker(config, rid, cancel):

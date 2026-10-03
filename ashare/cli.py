@@ -404,10 +404,9 @@ def _store_command(args, config, store):
         if args.action == 'list':
             return [{k: p[k] for k in ('id', 'status', 'kind', 'target', 'title', 'created_at', 'decided_at', 'decided_by')} for p in governance.proposals(store, args.status)]
         if args.action == 'show':
-            row = next((p for p in governance.proposals(store) if p['id'] == args.id), None)
-            if not row:
-                raise ValueError('未找到该提案')
-            return row
+            from .proposal_presentation import card
+            row = governance.proposal(store, args.id)
+            return {**row, 'review_card': card(store, row)}
         if args.action == 'new':
             spec = json.loads(Path(args.file).read_text(encoding='utf-8'))
             required = {'kind', 'target', 'title', 'hypothesis', 'change', 'evidence', 'test_plan', 'failure_criteria', 'rollback'}

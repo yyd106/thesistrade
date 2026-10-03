@@ -231,17 +231,25 @@ def decide(store, proposal_id, status, *, decided_by, note, at=None, replaced_by
     return dict(store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (proposal_id,)).fetchone())
 
 
+def _proposal(store, row):
+    item = {**dict(row), 'payload': json.loads(row['payload_json'])}
+    item['additional_evidence'] = [dict(e) for e in store.db.execute(
+        'SELECT run_id,created_at,payload_json FROM selfcheck_evidence WHERE proposal_id=? ORDER BY created_at', (row['id'],))]
+    item['review_observations'] = [dict(e) for e in store.db.execute(
+        'SELECT review_id,created_at,payload_json FROM review_observations WHERE proposal_id=? ORDER BY created_at', (row['id'],))]
+    return item
+
+
+def proposal(store, identity):
+    row = store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (identity,)).fetchone()
+    if not row:
+        raise ValueError('未找到该提案')
+    return _proposal(store, row)
+
+
 def proposals(store, status=None):
     sql = 'SELECT * FROM strategy_proposals' + (' WHERE status=?' if status else '') + ' ORDER BY created_at DESC LIMIT 200'
-    result = []
-    for r in store.db.execute(sql, (status,) if status else ()):
-        item = {**dict(r), 'payload': json.loads(r['payload_json'])}
-        item['additional_evidence'] = [dict(e) for e in store.db.execute(
-            'SELECT run_id,created_at,payload_json FROM selfcheck_evidence WHERE proposal_id=? ORDER BY created_at', (r['id'],))]
-        item['review_observations'] = [dict(e) for e in store.db.execute(
-            'SELECT review_id,created_at,payload_json FROM review_observations WHERE proposal_id=? ORDER BY created_at', (r['id'],))]
-        result.append(item)
-    return result
+    return [_proposal(store, r) for r in store.db.execute(sql, (status,) if status else ())]
 
 
 def issues(store, status='OPEN'):
