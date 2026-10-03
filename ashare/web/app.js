@@ -416,7 +416,7 @@ function updateButtons() {
 function reviewDetails(title,key) {const d=details('',key);d.children[0].textContent=title;return d;}
 function reviewFreshness(r,at) {
   const hours=(Date.parse(at)-Date.parse(r?.window_end))/3600000;
-  return Number.isFinite(hours)&&hours>36?'最近复盘截止于 '+when(r.window_end)+'，已超过36小时；以下为历史窗口，等待下一轮复盘。':'';
+  return Number.isFinite(hours)&&hours>36?'本期复盘截止于 '+when(r.window_end)+'，已超过36小时；仅供历史回看，不能作为当前状态。':'';
 }
 function drawReviewChecks(body,r) {
   const summary=r.presentation?.checks,items=summary?.items||r.payload.consistency_checks||[];

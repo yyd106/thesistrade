@@ -34,6 +34,8 @@ assert.match(visible(box),/-4\.50 元/);assert.match(visible(box),/已入账现�
 const missing=structuredClone(record);delete missing.payload.facts.daily_portfolio;box=new Element('section');get('drawDailyReview')(box,missing);
 assert.match(visible(box),/未提供独立24小时核算/);assert.match(visible(box),/不能用48小时金额代替/);
 assert.match(get('reviewFreshness')(record,'2026-10-05T00:00:00Z'),/已超过36小时/);
+assert.match(get('reviewFreshness')(record,'2026-10-05T00:00:00Z'),/本期复盘.*仅供历史回看/);
+assert.doesNotMatch(get('reviewFreshness')(record,'2026-10-05T00:00:00Z'),/最近复盘|等待下一轮/);
 assert.equal(get('reviewFreshness')(record,'2026-10-03T12:00:00Z'),'');
 // Superseded and expired findings stay in closed history, while identifiers survive verbatim.
 const findingsRecord=structuredClone(record);findingsRecord.presentation={findings:{items:[{ordinal:0,lesson:'当前资料缺口',category:'DATA',to:'engineering_issue',id:'ISSUE_unchanged_1',status:'OPEN',current:true,expires_at:'2026-11-02T12:00:00Z'},{ordinal:1,lesson:'历史研究发现',to:'proposal_draft',id:'CP_unchanged_1',status:'SUPERSEDED',current:false,expired:true}],total:2,omitted:0}};
