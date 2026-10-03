@@ -55,6 +55,17 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                     result=renew(store,config,packet,reuse)
                 else:
                     persist_snapshot(store,packet)
+                    if use_model and config.get('model_enabled'):
+                        # Enrollment freezes the input before either experiment arm
+                        # runs. Renewals are not new research observations.
+                        try:
+                            from .experiment_runner import enroll
+                            enroll(store,config,packet)
+                        except Exception as exc:
+                            # Keep experiment failures isolated from production and
+                            # never copy input text or exception details into logs.
+                            store.db.rollback()
+                            store.record_attempt('experiment_enrollment',sym,'FAILED',type(exc).__name__)
                     result=study(store,config,packet,use_model)
                 store.record_attempt('research_pipeline',sym,'OK')
                 return result

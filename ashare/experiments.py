@@ -1,4 +1,4 @@
-"""Immutable experiment designs. Phase one deliberately has no execution transition."""
+"""Immutable experiment designs; explicit activation uses the isolated runner."""
 import json
 from .storage import digest, normalize_time, now
 from .judgments import encode
@@ -53,13 +53,16 @@ def register(store, proposal_id, spec, at=None):
     identity = 'EX-' + digest(proposal_id + hashed)[:20]
     store.db.execute('INSERT INTO experiment_designs VALUES(?,?,?,?,?)', (identity, proposal_id, at, hashed, encode(spec)))
     store.db.execute('INSERT INTO experiment_events(experiment_id,at,status,note) VALUES(?,?,?,?)',
-                     (identity, at, 'DESIGNED', '仅登记设计；第二期运行器尚未启用，未开始实验或调用模型'))
+                     (identity, at, 'DESIGNED', '仅登记设计；尚未启动实验或调用模型'))
     return identity
 
 
 def close(store, identity, status, note, at=None):
+    if store.db.execute('SELECT 1 FROM experiment_runs WHERE experiment_id=?', (identity,)).fetchone():
+        from .experiment_runner import close as close_run
+        return close_run(store, identity, status, note, at)
     if status not in ('CANCELLED', 'REJECTED') or not isinstance(note, str) or not note.strip():
-        raise ValueError('一期只允许关闭设计，并须记录原因')
+        raise ValueError('只允许关闭设计，并须记录原因')
     with store.db:
         row = store.db.execute('SELECT status FROM experiment_events WHERE experiment_id=? ORDER BY id DESC LIMIT 1', (identity,)).fetchone()
         if not row or row[0] != 'DESIGNED':
@@ -79,4 +82,8 @@ def view(store, identity=None):
         events = [dict(e) for e in store.db.execute('SELECT at,status,note FROM experiment_events WHERE experiment_id=? ORDER BY id', (r['id'],))]
         result.append({'id': r['id'], 'proposal_id': r['proposal_id'], 'created_at': r['created_at'],
                        'status': events[-1]['status'], 'spec': json.loads(r['spec_json']), 'history': events})
+        from .experiment_runner import summary
+        execution = summary(store, r['id'])
+        if execution:
+            result[-1]['execution'] = execution
     return result[0] if identity else result

@@ -496,10 +496,44 @@ function proposalField(box,title,value,empty='尚未填写，需补齐。') {
   section.append(el('h4',title),proposalText('p',typeof value==='string'&&value.trim()?value:empty));box.append(section);
 }
 function proposalExcerpt(value,limit=260) {return typeof value==='string'&&value.length>limit?value.slice(0,limit)+'…':value;}
+function proposalExperimentLabel(experiment) {
+  return {DESIGNED:'已登记设计 · 未运行',RUNNING:'运行中',COMPLETED:'观察已完成',INCONCLUSIVE:'已结束 · 尚不能判断',CANCELLED:'已取消',REJECTED:'已否决',INVALID:'设计材料需核对'}[experiment?.status]||'状态待核对';
+}
+function proposalExecutionLines(execution) {
+  if(!execution||typeof execution!=='object')return [];
+  const count=value=>Number.isInteger(value)&&value>=0?String(value):'待核对';
+  const stamp=value=>typeof value==='string'&&Number.isFinite(Date.parse(value))?when(value):'时间待核对';
+  const rate=value=>Number.isFinite(value)&&value>=0&&value<=1?(value*100).toFixed(1)+'%':'尚无完整配对结果';
+  const delta=value=>Number.isFinite(value)&&Math.abs(value)<=1?(value>0?'+':'')+(value*100).toFixed(1)+' 个百分点':'尚无配对差值';
+  const lines=['本轮检验研究输出是否具有可检验的结构。结果不代表收益表现，也不会自动改变当前生产策略。',
+    '实际启动：'+stamp(execution.started_at)+'；预定结束：'+stamp(execution.ends_at)+'（北京时间）。'];
+  for(const window of (Array.isArray(execution.windows)?execution.windows:[]).slice(0,2)){
+    if(Number.isInteger(window?.index))lines.push('观察窗口 '+window.index+'：'+stamp(window.start)+' 至 '+stamp(window.end)+'（北京时间）。');
+  }
+  lines.push('配对观察：纳入 '+count(execution.enrolled)+' 对；完成 '+count(execution.complete)+' 对；失败 '+count(execution.failed)+' 对；等待 '+count(execution.pending)+' 对。');
+  lines.push('模型调用：'+count(execution.model_calls)+' / '+count(execution.max_model_calls)+' 次；已重试 '+count(execution.retries)+' 次。失败调用也计入预算。');
+  lines.push('覆盖 '+count(execution.day_clusters)+' 个日期簇；同日观察可能相关，配对数量不代表独立样本数量。');
+  lines.push('可检验结构比例：基线 '+rate(execution.baseline_rate)+'；候选 '+rate(execution.candidate_rate)+'。');
+  if(Number.isFinite(execution.paired_delta)&&Math.abs(execution.paired_delta)<=1)lines.push('候选相对基线：'+delta(execution.paired_delta)+'（描述统计）。');
+  lines.push('总体引用有效率：基线 '+rate(execution.baseline_citation_rate)+'；候选 '+rate(execution.candidate_citation_rate)+'。');
+  for(const result of (Array.isArray(execution.window_results)?execution.window_results:[]).slice(0,2)){
+    if(![1,2].includes(result?.window))continue;
+    const name=result.window===1?'首轮观察窗 1':'确认窗 2';
+    lines.push(name+'结果：纳入 '+count(result.enrolled)+' 对；完成 '+count(result.complete)+' 对；失败 '+count(result.failed)+' 对；等待 '+count(result.pending)+' 对；覆盖 '+count(result.day_clusters)+' 个日期簇。');
+    lines.push(name+'可检验结构比例：基线 '+rate(result.baseline_rate)+'；候选 '+rate(result.candidate_rate)+'；差值 '+delta(result.paired_delta)+'（描述统计）。');
+    lines.push(name+'引用有效率：基线 '+rate(result.baseline_citation_rate)+'；候选 '+rate(result.candidate_citation_rate)+'。');
+  }
+  lines.push('分窗评估：'+({PENDING:'尚待观察；两个窗口均完成后再判断。',INSUFFICIENT:'证据不足；不能以总体比例替代确认窗的观察要求。',NOT_SUPPORTED:'不支持候选；总体改善不能抵消确认窗或引用质量未达要求。',STRUCTURE_IMPROVEMENT_ONLY:'仅观察到结构比例提高；不代表预测准确或收益改善。'}[execution.assessment]||'评估待核对。'));
+  lines.push('实验结论：'+({COLLECTING:'仍在收集观察，尚不能判断。',DESCRIPTIVE_ONLY:'观察完成，仅形成结构可检验性的描述统计；不能据此认定收益改善。',INSUFFICIENT:'观察不足或实验条件发生变化，尚不能判断。',CANCELLED:'实验已取消，保留已采集的观察和失败记录。',REJECTED:'实验已否决，保留已采集的观察和失败记录。'}[execution.conclusion]||'结论待核对。'));
+  if(execution.stop_reason)lines.push('停止原因：'+({WINDOW_COMPLETE:'两个观察窗口已结束',CALL_BUDGET_EXHAUSTED:'模型调用预算已用尽',IMPLEMENTATION_CHANGED:'运行版本或固定条件已变化',PROPOSAL_CLOSED:'对应提案已关闭',USER_CANCELLED:'用户取消实验',USER_REJECTED:'用户否决实验'}[execution.stop_reason]||'需在本机核对停止原因')+'。');
+  if(execution.status==='RUNNING')lines.push(execution.pending>0?'当前等待：已纳入的配对完成，并继续收集后续窗口中的观察。':'当前等待：后续研究产生符合观察窗口的输入；暂未产生新配对也会保留等待状态。');
+  return lines;
+}
 function proposalExperimentText(experiment) {
   if(!experiment)return '尚未登记实验设计。';
-  const lines=[(experiment.id||'实验编号待补齐')+' · '+({DESIGNED:'已登记设计 · 未运行',RUNNING:'运行中',COMPLETED:'已完成',CANCELLED:'已取消',REJECTED:'已否决',INVALID:'设计材料需核对'}[experiment.status]||'状态待核对')];
-  if(typeof experiment.primary_metric==='string'&&experiment.primary_metric)lines.push('主要指标：'+({verifiable_prediction_rate:'可核验预测比例',paired_net_excess_bps:'扣费后配对超额（基点）'}[experiment.primary_metric]||experiment.primary_metric));
+  const lines=[(experiment.id||'实验编号待补齐')+' · '+proposalExperimentLabel(experiment)];
+  if(typeof experiment.primary_metric==='string'&&experiment.primary_metric)lines.push('主要指标：'+({verifiable_prediction_rate:experiment.execution?'可检验结构比例':'可核验预测比例',paired_net_excess_bps:'扣费后配对超额（基点）'}[experiment.primary_metric]||experiment.primary_metric));
+  lines.push(...proposalExecutionLines(experiment.execution));
   const enrollment=experiment.enrollment||{},windows=[];
   if(Number.isInteger(enrollment.windows))windows.push(enrollment.windows+' 个观察窗口');
   if(Number.isInteger(enrollment.window_days))windows.push('每个 '+enrollment.window_days+' 个自然日');
@@ -527,6 +561,7 @@ function drawProposals(box,data) {
     card.append(overview);
     const states=el('div',null,'proposal-states');
     states.append(el('span','证据：'+({RECORDED:'已记录 · 效果待检验',INSUFFICIENT:'尚不足以判断',MISSING:'待补充',INVALID:'格式待修正'}[evidence.status]||'待核对'),'badge'),el('span','监督：'+proposalReviewLabel(review),'badge'));
+    if(item.experiment)states.append(el('span','实验：'+proposalExperimentLabel(item.experiment),'badge'));
     card.append(states);
     if(item.readiness?.status==='INCOMPLETE')card.append(proposalText('p','材料待补齐：'+(item.readiness.reason||'请查看下方检验方案与证据缺口。'),'proposal-warning'));
     const next=typeof item.next_step==='string'&&item.next_step.trim()?item.next_step:item.status==='DRAFT'?'继续整理证据与检验方案，完成后再提交审查。':'核对提案材料与监督状态，策略变更仍需明确批准。';

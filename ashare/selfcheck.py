@@ -18,7 +18,7 @@ LIMITATIONS = [
     '全球价格诊断不含汇率与费用；动态净反应含估算成本，空头方向不代表可做空。',
     '股票超额仅相对沪深300；尚未控制行业、风险暴露及选股差异。',
     '事实预测、仓位优劣需要单独检验；当前不以涨跌替代经营证据。',
-    '重叠时间簇不足时维持现行方法；一期不运行候选实验，不自动采纳提案。']
+    '重叠时间簇不足时维持现行方法；候选需独立登记和启动隔离实验，不自动采纳提案。']
 
 
 def outcomes(store, at):
@@ -216,7 +216,7 @@ def propose(store, report, rows, at):
 
 def markdown(report):
     lines = ['# 长期自检报告', '', f"生成：{report['created_at']}；编号：{report['id']}。",
-        '', '**结论：维持现行方法。以下为诊断与待验证假设，未运行候选实验，未修改生产策略。**',
+        '', '**结论：维持现行方法。以下为诊断与待验证假设，本诊断不运行候选实验、不修改生产策略；实验运行状态另列。**',
         '', '## 数据与判断', '', '注册及评分：' + encode(report['counts']),
         '来源性质：' + encode(report['provenance']), '可检验性缺口：' + encode(report['gaps']),
         '', '## 到期表现分组', '', '| 路线 | 版本 | 环境 | 期限 | 行动 | 来源 | 样本/时间簇 | 平均超额 bps |',
@@ -266,5 +266,7 @@ def status(store, identity=None):
     candidates = [dict(r) for r in store.db.execute("SELECT id,title,status,created_at FROM strategy_proposals WHERE source='selfcheck' ORDER BY created_at DESC LIMIT 30")]
     for c in candidates:
         c['evidence_versions'] = store.db.execute('SELECT count(*) FROM selfcheck_evidence WHERE proposal_id=?', (c['id'],)).fetchone()[0]
+    from .experiment_runner import summary
+    trials = [summary(store, r[0]) for r in store.db.execute('SELECT experiment_id FROM experiment_runs ORDER BY started_at DESC LIMIT 5')]
     return {'last': json.loads(last[0]) if last else None, 'candidates': candidates, 'weekly_budget': WEEKLY_BUDGET,
-            'experiment_runner': 'NOT_IMPLEMENTED', 'production_changes': False}
+            'experiment_runner': 'SINGLE_WATCHLIST_STRUCTURE_TRIAL', 'experiments': trials, 'production_changes': False}

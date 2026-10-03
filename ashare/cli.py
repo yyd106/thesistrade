@@ -57,8 +57,8 @@ def main():
     sc = sub.add_parser('self-check', help='长期自检：run诊断，propose整理候选，status/show查询；不调用模型或改策略')
     sc.add_argument('action', choices=['run', 'propose', 'status', 'show'])
     sc.add_argument('id', nargs='?')
-    ex = sub.add_parser('experiments', help='实验设计：list/show查询，register登记，close保留记录并关闭；一期不运行实验')
-    ex.add_argument('action', choices=['list', 'show', 'register', 'close'])
+    ex = sub.add_parser('experiments', help='隔离前向实验：prepare登记首个候选，start启动，run处理下一配对，advance更新截止，list/show查询，close关闭')
+    ex.add_argument('action', choices=['list', 'show', 'register', 'prepare', 'start', 'run', 'advance', 'close'])
     ex.add_argument('id', nargs='?')
     ex.add_argument('--file');ex.add_argument('--proposal');ex.add_argument('--note')
     ex.add_argument('--to', choices=['CANCELLED', 'REJECTED'])
@@ -239,6 +239,19 @@ def extended(args, config):
                 if args.action == 'show' and not args.id:raise ValueError('需要实验编号')
                 return experiments.view(store, args.id if args.action == 'show' else None)
             if config.get('deployment_role') == 'cloud':raise ValueError('实验设计仅在本机研究端登记')
+            if args.action in ('prepare', 'start', 'run', 'advance'):
+                from . import experiment_runner
+                if args.action == 'prepare':return experiment_runner.prepare(store, config)
+                if args.action == 'start':
+                    if not args.id:raise ValueError('需要实验编号')
+                    return experiment_runner.start(store, config, args.id, args.note)
+                if args.action == 'advance':return experiment_runner.advance(store, config)
+                from .supervision import busy
+                if busy(store):return {'status': 'YIELDED', 'reason': '生产研究优先'}
+                pending = experiment_runner.next_pending(store, config)
+                if not pending:return {'status': 'NO_PENDING_PAIR'}
+                if args.id and args.id != pending['experiment_id']:raise ValueError('下一配对不属于指定实验')
+                return experiment_runner.worker(config, pending['id'])
             if args.action == 'register':
                 if not args.file or not args.proposal:raise ValueError('需要设计文件及提案编号')
                 with store.db:

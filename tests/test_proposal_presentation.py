@@ -109,6 +109,47 @@ class ProposalPresentationTests(unittest.TestCase):
         self.assertEqual(shown['items'][0]['id'], ready['id'])
         self.assertLessEqual(shown['shown'], 20)
 
+    def test_active_experiment_remains_visible_above_twenty_newer_drafts(self):
+        active = self.proposal(at='2026-09-01T00:00:00+00:00')
+        ready = self.proposal(at='2026-09-02T00:00:00+00:00')
+        governance.decide(self.store, ready['id'], 'READY', decided_by=None, note='合成测试', at=AT)
+        for _ in range(22):
+            self.proposal()
+        with self.store.db:
+            self.store.db.execute('INSERT INTO experiment_designs VALUES(?,?,?,?,?)', ('EX-test', active['id'], AT, 'test', '{}'))
+            self.store.db.execute('INSERT INTO experiment_events(experiment_id,at,status,note) VALUES(?,?,?,?)',
+                                  ('EX-test', AT, 'RUNNING', '合成测试'))
+        with patch.object(presentation, 'card', side_effect=lambda store, row: {'id': row['id']}):
+            shown = presentation.cards(self.store)
+            self.assertEqual(shown['items'][0]['id'], active['id'])
+            self.assertEqual(shown['items'][1]['id'], ready['id'])
+            with self.store.db:
+                self.store.db.execute('INSERT INTO experiment_events(experiment_id,at,status,note) VALUES(?,?,?,?)',
+                                      ('EX-test', AT, 'CANCELLED', '合成测试'))
+            self.assertEqual(presentation.cards(self.store)['items'][0]['id'], ready['id'])
+
+    def test_experiment_progress_does_not_approve_or_promote_proposal(self):
+        row = self.proposal()
+        for state, expectation in [('RUNNING', '正在采集配对观察'), ('COMPLETED', '仅提供结构可检验性'),
+                                   ('INCONCLUSIVE', '尚不能判断')]:
+            with self.subTest(state=state):
+                experiment = {'id': 'EX-test', 'status': state, 'execution': {'status': state}}
+                with patch.object(presentation, 'experiment_summary', return_value=experiment):
+                    card = presentation.card(self.store, row)
+                self.assertEqual(card['status'], 'DRAFT')
+                self.assertIn(expectation, card['next_step'])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM strategy_guidance').fetchone()[0], 0)
+
+    def test_confirmation_window_failure_is_visible_in_next_step(self):
+        row = self.proposal()
+        experiment = {'id': 'EX-test', 'status': 'COMPLETED',
+                      'execution': {'status': 'COMPLETED', 'assessment': 'NOT_SUPPORTED'}}
+        with patch.object(presentation, 'experiment_summary', return_value=experiment):
+            card = presentation.card(self.store, row)
+        self.assertEqual(card['status'], 'DRAFT')
+        self.assertIn('分窗结果不支持候选', card['next_step'])
+        self.assertNotIn('提交监督审查', card['next_step'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -24,7 +24,19 @@ def size(value):
     return len(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode())
 
 
-def _next_step(status, readiness, review):
+def _next_step(status, readiness, review, experiment=None):
+    execution = (experiment or {}).get('execution')
+    if status in ('DRAFT', 'READY') and execution:
+        if execution['status'] == 'RUNNING':
+            return '前向实验正在采集配对观察；等待两个观察窗口完成后复核结构指标，策略变更仍需用户批准。'
+        if execution['status'] == 'COMPLETED':
+            if execution.get('assessment') == 'NOT_SUPPORTED':
+                return '分窗结果不支持候选；保留观察与失败记录，不能据此采纳该改动。'
+            if execution.get('assessment') == 'INSUFFICIENT':
+                return '实验观察已结束但证据不足；核对两个窗口的样本与失败记录，尚不能判断候选效果。'
+            return '前向实验已完成，仅提供结构可检验性的描述统计；复核当前证据后再决定是否提交监督审查。'
+        if execution['status'] == 'INCONCLUSIVE':
+            return '前向实验已结束，尚不能判断；核对样本量、失败记录与停止原因后再提出下一份实验设计。'
     if status == 'DRAFT':
         return '补齐方案与证据后再提交监督审查。' if readiness['status'] != 'READY' else '草稿已具备审查材料；整理为待审方案后进入监督审查。'
     if status == 'APPROVED':
@@ -98,14 +110,20 @@ def card(store, row):
             'applicability': {key: text(applicability.get(key), 120) for key in ('route', 'build_id', 'environment')},
             'counter_explanations': [text(v, 400) for v in counterpoints[:5] if isinstance(v, str)],
             'evidence': public_evidence, 'experiment': experiment, 'supervision': review,
-            'readiness': readiness, 'next_step': _next_step(row['status'], readiness, review)}
+            'readiness': readiness, 'next_step': _next_step(row['status'], readiness, review, experiment)}
 
 
 def cards(store):
-    # Pending decisions come first, then drafts and live changes; closed history
+    # Keep the active forward experiment visible even after newer drafts arrive.
+    # Pending decisions follow, then drafts and live changes; closed history
     # remains queryable with proposals show even when it falls outside this list.
     total = store.db.execute('SELECT count(*) FROM strategy_proposals').fetchone()[0]
     rows = store.db.execute('''SELECT * FROM strategy_proposals ORDER BY
+        CASE WHEN EXISTS (
+            SELECT 1 FROM experiment_designs d JOIN experiment_events e ON e.experiment_id=d.id
+            WHERE d.proposal_id=strategy_proposals.id AND e.status='RUNNING'
+            AND e.id=(SELECT max(latest.id) FROM experiment_events latest WHERE latest.experiment_id=d.id)
+        ) THEN 0 ELSE 1 END,
         CASE status WHEN 'READY' THEN 0 WHEN 'DRAFT' THEN 1 WHEN 'APPROVED' THEN 2
         WHEN 'ADOPTED' THEN 3 ELSE 4 END, created_at DESC, id LIMIT ?''', (MAX_CARDS,)).fetchall()
     items = []

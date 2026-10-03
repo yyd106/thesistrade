@@ -574,6 +574,43 @@ assert.match(experimentText({...frozenExperiment,status:'REJECTED'}),/已否决/
 assert.doesNotMatch(experimentText({...frozenExperiment,status:'REJECTED'}),/状态待核对|未运行/);
 assert.equal(experimentText({id:'EXP_legacy',status:'DESIGNED'}),'EXP_legacy · 已登记设计 · 未运行');
 assert.equal(experimentText({id:'',status:'INVALID'}),'实验编号待补齐 · 设计材料需核对');
+const runningExecution={version:'forward-runner-v1',manifest_hash:'a'.repeat(64),baseline_build:'baseline_01',
+  started_at:'2026-10-04T04:00:00Z',ends_at:'2027-02-21T04:00:00Z',status:'RUNNING',
+  windows:[{index:1,start:'2026-10-04T04:00:00Z',end:'2026-11-23T04:00:00Z'},
+    {index:2,start:'2027-01-02T04:00:00Z',end:'2027-02-21T04:00:00Z'}],
+  primary_metric:'verifiable_prediction_rate',metric_label:'可检验结构比例',model_calls:8,max_model_calls:120,retries:1,minimum_pairs:30,
+  enrolled:4,complete:2,failed:1,pending:1,baseline_rate:.5,candidate_rate:1,paired_delta:.5,day_clusters:2,
+  baseline_citation_rate:.5,candidate_citation_rate:1,assessment:'PENDING',
+  window_results:[{window:1,enrolled:4,complete:2,failed:1,pending:1,baseline_rate:.5,candidate_rate:1,paired_delta:.5,day_clusters:2,baseline_citation_rate:.5,candidate_citation_rate:1},
+    {window:2,enrolled:0,complete:0,failed:0,pending:0,baseline_rate:null,candidate_rate:null,paired_delta:null,day_clusters:0,baseline_citation_rate:null,candidate_citation_rate:null}],
+  conclusion:'COLLECTING',stop_reason:null,production_changes:false,profit_evidence:false,private_input:'RAW_PRIVATE_MARKER'};
+const runningExperiment={...frozenExperiment,status:'RUNNING',execution:runningExecution};
+proposalBox=new FakeElement('section');drawProposals(proposalBox,{items:[{...proposalFixture,experiment:runningExperiment}],total:1});
+const runningOutput=JSON.stringify(proposalBox);
+for(const text of ['实验：运行中','可检验结构比例','实际启动','预定结束','观察窗口 1','观察窗口 2','纳入 4 对','完成 2 对','失败 1 对','等待 1 对','8 / 120 次','已重试 1 次','2 个日期簇','50.0%','100.0%','+50.0 个百分点','描述统计','仍在收集观察','当前等待','不会自动改变当前生产策略','首轮观察窗 1结果','确认窗 2结果','确认窗 2引用有效率','分窗评估：尚待观察'])assert.ok(runningOutput.includes(text),text);
+assert.doesNotMatch(runningOutput,/RAW_PRIVATE_MARKER|undefined|\[object Object\]|NaN/);
+assert.ok(descendants(proposalBox).every(n=>!['img','script','button','a'].includes(n.tag)&&!n.innerHTML));
+const emptyWindow={enrolled:0,complete:0,failed:0,pending:0,baseline_rate:null,candidate_rate:null,paired_delta:null,day_clusters:0,baseline_citation_rate:null,candidate_citation_rate:null};
+const waitingText=experimentText({...runningExperiment,execution:{...runningExecution,...emptyWindow,model_calls:0,retries:0,window_results:[{...emptyWindow,window:1},{...emptyWindow,window:2}]}});
+assert.match(waitingText,/尚无完整配对结果/);assert.match(waitingText,/后续研究产生符合观察窗口/);assert.doesNotMatch(waitingText,/0\.0%/);
+for(const [status,conclusion,expected] of [['COMPLETED','DESCRIPTIVE_ONLY','仅形成结构可检验性的描述统计'],['INCONCLUSIVE','INSUFFICIENT','尚不能判断'],['CANCELLED','CANCELLED','保留已采集的观察和失败记录'],['REJECTED','REJECTED','已否决']]){
+  const result=experimentText({...runningExperiment,status,execution:{...runningExecution,status,conclusion,stop_reason:'WINDOW_COMPLETE'}});
+  assert.ok(result.includes(expected));assert.match(result,/两个观察窗口已结束/);
+  assert.doesNotMatch(result,/当前等待|策略已批准|收益已验证/);
+}
+const driftText=experimentText({...runningExperiment,status:'INCONCLUSIVE',execution:{...runningExecution,status:'INCONCLUSIVE',conclusion:'INSUFFICIENT',stop_reason:'IMPLEMENTATION_CHANGED'}});
+assert.match(driftText,/运行版本或固定条件已变化/);
+const unsupportedText=experimentText({...runningExperiment,status:'COMPLETED',execution:{...runningExecution,status:'COMPLETED',conclusion:'DESCRIPTIVE_ONLY',assessment:'NOT_SUPPORTED',
+  enrolled:60,complete:60,failed:0,pending:0,baseline_rate:.3,candidate_rate:.8,paired_delta:.5,day_clusters:31,baseline_citation_rate:1,candidate_citation_rate:.95,
+  window_results:[{window:1,enrolled:45,complete:45,failed:0,pending:0,baseline_rate:.1,candidate_rate:.9,paired_delta:.8,day_clusters:23,baseline_citation_rate:1,candidate_citation_rate:1},
+    {window:2,enrolled:15,complete:15,failed:0,pending:0,baseline_rate:.9,candidate_rate:.5,paired_delta:-.4,day_clusters:8,baseline_citation_rate:1,candidate_citation_rate:.8}]}});
+assert.match(unsupportedText,/候选相对基线：\+50\.0 个百分点/);
+assert.match(unsupportedText,/确认窗 2可检验结构比例：基线 90\.0%；候选 50\.0%；差值 -40\.0 个百分点/);
+assert.match(unsupportedText,/确认窗 2引用有效率：基线 100\.0%；候选 80\.0%/);
+assert.match(unsupportedText,/分窗评估：不支持候选/);
+assert.match(unsupportedText,/总体改善不能抵消确认窗/);
+assert.match(experimentText({...runningExperiment,execution:{...runningExecution,assessment:'STRUCTURE_IMPROVEMENT_ONLY'}}),/仅观察到结构比例提高/);
+assert.match(experimentText({...runningExperiment,execution:{...runningExecution,assessment:'INSUFFICIENT'}}),/证据不足；不能以总体比例替代确认窗/);
 
 // A refresh, new evidence or reordered cards must preserve only the selected proposal's disclosure.
 proposalBox=new FakeElement('section');proposalBox.querySelectorAll=selector=>descendants(proposalBox).filter(n=>n.tag==='details'&&n.dataset.key&&(!selector.includes('[open]')||n.open));

@@ -14,6 +14,9 @@ def run_daily(store, config, at=None):
     result = {'at': at, 'registry': score(store, config, at), 'shadow': run_shadow(store, config, at), 'counts': registry_counts(store)}
     from .selfcheck import run as selfcheck
     result['selfcheck'] = selfcheck(store, config, at)
+    if config.get('deployment_role') != 'cloud':
+        from .experiment_runner import advance
+        result['experiments'] = advance(store, config, at)
     with store.db:
         store.db.execute("INSERT OR REPLACE INTO service_state VALUES('evaluation_last',?)", (json.dumps(result, ensure_ascii=False),))
     path = store.root / 'workflow' / 'evaluation' / SCORE_METHOD / 'daily' / (local(at).date().isoformat() + '-' + digest(json.dumps(result, sort_keys=True))[:12] + '.json')
@@ -110,8 +113,13 @@ def markdown(report, title=None, period='本周'):
     sc = report.get('selfcheck') or {}
     if sc.get('last'):
         lines += ['', '## 长期自检', '', f"最近检查：{sc['last'].get('at')}；报告：{sc['last'].get('report')}。",
-                  f"自动候选 {len(sc.get('candidates', []))} 项；每周最多 {sc.get('weekly_budget', 3)} 项新候选；当前仅登记实验设计，尚未运行。",
+                  f"自动候选 {len(sc.get('candidates', []))} 项；每周最多 {sc.get('weekly_budget', 3)} 项新候选；登记不等于启动。",
                   '结论：证据不足时维持现行方法，草稿与复盘不会自动进入生产研究。']
+    if sc.get('experiments'):
+        lines += ['', '## 隔离前向实验', '', '仅观察研究输出的可检验结构，不代表预测兑现、收益提高或生产采纳。']
+        for trial in sc['experiments']:
+            lines.append(f"- {trial['status']}；登记{trial['enrolled']}对，完整{trial['complete']}对，失败{trial['failed']}对；"
+                         f"订阅调用{trial['model_calls']}/{trial['max_model_calls']}次；主要指标：可检验结构比例。")
     if closed:
         replaced = closed['replacements']
         lines.append(f"- REJECTED（驳回，累计）：{closed['REJECTED']} 条")

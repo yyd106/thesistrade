@@ -147,6 +147,9 @@ class Scheduler:
         self.reports_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='reports');self.reports_future=None;self.last_reports=None
         self.supervision_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='supervision')
         self.supervision_future=None;self.supervision_cancel=Event();self.last_supervision_scan=None
+        self.experiment_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='experiment')
+        self.experiment_future=None;self.experiment_cancel=Event();self.last_experiment_scan=None
+        self.experiment_scan_ok=True
         self.poll_seconds=10
         from .monitor import MarketMonitor
         self.monitor=MarketMonitor()
@@ -253,6 +256,8 @@ class Scheduler:
                 from .supervision import busy
                 if busy(store) or offline or not config['scheduler_enabled'] or not config.get('supervision_enabled',True):
                     self.supervision_cancel.set()
+                if busy(store) or offline or not config['scheduler_enabled'] or not config.get('model_enabled'):
+                    self.experiment_cancel.set()
             with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('heartbeat',?)",(stamp,))
             # Process report queues and trading Slots in separate workers; slow PDF/model calls cannot stall the clock.
             active_kinds={r[0] for r in store.db.execute("SELECT kind FROM jobs WHERE status='RUNNING'")}
@@ -312,6 +317,7 @@ class Scheduler:
                     from .reports import run_sync
                     self.reports_future=self.reports_pool.submit(run_sync,dict(config));self.last_reports=time.monotonic()
             if role(config)!='cloud':self.supervision_tick(store,config,stamp,offline)
+            if role(config)!='cloud':self.experiment_tick(store,config,stamp,offline)
             if role(config)!='cloud' and time.monotonic()-self.last_followups>=60:
                 from .followups import reconcile
                 try:
@@ -342,6 +348,38 @@ class Scheduler:
             self.supervision_cancel=Event()
             self.supervision_future=self.supervision_pool.submit(supervision.worker,dict(config),pending['id'],self.supervision_cancel)
 
+    def experiment_tick(self,store,config,stamp,offline=None):
+        """Bounded local observation work; research and supervision take priority."""
+        if role(config)=='cloud':
+            self.experiment_cancel.set();return
+        from . import experiment_runner,supervision
+        if self.experiment_future and self.experiment_future.done():
+            try:self.experiment_future.result()
+            except Exception as exc:
+                with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('experiment_worker_error',?)",(type(exc).__name__,))
+            self.experiment_future=None
+        # Deadline accounting is model-free and remains active while offline.
+        if self.last_experiment_scan is None or time.monotonic()-self.last_experiment_scan>=60:
+            try:
+                experiment_runner.advance(store,config,stamp)
+                self.experiment_scan_ok=True
+            except Exception as exc:
+                self.experiment_scan_ok=False
+                with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('experiment_worker_error',?)",(type(exc).__name__,))
+            self.last_experiment_scan=time.monotonic()
+        if not self.experiment_scan_ok or offline or not config['scheduler_enabled'] or not config.get('model_enabled') or supervision.busy(store):
+            self.experiment_cancel.set();return
+        if self.supervision_future is not None or (config.get('supervision_enabled',True) and supervision.next_pending(store,stamp)):
+            self.experiment_cancel.set();return
+        if self.experiment_future is not None:return
+        try:pending=experiment_runner.next_pending(store,config,stamp)
+        except Exception as exc:
+            with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('experiment_worker_error',?)",(type(exc).__name__,))
+            return
+        if pending:
+            self.experiment_cancel=Event()
+            self.experiment_future=self.experiment_pool.submit(experiment_runner.worker,dict(config),pending['id'],self.experiment_cancel)
+
     def credit_dividends(self,store,config,stamp):
         """Credit due cash dividends. A failure is recorded in service_state and never stops the clock."""
         from .dividends import credit
@@ -371,6 +409,8 @@ class Scheduler:
 
     def close(self):
         self.stop.set()
+        self.experiment_cancel.set()
+        self.experiment_pool.shutdown(wait=True,cancel_futures=True)
         self.supervision_cancel.set()
         self.supervision_pool.shutdown(wait=True,cancel_futures=True)
         self.stop.set();self.pool.shutdown(wait=True,cancel_futures=True);self.dynamic_pool.shutdown(wait=True,cancel_futures=True);self.global_pool.shutdown(wait=True,cancel_futures=True);self.monitor.close();self.sync_pool.shutdown(wait=True,cancel_futures=True);self.reports_pool.shutdown(wait=True,cancel_futures=True)

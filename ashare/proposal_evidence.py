@@ -16,7 +16,7 @@ ROUTES = ('watchlist', 'portfolio', 'dynamic', 'global')
 BASE_LIMITATIONS = [
     '价格与超额分组仅为观察性诊断，不是实际成交收益，不能证明因果、策略优劣或未来盈利。',
     '同一判断在不同报告或期限中可能重复；各版本的样本和时间簇不得相加。',
-    '候选实验尚未运行；监督意见不等于用户批准，也不改变生产规则。',
+    '实验进度与结果另见冻结运行摘要；监督意见不等于用户批准，也不改变生产规则。',
     '全球价格诊断不含汇率与费用；动态净反应含估算成本，其他价格诊断不等于扣费后的策略收益。',
 ]
 
@@ -191,7 +191,7 @@ def summary(store, proposal, payload):
             limitations.append(f'编号仅展示前{MAX_REFERENCES}项；材料哈希覆盖全部引用。')
         displayed_snapshots = [all_snapshots[0]] if len(all_snapshots) == 1 else [all_snapshots[0], all_snapshots[-1]]
         snapshots = [{k: v for k, v in item.items() if k != 'cohorts'} | {'cohort_count': len(item['cohorts'])} for item in displayed_snapshots]
-        text = '证据不足：以下为冻结价格诊断，候选实验尚未运行。'
+        text = '证据不足：以下为冻结价格诊断，实验进度与结果另见冻结运行摘要。'
         for c in cohorts:
             stats = c['excess']
             horizon_unit = '根观测日线' if c['benchmark'] == 'CASH_USD' else '个交易日'
