@@ -69,6 +69,9 @@ def card(store, row):
     public_evidence = {k: evidence.get(k) for k in
                        ('text', 'status', 'cohorts', 'references', 'additional_count', 'limitations')}
     public_evidence['text'] = text(evidence.get('text'), 4200)
+    if payload.get('evidence') is None or (isinstance(payload.get('evidence'), str) and not payload['evidence'].strip()):
+        public_evidence.update(status='MISSING', text='尚未整理证据摘要，请补充依据及检验方案。',
+                               limitations=['草稿材料尚未补齐，不能据此判断方案效果。'])
     missing = [key for key in FIELDS if not isinstance(payload.get(key), str) or not payload[key].strip()]
     if evidence['status'] in ('MISSING', 'INVALID'):
         missing.append('evidence')

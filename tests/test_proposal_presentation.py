@@ -55,6 +55,11 @@ class ProposalPresentationTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM strategy_guidance').fetchone()[0], 0)
 
     def test_incomplete_evidence_is_visible_and_closed_proposal_does_not_reopen(self):
+        for absent in (None, '', '  '):
+            missing = presentation.card(self.store, self.proposal(evidence=absent))
+            self.assertEqual(missing['evidence']['status'], 'MISSING')
+            self.assertIn('尚未整理', missing['evidence']['text'])
+            self.assertEqual(missing['readiness']['status'], 'INCOMPLETE')
         row = self.proposal(evidence={})
         card = presentation.card(self.store, row)
         self.assertEqual(card['readiness']['status'], 'INCOMPLETE')
