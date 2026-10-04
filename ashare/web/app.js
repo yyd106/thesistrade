@@ -431,6 +431,12 @@ function drawReviewChecks(body,r) {
   for(const c of items.slice(0,24)){
     const row=el('div',null,'review-check-row');row.append(proposalText('p',(titles[c.check]||c.check||'检查项待核对')+'：'+(states[c.status]||'状态待核对')+' · 检查 '+(c.checked??'未知')+' 项 / 异常 '+(c.failures??'未知')+' 项'));
     if(c.detail)row.append(proposalText('p',c.detail,'subtle'));
+    const missingLabels={'order / plan / upper band':'订单、原计划或买入上限','original plan eligibility':'当时的研究资格','order portfolio policy snapshot':'订单对应的组合授权记录','order / exit evidence':'订单或退出依据','decision / exit evidence':'交易决定或退出依据','decision payload / exit evidence':'完整交易决定与退出依据','legacy decision / verifiable leading exit code':'旧记录中的有效退出码','recorded exit code':'已记录的退出码'};
+    for(const g of (c.missing_groups||[]).slice(0,24)){
+      const route=({watchlist:'自选股',global:'全球资产',dynamic:'动态研究'})[g.route]||'路线待核对';
+      row.append(proposalText('p',route+' · '+(titles[g.check]||'检查项待核对')+'：'+(missingLabels[g.missing]||g.missing||'依据待补')+' · 缺少 '+g.count+' 项','subtle'));
+    }
+    if(c.missing_groups_omitted)row.append(proposalText('p','另有 '+c.missing_groups_omitted+' 组未显示，完整分组保留在本机复盘记录。','subtle'));
     for(const e of (c.examples||[]).slice(0,3)){
       const parts=[e.symbol,e.position,e.route&&({watchlist:'自选股',global:'全球资产',dynamic:'动态研究'})[e.route],e.fill_id&&'成交 '+e.fill_id,e.reason,e.missing&&'缺少：'+e.missing,e.detail].filter(Boolean);
       if(e.last_sync)parts.push(Object.keys(e.last_sync).length?'上次同步 '+when(e.last_sync.at)+' · '+(e.last_sync.status==='OK'?'成功':'未成功'):'尚无成功同步记录');

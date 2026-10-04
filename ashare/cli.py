@@ -451,12 +451,13 @@ def _store_command(args, config, store):
             if old and same:
                 raise ValueError(f"提案文件的 dedupe_key 已被提案 {same['id']} 使用；用 --supersedes 登记新版时请换一个 dedupe_key 或去掉它")
             with store.db:
-                pid = governance.draft_proposal(store, source=spec.get('source', 'agent'), kind=spec['kind'], target=spec['target'],
+                receipt = governance.draft_proposal(store, source=spec.get('source', 'agent'), kind=spec['kind'], target=spec['target'],
                                                 title=spec['title'], payload={k: v for k, v in spec.items() if k not in ('kind', 'target', 'title', 'source')},
-                                                at=now(), dedupe_key=spec.get('dedupe_key'))
+                                                at=now(), dedupe_key=spec.get('dedupe_key'), return_receipt=True)
+            pid = receipt['id']
             for oid in old:
                 governance.decide(store, oid, 'SUPERSEDED', decided_by=None, note=f'{note}（新版 {pid}）', replaced_by=pid)
-            return {'status': 'DRAFT', 'id': pid, 'supersedes': old}
+            return {**receipt, 'supersedes': old}
         return governance.decide(store, args.id, args.to, decided_by=args.approved_by, note=args.note,
                                  replaced_by=getattr(args, 'replaced_by', None))
     if command == 'maintenance':

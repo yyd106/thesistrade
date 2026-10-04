@@ -36,6 +36,14 @@ def checks_summary(values):
         item = {key: row.get(key) for key in ('check', 'status', 'checked', 'failures', 'missing')}
         item['check'] = text(item['check'], 100)
         item['detail'] = text(row.get('detail'), 400)
+        groups = [g for g in (row.get('missing_groups') or []) if isinstance(g, dict)
+                  and g.get('route') in ('watchlist', 'dynamic', 'global')
+                  and type(g.get('count')) is int and g['count'] > 0]
+        if groups:
+            item['missing_groups'] = [{key: text(g.get(key), 100) for key in ('check', 'route', 'missing')}
+                                      | {'count': g['count']} for g in groups[:24]]
+            item['missing_groups_total'] = len(groups)
+            item['missing_groups_omitted'] = max(0, len(groups) - 24)
         item['examples'] = []
         for example in (row.get('examples') or [])[:3]:
             if not isinstance(example, dict):

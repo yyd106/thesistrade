@@ -51,8 +51,10 @@ USER_DECISIONS = ('APPROVED', 'ADOPTED', 'RETIRED')
 
 def guidance(store, route, symbol, at):
     """Adopted research rules for this route and symbol, as of `at`. Never includes drafts."""
-    rows = store.db.execute('''SELECT * FROM strategy_guidance WHERE status='ADOPTED' AND route IN (?,'ALL')
-        AND scope IN (?,'ALL') AND adopted_at<=? ORDER BY adopted_at,id''', (route, symbol, normalize_time(at)))
+    at = normalize_time(at)
+    rows = store.db.execute('''SELECT * FROM strategy_guidance WHERE status IN ('ADOPTED','RETIRED') AND route IN (?,'ALL')
+        AND scope IN (?,'ALL') AND adopted_at<=? AND (retired_at>? OR (status='ADOPTED' AND retired_at IS NULL))
+        ORDER BY adopted_at,id''', (route, symbol, at, at))
     return [{'id': r['id'], 'text': r['text'], 'adopted_at': r['adopted_at'], 'proposal_id': r['proposal_id'],
              'claim_type': 'ADOPTED_RESEARCH_RULE'} for r in rows]
 
@@ -133,26 +135,35 @@ def retitle_issue(store, issue_id, title, note, at=None):
     return {'status': 'RETITLED', 'id': issue_id, 'from': row['title'], 'to': title}
 
 
-def draft_proposal(store, *, source, kind, target, title, payload, at, dedupe_key=None):
-    """Create a DRAFT change proposal. Repeated observations append evidence to the same draft."""
+def draft_proposal(store, *, source, kind, target, title, payload, at, dedupe_key=None, return_receipt=False):
+    """Create a draft, or identify an identical existing proposal without changing it.
+
+    Existing callers receive its id. Receipts also distinguish creation from reuse and report
+    the actual lifecycle state. Additional evidence belongs in its separate append-only tables.
+    """
     if kind not in PROPOSAL_KINDS:
         raise ValueError('未知提案类型')
+    for field, value in (('target', target), ('title', title)):
+        if not isinstance(value, str) or len(value) > 200:
+            raise ValueError(f'提案 {field} 须为不超过200字的字符串')
     at = normalize_time(at)
     # Lifecycle fields are written only by decide().
     payload = {k: v for k, v in payload.items() if k not in RESERVED_PAYLOAD}
     if dedupe_key:
         row = store.db.execute('SELECT * FROM strategy_proposals WHERE dedupe_key=?', (dedupe_key,)).fetchone()
         if row:
-            old = json.loads(row['payload_json'])
-            old['observations'] = (old.get('observations', []) + payload.get('observations', []))[-20:]
-            old['last_seen_at'] = at
-            store.db.execute('UPDATE strategy_proposals SET payload_json=? WHERE id=?', (json.dumps(old, ensure_ascii=False), row['id']))
-            return row['id']
+            ignored = set(RESERVED_PAYLOAD) | {'last_seen_at', 'dedupe_key'}
+            content = lambda value: json.dumps({k: v for k, v in value.items() if k not in ignored}, ensure_ascii=False, sort_keys=True)
+            if ((row['source'], row['kind'], row['target'], row['title']) != (source, kind, target, title)
+                    or content(json.loads(row['payload_json'])) != content(payload)):
+                raise ValueError(f"dedupe_key 已关联提案 {row['id']}（{row['status']}），内容不一致；新增证据须单独登记，修订方案请使用新版本和新的 dedupe_key")
+            receipt = {'id': row['id'], 'status': row['status'], 'action': 'EXISTS'}
+            return receipt if return_receipt else row['id']
     pid = uuid.uuid4().hex[:16]
     store.db.execute('INSERT INTO strategy_proposals VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                     (pid, at, source, kind, target[:200], 'DRAFT', title[:200], json.dumps({**payload, 'last_seen_at': at}, ensure_ascii=False),
+                     (pid, at, source, kind, target, 'DRAFT', title, json.dumps({**payload, 'last_seen_at': at}, ensure_ascii=False),
                       None, None, None, dedupe_key))
-    return pid
+    return {'id': pid, 'status': 'DRAFT', 'action': 'CREATED'} if return_receipt else pid
 
 
 def validate_guidance(value):

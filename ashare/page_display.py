@@ -34,6 +34,7 @@ def public_fields():
       valuation_notice research portfolio statistics daily_accounting context_48h learning_notice analysis analysis_error
       consistency_checks routing presentation history revision ready_at model_status automatic_retries_remaining payload
       checks counts total omitted items current ordinal lesson applicability category to status updated_at expires_at expired
+      missing_groups missing_groups_total missing_groups_omitted
       findings notice daily context status_at data_as_of shown check checked failures missing examples route fill_id last_sync
       pending failed free_gb db_gb backups_gb free_bytes database_bytes warning phase position detail name qty qty_scale cost_cents average_cost_cents
       market_value_cents unrealized_cents cumulative_realized_cents price_cents price_micros currency fx_micros fx_at quote_at

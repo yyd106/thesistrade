@@ -258,6 +258,8 @@ def run_json(prompt, schema, folder, timeout=240, *, cancel_event=None):
             meta.update(parse_header((folder / "stderr.log").read_text(errors="replace")))
         except OSError:
             pass
+        from .model_identity_audit import identity
+        meta['identity'] = identity(meta)
         json_write(folder / "meta.json", meta)
         _local.meta = dict(meta)
     try:

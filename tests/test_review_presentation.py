@@ -129,6 +129,25 @@ class ReviewPresentationTests(unittest.TestCase):
         self.assertEqual(checks[3]['examples'][0]['free_gb'], 2.1)
         self.assertNotIn('PRIVATE_MARKER', json.dumps(checks))
 
+    def test_missing_groups_keep_route_counts_without_exporting_private_examples(self):
+        from ashare import page_display
+        row, payload = insert_review_fixture(self.store)
+        groups = [{'check':'CHECK_BUY_OUTSIDE_PLAN_BAND', 'route':'watchlist' if i < 23 else 'dynamic',
+                   'missing':'order / plan / upper band', 'count':i+1,
+                   'examples':[{'path':'PRIVATE_GROUP_PATH', 'raw':'PRIVATE_GROUP_RAW'}]} for i in range(26)]
+        payload['consistency_checks'] = [{'check':'CHECK_EXECUTION_EVIDENCE','status':'INSUFFICIENT',
+                                         'checked':30,'failures':0,'missing_groups':groups}]
+        before = copy.deepcopy(payload)
+        summary = projection(self.store, row, payload, AT)['checks']['items'][0]
+        public = page_display.bounded(summary, [0])
+        self.assertEqual(public['missing_groups_total'], 26)
+        self.assertEqual(public['missing_groups_omitted'], 2)
+        self.assertEqual(len(public['missing_groups']), 24)
+        self.assertEqual(public['missing_groups'][-1]['route'], 'dynamic')
+        self.assertEqual(public['missing_groups'][-1]['count'], 24)
+        self.assertNotIn('PRIVATE_GROUP', json.dumps(public))
+        self.assertEqual(payload, before)
+
     def test_proposal_priority_and_14_day_history_ignore_repeated_narratives(self):
         old = self.proposal(at=OLD, source='review', incomplete=True)
         with self.store.db:

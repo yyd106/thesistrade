@@ -39,15 +39,19 @@ def route_lessons(store,rid,lessons,at,build_id=None):
             key='review-observation:'+digest(encode([build_id or 'UNKNOWN',lesson['symbol'],lesson['category'],
                 normal(lesson.get('applicability')),normal(lesson['lesson'])]))
             prior=store.db.execute('SELECT proposal_id FROM review_observations WHERE review_id=? AND ordinal=?',(rid,n)).fetchone()
-            existing=store.db.execute('SELECT id FROM strategy_proposals WHERE dedupe_key=?',(key,)).fetchone()
-            pid=prior[0] if prior else existing[0] if existing else draft_proposal(store,source='review',kind='OTHER',target=lesson['symbol'],title=lesson['lesson'][:60],
-                payload={'observations':[{'review_id':rid,'lesson':lesson['lesson'],'applicability':lesson.get('applicability'),
-                    'category':lesson['category'],'evidence':evidence}],
-                    'note':'复盘产生的策略观察草稿：尚未验证，不进入研究输入。需整理成含检验方法的完整提案并经用户批准。'},
-                at=at,dedupe_key=key)
-            store.db.execute('INSERT OR IGNORE INTO review_observations VALUES(?,?,?,?,?)',
-                (pid,rid,n,at,encode({'lesson':lesson['lesson'],'evidence':evidence,'build_id':build_id})))
-            routed.append({'lesson':n,'to':'proposal_draft','id':pid})
+            existing=store.db.execute('SELECT id,status FROM strategy_proposals WHERE id=?',(prior[0],)).fetchone() if prior else store.db.execute('SELECT id,status FROM strategy_proposals WHERE dedupe_key=?',(key,)).fetchone()
+            if existing:
+                receipt={'id':existing['id'],'status':existing['status'],'action':'EXISTS'}
+            else:
+                receipt=draft_proposal(store,source='review',kind='OTHER',target=lesson['symbol'],title=lesson['lesson'][:60],
+                    payload={'observations':[{'review_id':rid,'lesson':lesson['lesson'],'applicability':lesson.get('applicability'),
+                        'category':lesson['category'],'evidence':evidence}],
+                        'note':'复盘产生的策略观察草稿：尚未验证，不进入研究输入。需整理成含检验方法的完整提案并经用户批准。'},
+                    at=at,dedupe_key=key,return_receipt=True)
+            added=store.db.execute('INSERT OR IGNORE INTO review_observations VALUES(?,?,?,?,?)',
+                (receipt['id'],rid,n,at,encode({'lesson':lesson['lesson'],'evidence':evidence,'build_id':build_id}))).rowcount
+            routed.append({'lesson':n,'to':'proposal_draft',**receipt,
+                'observation_action':'RECORDED' if added else 'ALREADY_RECORDED'})
     return routed
 
 

@@ -28,6 +28,17 @@ assert.ok(all.includes('MODEL_FULL_SUMMARY'));assert.ok(all.includes('MODEL_DETA
 assert.ok(all.includes('上次同步'));assert.ok(all.includes('未成功'));
 assert.equal(JSON.stringify(record),before);
 assert.ok(nodes(box).every(n=>!['script','img','iframe'].includes(n.tag)&&!n.innerHTML));
+// Missing evidence retains route-level counts beyond the first representative examples.
+const grouped=structuredClone(record);
+grouped.payload.consistency_checks[1].missing_groups=[
+  {check:'CHECK_BUY_OUTSIDE_PLAN_BAND',route:'watchlist',missing:'order / plan / upper band',count:6},
+  {check:'CHECK_SELL_WITHOUT_REASON',route:'dynamic',missing:'recorded exit code',count:2}];
+grouped.payload.consistency_checks[1].missing_groups_omitted=3;
+box=new Element('section');get('drawDailyReview')(box,grouped);
+assert.match(full(box),/自选股 · 买入价格与计划区间：订单、原计划或买入上限 · 缺少 6 项/);
+assert.match(full(box),/动态研究 · 卖出依据：已记录的退出码 · 缺少 2 项/);
+assert.match(full(box),/另有 3 组未显示/);
+assert.doesNotMatch(visible(box),/缺少 6 项/,'Evidence detail stays collapsed by default');
 // Local overview and old cloud full packets keep the same 24-hour amount.
 box=new Element('section');const compact=structuredClone(record);delete compact.payload.facts.daily_portfolio;compact.payload.facts.daily_accounting={...daily,dividend_cents:175,dividends_known:true};get('drawDailyReview')(box,compact);
 assert.match(visible(box),/-4\.50 元/);assert.match(visible(box),/已入账现金分红 \+1\.75 元/);
