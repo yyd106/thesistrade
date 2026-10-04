@@ -886,9 +886,64 @@ function nextNotice(s,later=noticeLater,role=currentUser?.role,showing=noticeSho
   // Keep the notice on screen while it is still open, so a click never lands on a different one.
   return open.find(n=>n.id===showing)||open[0]||null;
 }
+function approvalNoticeExpired(n,at=Date.now()) {
+  return !!n.approval_request&&(!Number.isFinite(Date.parse(n.approval_request.expires_at))||Date.parse(n.approval_request.expires_at)<=at);
+}
+function approvalNoticeText(n) {
+  const r=n.approval_request;if(!r)return traderText(n.body);
+  const s=r.summary||{},snapshot=r.snapshot||{};
+  const states={DRAFT:'草稿',READY:'待决定',APPROVED:'已批准',ADOPTED:'已采纳',REJECTED:'不实施',SUPERSEDED:'被新版替代',RETIRED:'已撤下'};
+  const stateName=value=>states[value]||value||'未提供';
+  const action={APPROVED:'批准此版本',ADOPTED:'采纳并上线此版本',RETIRED:'撤下此规则',REJECTED:s.from==='APPROVED'?'撤回批准':'不实施此提案',SUPERSEDED:'将旧提案标为被新版替代',APPLY:'执行所列设置变更'}[r.action]||r.action;
+  const routeName=value=>({watchlist:'自选股',global:'全球资产',ALL:'所有研究路线'}[value]||value);
+  const scopeName=value=>value==='ALL'?'所有标的':value;
+  const valueText=value=>value===undefined?'未设置':typeof value==='string'?value:JSON.stringify(value,null,2);
+  const out=['本次确认：'+action,'有效期至：'+when(r.expires_at)];
+  // Frozen action text is shown verbatim. General vocabulary substitutions could
+  // alter rule wording, setting names or identifiers and therefore do not apply here.
+  if(r.kind==='CONFIG'){
+    const settings={watchlist:'固定关注名单',dynamic_enabled:'新闻跟踪',model_enabled:'模型研究',model_name:'固定模型',model_reasoning_effort:'推理强度',paper_entry_band_bps:'入场区间',paper_stop_loss_bps:'止损幅度',paper_take_profit_bps:'止盈幅度',plan_max_age_hours:'计划有效时间',max_packet_chars:'研究资料长度',max_news_packet_pct:'新闻占比',evaluation_horizon_days:'评分期限',shadow_risk_per_trade_bps:'对照账本每笔风险',shadow_start_date:'对照账本起始日',research_topics:'研究主题',comparison_peers:'比较对象',business_keywords:'业务关键词',industry_enabled:'行业研究',industry_policy:'行业研究规则',scheduler_enabled:'自动运行'};
+    const changes=s.changes||snapshot.changes||[];
+    out.push('','设置变更：'+changes.length+' 项');
+    for(const [index,change] of changes.entries()){
+      out.push('',(index+1)+'. '+(settings[change.key]?settings[change.key]+'（'+change.key+'）':change.key),
+        '原值：'+(change.before_present===false?'未显式设置，沿用默认值':valueText(change.before)),
+        '新值：'+valueText(change.after));
+    }
+    out.push('','理由：'+(s.reason||snapshot.reason||'未提供'));
+    if(s.build_before||s.build_after)out.push('执行版本：'+(s.build_before||'未提供')+' → '+(s.build_after||'未提供'));
+  }else{
+    out.push('','提案：'+(s.title||r.subject_id),'提案编号：'+(s.proposal_id||r.subject_id),
+      '状态：'+stateName(s.from||snapshot.status)+' → '+stateName(s.to||r.action));
+    if(s.target)out.push('改动对象：'+s.target);
+    if(s.proposal_hash||snapshot.proposal_hash)out.push('提案内容版本：'+(s.proposal_hash||snapshot.proposal_hash));
+    if(s.guidance)out.push('','本版研究规则',
+      '路线：'+routeName(s.guidance.route)+'；适用范围：'+scopeName(s.guidance.scope),s.guidance.text);
+    const rules=s.replaces||snapshot.rules||[];
+    if(rules.length){
+      out.push('',r.action==='RETIRED'?'本次将撤下 '+rules.length+' 条规则：':'明确替代范围（采纳时撤下以下 '+rules.length+' 条旧规则）：');
+      for(const [index,rule] of rules.entries()){
+        out.push('',(index+1)+'. '+rule.id,'路线：'+routeName(rule.route)+'；适用范围：'+scopeName(rule.scope),rule.text);
+        if(rule.proposal_id)out.push('原提案：'+rule.proposal_id);
+        if(rule.proposal_version?.hash)out.push('旧规则提案版本：'+rule.proposal_version.hash);
+      }
+      if(r.action!=='RETIRED')out.push('未列出的现有规则继续保留。');
+    }else if(s.guidance)out.push('','替代范围：不替代任何旧规则，现有互补规则继续保留。');
+    const newer=s.replaced_by||snapshot.replaced_by;
+    if(newer)out.push('','替代它的新版提案：'+newer.id,'新版状态：'+stateName(newer.status),'新版内容版本：'+newer.hash);
+    if(s.note||snapshot.note)out.push('','决定理由：'+(s.note||snapshot.note));
+    const planLabels={hypothesis:'依据与假设',change:'方案摘要',test_plan:'验证计划',failure_criteria:'失败标准',rollback:'撤回办法',evidence_summary:'证据说明'};
+    for(const [key,title] of Object.entries(planLabels))if(s.plan?.[key])out.push('',title+'：'+s.plan[key]);
+    if(s.approval_notice)out.push('',s.approval_notice);
+  }
+  out.push('','本次审批版本：'+r.hash,'','批准只生成本次动作的回执，之后由代理按批准内容实施；执行时再次核对内容与状态。');
+  return out.join('\n');
+}
 function drawNoticeActions(n) {
   const box=$('notice-actions');box.replaceChildren();
-  for(const a of noticeActions(n.kind)){
+  const expired=approvalNoticeExpired(n);
+  if(expired)box.append(el('p','本次审批已过期，请重新登记当前版本。','caution'));
+  for(const a of expired?[]:noticeActions(n.kind)){
     const b=el('button',noticePending===a.action?a.confirm:a.label,a.primary?'primary':'');b.type='button';
     b.addEventListener('click',()=>answerNotice(n,a,b));box.append(b);
   }
@@ -900,12 +955,12 @@ function renderNotice(s) {
   const dialog=$('notice-dialog');if(!dialog)return;
   const n=nextNotice(s);
   if(!n){if(dialog.open&&!noticeBusy)dialog.close();noticeShown=null;return;}
-  if(noticeShown===n.id&&dialog.open)return;
+  if(noticeShown===n.id&&dialog.open){if(approvalNoticeExpired(n))drawNoticeActions(n);return;}
   noticeShown=n.id;noticePending=null;
   $('notice-kind').textContent=noticeKinds[n.kind]||'通知';
   $('notice-title').textContent=traderText(n.title);
   $('notice-meta').textContent=when(n.created_at)+' · 来自'+(noticeAuthors[n.author]||n.author)+(n.deadline?' · 请在 '+when(n.deadline)+' 前处理':'');
-  $('notice-body').textContent=traderText(n.body);
+  $('notice-body').textContent=approvalNoticeText(n);
   feedback('notice-feedback','');drawNoticeActions(n);
   if(!dialog.open){if(dialog.showModal)dialog.showModal();else dialog.setAttribute('open','');}
   // Focus the title, not a button: a key pressed while typing elsewhere must not answer an unread notice.
@@ -913,13 +968,14 @@ function renderNotice(s) {
 }
 async function answerNotice(n,a,button) {
   if(noticeBusy)return;
+  if(approvalNoticeExpired(n)){drawNoticeActions(n);feedback('notice-feedback','本次审批已过期，请重新登记当前版本。','error');return;}
   if(a.confirm&&noticePending!==a.action){
     noticePending=a.action;drawNoticeActions(n);
     feedback('notice-feedback','再点一次“'+a.confirm+'”确认；点其他按钮可以改主意。','pending');return;
   }
   noticeBusy=true;button.disabled=true;feedback('notice-feedback','正在提交…','pending');
   try{
-    await api.post('/api/notices/decide',{id:n.id,action:a.action});
+    await api.post('/api/notices/decide',{id:n.id,action:a.action,...(n.approval_request?{expected_hash:n.approval_request.hash}:{})});
     noticeAnswered.add(n.id);noticeBusy=false;noticeShown=null;$('notice-dialog').close();renderNotice(state);await refresh();
   }catch(error){feedback('notice-feedback',error.message,'error');}
   finally{noticeBusy=false;button.disabled=false;}
@@ -976,7 +1032,8 @@ let pendingWatchlist=null;
 function watchlistDiff(before,after){const old=new Map(before.map(w=>[w.symbol,w.name])),next=new Map(after.map(w=>[w.symbol,w.name]));return [...after.filter(w=>!old.has(w.symbol)).map(w=>'新增：'+w.name+' '+w.symbol),...before.filter(w=>!next.has(w.symbol)).map(w=>'移除：'+w.name+' '+w.symbol),...after.filter(w=>old.has(w.symbol)&&old.get(w.symbol)!==w.name).map(w=>'名称调整：'+old.get(w.symbol)+' → '+w.name+' '+w.symbol)];}
 async function saveSettings(button,body,target,success) {
   button.dataset.saving='true';button.disabled=true;feedback(target,'正在保存…','pending');
-  try{await api.post('/api/settings',body);if(body.watchlist)editing=false;feedback(target,success);await refresh();}
+  try{const result=await api.post('/api/settings',body);if(body.watchlist)editing=false;
+    feedback(target,result.status==='APPROVAL_PENDING'?'调整已登记，尚未生效。请核对审批通知；批准后由代理按回执实施。':success,result.status==='APPROVAL_PENDING'?'pending':'');await refresh();}
   catch(error){feedback(target,error.message,'error');}
   finally{delete button.dataset.saving;button.disabled=!connected;}
 }

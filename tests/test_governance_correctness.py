@@ -1,3 +1,4 @@
+from approval_fixture import decide as confirmed_decide
 import copy
 import json
 import sqlite3
@@ -38,7 +39,7 @@ class GovernanceCorrectnessTests(unittest.TestCase):
             return governance.draft_proposal(self.store, **(copy.deepcopy(self.arguments) | changes))
 
     def decide(self, pid, status, at=ADOPTED, **kwargs):
-        return governance.decide(self.store, pid, status, decided_by='SYNTHETIC_USER',
+        return confirmed_decide(self.store, pid, status, decided_by='SYNTHETIC_USER',
                                  note='仅用于合成测试', at=at, **kwargs)
 
     def to_state(self, pid, status):

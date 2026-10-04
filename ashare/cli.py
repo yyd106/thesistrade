@@ -65,15 +65,21 @@ def main():
     ex.add_argument('--file');ex.add_argument('--proposal');ex.add_argument('--note')
     ex.add_argument('--to', choices=['CANCELLED', 'REJECTED'])
     sub.add_parser('schedule', help='显示周期任务与下一次运行时间')
-    prop = sub.add_parser('proposals', help='变更提案：list/show/new/decide')
-    prop.add_argument('action', choices=['list', 'show', 'new', 'decide'])
+    prop = sub.add_parser('proposals', help='变更提案：list/show/new/request/decide')
+    prop.add_argument('action', choices=['list', 'show', 'new', 'request', 'decide'])
     prop.add_argument('id', nargs='?')
     prop.add_argument('--status');prop.add_argument('--file', help='new：提案JSON文件')
     prop.add_argument('--supersedes', action='append', help='new：被这份新提案替代的旧提案编号，可重复；旧提案标为SUPERSEDED')
     prop.add_argument('--to', help='decide：READY/APPROVED/REJECTED/ADOPTED/RETIRED/SUPERSEDED')
     prop.add_argument('--replaced-by', help='decide --to SUPERSEDED 时必填：替代它的新版提案编号')
-    prop.add_argument('--approved-by', help='批准、上线、撤下时必填：用户本人确认的记录')
+    prop.add_argument('--approved-by', help='兼容旧参数；批准人文字不能授予权限，请使用审批回执')
+    prop.add_argument('--approval', '--approval-id', dest='approval_id', help='已认证管理员确认的审批请求编号')
+    prop.add_argument('--replaces', action='append', help='明确替代的已采纳研究规则编号G-...，可重复；未列规则保留')
+    prop.add_argument('--replace-none', action='store_true', help='明确不替代任何旧规则，作为互补新增')
     prop.add_argument('--note', help='决定理由或实施说明')
+    ap = sub.add_parser('approvals', help='审批请求与回执：只读查询，确认须在管理员网页完成')
+    ap.add_argument('action', choices=['list', 'show'])
+    ap.add_argument('id', nargs='?')
     iss = sub.add_parser('issues', help='工程问题：list/new/resolve/retitle')
     iss.add_argument('action', choices=['list', 'new', 'resolve', 'retitle']);iss.add_argument('id', nargs='?')
     iss.add_argument('--status', default='OPEN');iss.add_argument('--note');iss.add_argument('--wontfix', action='store_true')
@@ -118,9 +124,10 @@ def main():
     rp = sub.add_parser('reports', help='私有报告仓库：setup/sync/status（摘要备份及外部审查交换）')
     rp.add_argument('action', choices=['setup', 'sync', 'status']);rp.add_argument('--remote', help='setup：git@github.com:<owner>/<repo>.git')
     cfgp = sub.add_parser('config', help='查看或修改设置（按类别校验并留痕）')
-    cfgp.add_argument('action', choices=['show', 'set'])
+    cfgp.add_argument('action', choices=['show', 'set', 'request', 'recover'])
     cfgp.add_argument('pairs', nargs='*', help='set：key=value，value 按JSON解析')
-    cfgp.add_argument('--reason');cfgp.add_argument('--approved-by')
+    cfgp.add_argument('--reason');cfgp.add_argument('--approved-by', help='兼容备注，不授予策略修改权限')
+    cfgp.add_argument('--approval', '--approval-id', dest='approval_id', help='本次精确设置变更的审批请求编号')
     args = parser.parse_args()
     config = load_config(args.config)
     handled = extended(args, config)
@@ -301,7 +308,7 @@ def extended(args, config):
                     'due': expected['due'], 'not_yet_credited': [d for d in expected['due'] if not d['credited']], 'conflicts': expected['conflicts'],
                     'held': {s: {k: p.get(k, 0) for k in ('qty', 'cost_cents', 'dividend_cents')} for s, p in held.items()}}
         finally:store.close()
-    if command in ('proposals', 'issues', 'guidance', 'maintenance', 'backtest'):
+    if command in ('proposals', 'approvals', 'issues', 'guidance', 'maintenance', 'backtest'):
         store = Store(config['data_dir'])
         try:
             return _store_command(args, config, store)
@@ -382,6 +389,9 @@ def extended(args, config):
         finally:store.close()
     if command == 'config':
         from .config_ops import apply, classify
+        if args.action == 'recover':
+            from .config_ops import recover
+            return recover(config['config_path'])
         if args.action == 'show':
             raw = json.loads(Path(config['config_path']).read_text())
             return {k: {'value': v, 'class': classify(k)} for k, v in sorted(raw.items()) if k != 'sync_key_file'}
@@ -392,13 +402,25 @@ def extended(args, config):
             if not sep:
                 raise ValueError('请使用 key=value 形式')
             changes[key.strip()] = parse_value(value)
-        return apply(config['config_path'], changes, reason=args.reason, approved_by=args.approved_by)
+        if args.action == 'request':
+            from .config_ops import request_change
+            return request_change(config['config_path'], changes, reason=args.reason)
+        return apply(config['config_path'], changes, reason=args.reason, approved_by=args.approved_by,
+                     approval_id=getattr(args, 'approval_id', None))
     return None
 
 
 def _store_command(args, config, store):
     from . import governance
     command = args.command
+    if command == 'approvals':
+        from . import approvals
+        if args.action == 'list':
+            return [{k: r[k] for k in ('id', 'kind', 'subject_id', 'action', 'status', 'created_at', 'expires_at')}
+                    for r in approvals.listing(store)]
+        if not args.id:
+            raise ValueError('需要审批请求编号')
+        return approvals.request_info(store, args.id)
     if command == 'guidance':
         return [dict(r) for r in store.db.execute("SELECT * FROM strategy_guidance ORDER BY adopted_at")]
     if command == 'issues':
@@ -435,31 +457,41 @@ def _store_command(args, config, store):
             missing = required - set(spec)
             if missing:
                 raise ValueError('提案缺少字段：' + '、'.join(sorted(missing)))
-            old = list(dict.fromkeys(getattr(args, 'supersedes', None) or []))
-            note = (args.note or '').strip() or '被完整新版替代'
-            same = store.db.execute('SELECT id FROM strategy_proposals WHERE dedupe_key=?', (spec['dedupe_key'],)).fetchone() if spec.get('dedupe_key') else None
-            for oid in old:  # check every old proposal before writing anything; the new id does not exist yet
-                row = store.db.execute('SELECT status,decided_by FROM strategy_proposals WHERE id=?', (oid,)).fetchone()
-                if not row:
-                    raise ValueError(f'未找到提案 {oid}')
-                if 'SUPERSEDED' not in governance.TRANSITIONS.get(row['status'], ()):
-                    raise ValueError(f"提案 {oid} 的状态为{row['status']}，不能标为被新版替代")
-                if row['status'] == 'REJECTED' and row['decided_by']:
-                    raise ValueError(f"提案 {oid} 由 {row['decided_by']} 驳回，改标请用 decide --to SUPERSEDED 并写明批准人")
-                if same and same['id'] == oid:
-                    raise ValueError(f'提案文件的 dedupe_key 指向 {oid} 本身，不能替代它自己')
-            if old and same:
-                raise ValueError(f"提案文件的 dedupe_key 已被提案 {same['id']} 使用；用 --supersedes 登记新版时请换一个 dedupe_key 或去掉它")
-            with store.db:
+            from .approvals import atomic
+            with atomic(store):
+                old = list(dict.fromkeys(getattr(args, 'supersedes', None) or []))
+                note = (args.note or '').strip() or '被完整新版替代'
+                same = store.db.execute('SELECT id FROM strategy_proposals WHERE dedupe_key=?', (spec['dedupe_key'],)).fetchone() if spec.get('dedupe_key') else None
+                for oid in old:  # check every old proposal before writing anything; the new id does not exist yet
+                    row = store.db.execute('SELECT status,decided_by FROM strategy_proposals WHERE id=?', (oid,)).fetchone()
+                    if not row:
+                        raise ValueError(f'未找到提案 {oid}')
+                    if 'SUPERSEDED' not in governance.TRANSITIONS.get(row['status'], ()):
+                        raise ValueError(f"提案 {oid} 的状态为{row['status']}，不能标为被新版替代")
+                    if row['status'] == 'REJECTED' and row['decided_by']:
+                        raise ValueError(f"提案 {oid} 由 {row['decided_by']} 驳回，改标请用 decide --to SUPERSEDED 并使用新审批回执")
+                    if same and same['id'] == oid:
+                        raise ValueError(f'提案文件的 dedupe_key 指向 {oid} 本身，不能替代它自己')
+                if old and same:
+                    raise ValueError(f"提案文件的 dedupe_key 已被提案 {same['id']} 使用；用 --supersedes 登记新版时请换一个 dedupe_key 或去掉它")
                 receipt = governance.draft_proposal(store, source=spec.get('source', 'agent'), kind=spec['kind'], target=spec['target'],
-                                                title=spec['title'], payload={k: v for k, v in spec.items() if k not in ('kind', 'target', 'title', 'source')},
-                                                at=now(), dedupe_key=spec.get('dedupe_key'), return_receipt=True)
-            pid = receipt['id']
-            for oid in old:
-                governance.decide(store, oid, 'SUPERSEDED', decided_by=None, note=f'{note}（新版 {pid}）', replaced_by=pid)
-            return {**receipt, 'supersedes': old}
+                                                    title=spec['title'], payload={k: v for k, v in spec.items() if k not in ('kind', 'target', 'title', 'source')},
+                                                    at=now(), dedupe_key=spec.get('dedupe_key'), return_receipt=True)
+                pid = receipt['id']
+                for oid in old:
+                    governance.decide(store, oid, 'SUPERSEDED', decided_by=None, note=f'{note}（新版 {pid}）', replaced_by=pid)
+                return {**receipt, 'supersedes': old}
+        replaces = getattr(args, 'replaces', None)
+        if getattr(args, 'replace_none', False):
+            if replaces:
+                raise ValueError('--replace-none与--replaces不能同时使用')
+            replaces = []
+        if args.action == 'request':
+            return governance.request_decision(store, args.id, args.to, note=args.note,
+                                               replaces=replaces, replaced_by=getattr(args, 'replaced_by', None))
         return governance.decide(store, args.id, args.to, decided_by=args.approved_by, note=args.note,
-                                 replaced_by=getattr(args, 'replaced_by', None))
+                                 replaced_by=getattr(args, 'replaced_by', None), replaces=replaces,
+                                 approval_id=getattr(args, 'approval_id', None))
     if command == 'maintenance':
         from . import maintenance
         result = {'outbox_pruned': maintenance.prune_outbox(store), 'disk': maintenance.disk_status(store, config)}

@@ -47,10 +47,18 @@ class ConfigChangeTests(unittest.TestCase):
         from ashare.build import STRATEGY_KEYS
         self.assertEqual(config_ops.OPERATIONAL & set(STRATEGY_KEYS), set())
 
-    def test_strategy_change_needs_named_approval(self):
-        with self.assertRaisesRegex(ValueError, '批准人'):
+    def test_strategy_change_needs_exact_authenticated_approval(self):
+        from approval_fixture import grant
+        with self.assertRaisesRegex(ValueError, '审批收据'):
             config_ops.apply(self.path, {'paper_entry_band_bps': 100}, reason='测试')
-        result = config_ops.apply(self.path, {'paper_entry_band_bps': 100}, reason='按提案收窄区间', approved_by='Dean 2026-10-02 聊天确认')
+        changes = {'paper_entry_band_bps': 100}
+        request = config_ops.request_change(self.path, changes, reason='按提案收窄区间')
+        store = Store(Path(self.tmp.name) / 'data')
+        try:
+            grant(store, request)
+        finally:
+            store.close()
+        result = config_ops.apply(self.path, changes, reason='按提案收窄区间', approval_id=request['id'])
         self.assertNotEqual(result['build_before'], result['build_after'])
         self.assertEqual(self.log()[0]['class'], 'STRATEGY')
 

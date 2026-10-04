@@ -15,7 +15,7 @@ from .model import run_codex
 from .storage import Store, now, digest, json_write, atomic_write
 
 
-def load_config(path):
+def load_config(path, *, configure_model=True):
     path = Path(path).resolve()
     config = json.loads(path.read_text())
     if config.get("mode") not in ("research", "paper") or config.get("live_execution_enabled") is not False or config.get("paid_api_fallback") is not False:
@@ -39,7 +39,8 @@ def load_config(path):
     from .settings import validate_settings
     validate_settings(config)
     from .model import configure
-    configure(config)
+    if configure_model:
+        configure(config)
     return config
 
 

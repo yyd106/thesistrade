@@ -1,3 +1,4 @@
+from approval_fixture import decide as confirmed_decide
 """Synthetic read-only display tests; no production data or model invocations."""
 import copy
 import json
@@ -156,7 +157,7 @@ class ReviewPresentationTests(unittest.TestCase):
             self.store.db.execute('UPDATE strategy_proposals SET payload_json=? WHERE id=?', (json.dumps(payload), old))
         approved = self.proposal(at=OLD)
         governance.decide(self.store, approved, 'READY', decided_by=None, note='合成', at=OLD)
-        governance.decide(self.store, approved, 'APPROVED', decided_by='Synthetic Dean', note='合成', at=OLD)
+        confirmed_decide(self.store, approved, 'APPROVED', decided_by='Synthetic Dean', note='合成', at=OLD)
         ready = self.proposal(at=OLD)
         governance.decide(self.store, ready, 'READY', decided_by=None, note='合成', at=OLD)
         before = self.snapshot()

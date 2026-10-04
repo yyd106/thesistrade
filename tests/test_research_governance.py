@@ -1,3 +1,4 @@
+from approval_fixture import decide as confirmed_decide
 import json
 import os
 import stat
@@ -171,12 +172,12 @@ class GovernanceTests(unittest.TestCase):
         governance.decide(self.store, pid, 'READY', decided_by=None, note='整理完成', at='2026-09-20T00:01:00+00:00')
         with self.assertRaisesRegex(ValueError, '批准人'):
             governance.decide(self.store, pid, 'APPROVED', decided_by=' ', note='代理不能自行批准')
-        governance.decide(self.store, pid, 'APPROVED', decided_by='Dean', note='同意', at='2026-09-20T00:02:00+00:00')
-        governance.decide(self.store, pid, 'ADOPTED', decided_by='Dean', note='已上线', at='2026-09-20T00:03:00+00:00')
+        confirmed_decide(self.store, pid, 'APPROVED', decided_by='Dean', note='同意', at='2026-09-20T00:02:00+00:00')
+        confirmed_decide(self.store, pid, 'ADOPTED', decided_by='Dean', note='已上线', at='2026-09-20T00:03:00+00:00')
         self.assertEqual(len(governance.guidance(self.store, 'global', 'BTC', '2026-09-20T00:04:00+00:00')), 1)
         self.assertEqual(governance.guidance(self.store, 'global', 'ETH', '2026-09-20T00:04:00+00:00'), [])
         self.assertEqual(governance.guidance(self.store, 'global', 'BTC', '2026-09-20T00:02:30+00:00'), [])
-        governance.decide(self.store, pid, 'RETIRED', decided_by='Dean', note='效果不佳', at='2026-09-21T00:00:00+00:00')
+        confirmed_decide(self.store, pid, 'RETIRED', decided_by='Dean', note='效果不佳', at='2026-09-21T00:00:00+00:00')
         self.assertEqual(governance.guidance(self.store, 'global', 'BTC', '2026-09-22T00:00:00+00:00'), [])
 
     def test_issues_collapse_by_key_and_reopen_after_resolution(self):

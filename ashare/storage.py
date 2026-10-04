@@ -113,6 +113,8 @@ class Store:
         self.db.executescript(CLOUD_SCHEMA)
         from .industry import SCHEMA as INDUSTRY_SCHEMA
         self.db.executescript(INDUSTRY_SCHEMA)
+        from .approval_schema import SCHEMA as APPROVAL_SCHEMA
+        self.db.executescript(APPROVAL_SCHEMA)
 
     def raw(self, data, suffix=".bin"):
         h = digest(data)

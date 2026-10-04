@@ -1,3 +1,4 @@
+from approval_fixture import decide as confirmed_decide
 """Corporate-action rule v2. Announcements are synthetic, written in the two exchanges' public
 layouts (fictional companies and numbers); no collected document is used."""
 import argparse
@@ -585,16 +586,16 @@ class GovernanceToolTests(unittest.TestCase):
         with self.store.db:  # a rejection recorded by 0.15.2: columns only, no history in the payload
             self.store.db.execute("UPDATE strategy_proposals SET status='REJECTED',decided_at=?,decided_by=?,decision_note=? WHERE id=?",
                                   ('2026-09-26T01:05:00+00:00', 'Dean', '被新版替代', old))
-        with self.assertRaisesRegex(ValueError, '由 Dean 驳回'):
+        with self.assertRaisesRegex(ValueError, '确认回执'):
             governance.decide(self.store, old, 'SUPERSEDED', decided_by=None, note='改标', replaced_by=new)
         approved = self.draft('已批准')
         governance.decide(self.store, approved, 'READY', decided_by=None, note='整理')
-        governance.decide(self.store, approved, 'APPROVED', decided_by='Dean', note='同意')
-        with self.assertRaisesRegex(ValueError, '已批准'):
+        confirmed_decide(self.store, approved, 'APPROVED', decided_by='Dean', note='同意')
+        with self.assertRaisesRegex(ValueError, '确认回执'):
             governance.decide(self.store, approved, 'REJECTED', decided_by=None, note='代理改主意')
-        governance.decide(self.store, old, 'SUPERSEDED', decided_by='Dean', note='改标', replaced_by=new)
+        confirmed_decide(self.store, old, 'SUPERSEDED', decided_by='Dean', note='改标', replaced_by=new)
         history = next(p for p in governance.proposals(self.store) if p['id'] == old)['payload']['history']
-        self.assertEqual([(h['to'], h['by']) for h in history], [('REJECTED', 'Dean'), ('SUPERSEDED', 'Dean')])
+        self.assertEqual([(h['to'], h['by']) for h in history], [('REJECTED', 'Dean'), ('SUPERSEDED', 'admin')])
         with self.store.db:
             forged = governance.draft_proposal(self.store, source='agent', kind='RULE', target='x', title='t',
                                                payload={'hypothesis': 'h', 'superseded_by': old, 'history': [{'to': 'ADOPTED'}]}, at='2026-09-26T01:00:00+00:00')

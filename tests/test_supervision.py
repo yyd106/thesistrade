@@ -1,3 +1,4 @@
+from approval_fixture import decide as confirmed_decide
 import json
 import tempfile
 import subprocess
@@ -39,8 +40,8 @@ class SupervisionTests(unittest.TestCase):
             pid = governance.draft_proposal(self.store, source='manual', kind='RULE', target='趋势过滤', title='试验提案', payload=payload, at=AT)
         governance.decide(self.store, pid, 'READY', decided_by=None, note='方案完整', at=AT)
         if status == 'ADOPTED':
-            governance.decide(self.store, pid, 'APPROVED', decided_by='Dean synthetic test', note='测试批准', at=AT)
-            governance.decide(self.store, pid, 'ADOPTED', decided_by='Dean synthetic test', note='版本 test-build', at=AT)
+            confirmed_decide(self.store, pid, 'APPROVED', decided_by='Dean synthetic test', note='测试批准', at=AT)
+            confirmed_decide(self.store, pid, 'ADOPTED', decided_by='Dean synthetic test', note='版本 test-build', at=AT)
         return pid
 
     def runner(self, prompts, verdict='INSUFFICIENT'):

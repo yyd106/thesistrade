@@ -67,16 +67,20 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(code,200)
         self.assertTrue(json.loads(self.path.read_text())['scheduler_enabled'])
 
-    def test_fixed_list_edit_is_audited_and_status_separates_fixed_members(self):
+    def test_fixed_list_edit_requires_exact_approval_and_status_separates_fixed_members(self):
         original=json.loads(self.path.read_text())['watchlist']
         code,raw,_=self.request('GET','/api/status')
         self.assertEqual(json.loads(raw)['fixed_watchlist'],original)
         changed=[{**w,'name':w['name']+'核对'} if i==0 else w for i,w in enumerate(original)]
         code,raw,_=self.request('POST','/api/settings',{'watchlist':changed},{'X-CSRF-Token':self.csrf})
-        self.assertEqual(code,200,raw)
-        records=[json.loads(line) for line in (Path(self.data)/'workflow/changes/config-changes.jsonl').read_text().splitlines()]
-        self.assertIn('watchlist',json.dumps(records[-1]));self.assertIn('admin',json.dumps(records[-1]))
-        self.assertEqual(json.loads(self.path.read_text())['watchlist'],changed)
+        self.assertEqual(code,202,raw)
+        response=json.loads(raw)
+        self.assertEqual(response['status'],'APPROVAL_PENDING')
+        self.assertEqual(json.loads(self.path.read_text())['watchlist'],original)
+        self.assertFalse((Path(self.data)/'workflow/changes/config-changes.jsonl').exists())
+        request=response['approval_request']
+        self.assertEqual(request['summary']['changes'][0]['after'],changed)
+        self.assertEqual(request['summary']['changes'][0]['before'],original)
 
     def test_foreign_origin_or_host_remains_blocked(self):
         code,body=self.post('cycle',Origin='https://foreign.example')

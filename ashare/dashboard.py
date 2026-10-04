@@ -319,7 +319,8 @@ def make_handler(config_path,token,port):
                     if not isinstance(body.get('id'),str) or not isinstance(body.get('action'),str):raise ValueError('请求内容无效。')
                     store=Store(cfg['data_dir'])
                     try:
-                        row=decide(store,body['id'],body['action'],user['username'])
+                        row=decide(store,body['id'],body['action'],user,expected_hash=body.get('expected_hash'),
+                                   authority='CLOUD_ADMIN' if cfg.get('deployment_role')=='cloud' else 'LOCAL_ADMIN')
                         self.send(200,{'id':row['id'],'status':row['status'],'answered_at':row['acked_at']})
                     finally:store.close()
                 elif self.path=='/api/settings':
@@ -343,9 +344,14 @@ def make_handler(config_path,token,port):
                             if len(set(symbols)|set(FIXED)|protected_assets(check_store))>MAX_ASSETS:raise ValueError('新列表加上固定资产及持仓/未完成委托超过40，请保留受保护持仓的名额。')
                         finally:check_store.close()
                     validate_settings(raw)
-                    from .config_ops import apply
-                    apply(config_path,body,reason='管理员在设置页确认修改',approved_by=user['username']+' 在已登录管理页提交',data_dir=cfg['data_dir'])
-                    self.send(200,{'status':'SAVED'})
+                    from .config_ops import apply, classify, request_change
+                    if any(classify(key)=='STRATEGY' for key in body):
+                        request=request_change(config_path,body,reason='管理员在设置页提交策略调整',data_dir=cfg['data_dir'])
+                        self.send(202,{'status':'APPROVAL_PENDING','approval_request':request,
+                                       'message':'调整已登记，尚未生效。请核对审批通知；批准后由代理按回执实施。'})
+                    else:
+                        apply(config_path,body,reason='管理员在设置页确认运行调整',data_dir=cfg['data_dir'])
+                        self.send(200,{'status':'SAVED'})
                 else:self.send(404,{'error':'Not found'})
             except auth.AuthError as exc:self.send(exc.code,{'error':str(exc)})
             except Exception as exc:self.send(400,{'error':str(exc)[:500]})
@@ -353,6 +359,8 @@ def make_handler(config_path,token,port):
 
 
 def serve(config_path,port=None):
+    from .config_ops import recover
+    recover(config_path)
     config=load_config(config_path);port=port or int(os.environ.get('PORT',config['ui_port']))
     scheduler=Scheduler(config_path)
     Handler=make_handler(config_path,secrets.token_urlsafe(32),port)

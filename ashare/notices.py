@@ -13,6 +13,7 @@ carries out what was approved.
 """
 import json
 import re
+from datetime import datetime
 from .storage import digest, normalize_time, now
 from .calendar import local
 
@@ -75,12 +76,35 @@ def listing(store, status=None, limit=50):
     return [dict(r) for r in store.db.execute(sql, ((status, limit) if status else (limit,)))]
 
 
-def pending(store):
-    return [dict(r) for r in store.db.execute('SELECT * FROM notices WHERE delivered_at IS NULL ORDER BY created_at LIMIT 50')]
+def pending(store, *, include_approvals=True):
+    condition = '' if include_approvals else " AND json_extract(payload_json,'$.approval_request') IS NULL"
+    return [dict(r) for r in store.db.execute('SELECT * FROM notices WHERE delivered_at IS NULL' + condition + ' ORDER BY created_at LIMIT 50')]
 
 
 def unresolved(store):
-    return [r[0] for r in store.db.execute("SELECT id FROM notices WHERE delivered_at IS NOT NULL AND status='OPEN' ORDER BY created_at LIMIT 200")]
+    """Poll current approvals first and rotate history read-only, so stale notices cannot block receipts."""
+    at = now()
+    base = "delivered_at IS NOT NULL AND status='OPEN'"
+    current = "coalesce(json_extract(payload_json,'$.approval_request.created_at')<=? AND json_extract(payload_json,'$.approval_request.expires_at')>?,0)"
+    active = [r[0] for r in store.db.execute(
+        'SELECT id FROM notices WHERE ' + base + ' AND (' + current + ') ORDER BY created_at,id LIMIT 200', (at, at))]
+    remaining = 200 - len(active)
+    if not remaining:
+        return active
+    history = base + ' AND NOT (' + current + ')'
+    total = store.db.execute('SELECT count(*) FROM notices WHERE ' + history, (at, at)).fetchone()[0]
+    if not total:
+        return active
+    # No mutation or held transaction precedes the subsequent network request. Each minute
+    # advances one bounded page, including old approvals answered before their expiry.
+    pages = (total + remaining - 1) // remaining
+    offset = (int(datetime.fromisoformat(at).timestamp()) // 60 % pages) * remaining
+    rows = [r[0] for r in store.db.execute(
+        'SELECT id FROM notices WHERE ' + history + ' ORDER BY created_at,id LIMIT ? OFFSET ?', (at, at, remaining, offset))]
+    if len(rows) < remaining and offset:
+        rows += [r[0] for r in store.db.execute(
+            'SELECT id FROM notices WHERE ' + history + ' ORDER BY created_at,id LIMIT ?', (at, at, remaining - len(rows)))]
+    return active + rows
 
 
 def outgoing(row):
@@ -96,13 +120,13 @@ def for_replica(store, request):
     if not isinstance(known, list) or len(known) > 200:
         raise ValueError('通知编号数量超限')
     since = normalize_time(since) if isinstance(since, str) else '0000'
-    raised = [{**outgoing(r), **_state(r)} for r in store.db.execute(
+    raised = [{**outgoing(r), **_state(store, r)} for r in store.db.execute(
         'SELECT * FROM notices WHERE delivered_at IS NULL AND created_at>=? ORDER BY created_at LIMIT 50', (since,))]
     states = {}
     for nid in known:
         row = get(store, nid) if isinstance(nid, str) else None
         if row:
-            states[nid] = _state(row)
+            states[nid] = _state(store, row)
     return {'raised': raised, 'states': states}
 
 
@@ -112,7 +136,7 @@ def mirror(store, data):
         raise ValueError('通知同步格式错误')
     newest = None
     for n in data.get('raised') or []:
-        if not isinstance(n, dict) or set(n) != set(FIELDS) | {'status', 'acked_at', 'decided_by'} or not ID.fullmatch(str(n['id'])):
+        if not isinstance(n, dict) or set(n) - {'approval_receipt'} != set(FIELDS) | {'status', 'acked_at', 'decided_by'} or not ID.fullmatch(str(n['id'])):
             raise ValueError('通知字段不匹配')
         _check(n['title'], n['body'], n['kind'], n['author'])
         created = normalize_time(n['created_at'])
@@ -130,13 +154,23 @@ def mark_delivered(store, ids, at):
         store.db.execute('UPDATE notices SET delivered_at=? WHERE id=? AND delivered_at IS NULL', (at, nid))
 
 
-def _state(row):
+def _state(store, row):
     p = json.loads(row['payload_json'] or '{}')
-    return {'status': row['status'], 'acked_at': row['acked_at'], 'decided_by': p.get('decided_by')}
+    state = {'status': row['status'], 'acked_at': row['acked_at'], 'decided_by': p.get('decided_by')}
+    if p.get('approval_request'):
+        from . import approvals
+        state['approval_receipt'] = approvals.receipt_state(store, p['approval_request']['id'])
+    return state
 
 
 def apply_states(store, states):
     """Answers recorded where Dean saw the notice; the research node only mirrors them."""
+    from .approvals import atomic
+    with atomic(store):
+        _apply_states(store, states)
+
+
+def _apply_states(store, states):
     for nid, s in (states or {}).items():
         if not isinstance(s, dict) or s.get('status') not in STATUSES:
             continue
@@ -144,6 +178,26 @@ def apply_states(store, states):
         if not row:
             continue
         payload = json.loads(row['payload_json'] or '{}')
+        if payload.get('approval_request'):
+            # Terminal state is authoritative only with a matching authenticated receipt.
+            # A legacy cloud's APPROVED status cannot become a strategy authorization.
+            receipt = s.get('approval_receipt')
+            if s.get('status') != 'OPEN':
+                if not receipt:
+                    continue
+                from . import approvals
+                if receipt.get('request_id') != payload['approval_request']['id']:
+                    raise ValueError('审批回执与通知请求不匹配')
+                if s['status'] != ('APPROVED' if receipt.get('decision') == 'APPROVE' else 'REJECTED'):
+                    raise ValueError('审批回执与通知状态不匹配')
+                approvals.mirror_receipt(store, receipt)
+                s = {**s, 'decided_by': receipt['actor'], 'acked_at': receipt['issued_at']}
+            elif receipt:
+                raise ValueError('未处理的通知不能携带审批回执')
+            elif row['status'] != 'OPEN':
+                continue  # A stale cloud reply cannot undo an immutable approval decision.
+        elif s.get('approval_receipt'):
+            raise ValueError('普通通知不能接收策略审批回执')
         if s.get('decided_by'):
             payload['decided_by'] = str(s['decided_by'])[:40]
         store.db.execute('UPDATE notices SET status=?,acked_at=?,payload_json=? WHERE id=?',
@@ -152,6 +206,12 @@ def apply_states(store, states):
 
 def receive(store, body, at):
     """Cloud side of /api/sync/notices. Content is immutable once received; the reply carries answers."""
+    from .approvals import atomic
+    with atomic(store):
+        return _receive(store, body, at)
+
+
+def _receive(store, body, at):
     incoming = body.get('notices') or []
     known = body.get('known') or []
     if not isinstance(incoming, list) or len(incoming) > 50 or not isinstance(known, list) or len(known) > 200:
@@ -163,6 +223,19 @@ def receive(store, body, at):
         payload = json.loads(n['payload_json'])
         if not isinstance(payload, dict):
             raise ValueError('通知附加信息格式错误')
+        if set(payload) & {'approval_receipt', 'receipt', 'decided_by', 'action', 'authority'}:
+            raise ValueError('通知请求不能携带审批决定或批准主体')
+        existing = get(store, n['id'])
+        existing_request = json.loads(existing['payload_json'] or '{}').get('approval_request') if existing else None
+        if existing_request != payload.get('approval_request') and (existing_request or payload.get('approval_request')):
+            if existing:
+                raise ValueError('通知编号已绑定其他审批内容')
+        if payload.get('approval_request'):
+            from . import approvals
+            request = payload['approval_request']
+            if not isinstance(request, dict) or n['kind'] != 'DECISION' or n['id'] != request.get('notice_id'):
+                raise ValueError('审批请求与通知不匹配')
+            approvals.receive_request(store, request)
         store.db.execute('INSERT OR IGNORE INTO notices VALUES(?,?,?,?,?,?,?,?,?,?)',
                          (n['id'], normalize_time(n['created_at']), n['author'], n['kind'], n['title'].strip(), n['body'].strip(),
                           'OPEN', None, at, _payload(payload)))
@@ -170,39 +243,58 @@ def receive(store, body, at):
     for nid in [n['id'] for n in incoming] + [k for k in known if isinstance(k, str)]:
         row = get(store, nid)
         if row:
-            states[nid] = _state(row)
+            states[nid] = _state(store, row)
     return {'status': 'ACCEPTED', 'states': states}
 
 
-def decide(store, nid, action, user, at=None):
+def decide(store, nid, action, user, at=None, *, expected_hash=None, authority=None):
+    """Answer a notice; strategy approval requires its exact frozen request and a live admin session."""
+    from .approvals import atomic
     at = normalize_time(at or now())
-    row = get(store, nid)
-    if not row:
-        raise ValueError('没有这条通知')
-    allowed = ACTIONS[row['kind']]
-    if action not in allowed:
-        raise ValueError('这条通知不能这样处理')
-    if row['status'] != 'OPEN':
-        if row['status'] == allowed[action]:
-            return row  # the same answer twice (a retried request) changes nothing
-        raise ValueError('这条通知已经处理过')
-    payload = json.loads(row['payload_json'] or '{}')
-    payload.update(decided_by=user, action=action)
-    with store.db:
-        # Only an open notice takes an answer; a concurrent answer that got there first wins.
-        done = store.db.execute("UPDATE notices SET status=?,acked_at=?,payload_json=? WHERE id=? AND status='OPEN'",
-                                (allowed[action], at, json.dumps(payload, ensure_ascii=False, sort_keys=True), nid)).rowcount
-    if not done:
-        return decide(store, nid, action, user, at)
-    return get(store, nid)
+    with atomic(store):
+        row = get(store, nid)
+        if not row:
+            raise ValueError('没有这条通知')
+        allowed = ACTIONS[row['kind']]
+        if action not in allowed:
+            raise ValueError('这条通知不能这样处理')
+        payload = json.loads(row['payload_json'] or '{}')
+        request = payload.get('approval_request')
+        if request:
+            from . import approvals
+            if row['kind'] != 'DECISION' or nid != request.get('notice_id'):
+                raise ValueError('审批请求与通知不匹配')
+            # approve verifies a still-live session itself; a supplied username is never authority.
+            approvals.approve(store, request['id'], expected_hash, user, decision=action,
+                              authority=authority, at=at)
+        if row['status'] != 'OPEN':
+            if row['status'] != allowed[action]:
+                raise ValueError('这条通知已经处理过')
+            return row
+        actor = user.get('username') if isinstance(user, dict) else user
+        payload.update(decided_by=actor, action=action)
+        store.db.execute("UPDATE notices SET status=?,acked_at=?,payload_json=? WHERE id=? AND status='OPEN'",
+                         (allowed[action], at, json.dumps(payload, ensure_ascii=False, sort_keys=True), nid))
+        return get(store, nid)
 
 
 def open_for_display(store, limit=20):
     out = []
-    for r in store.db.execute("SELECT * FROM notices WHERE status='OPEN' ORDER BY created_at LIMIT ?", (limit,)):
+    at = now()
+    for r in store.db.execute("SELECT * FROM notices WHERE status='OPEN' ORDER BY created_at"):
         item = {k: r[k] for k in DISPLAY if k != 'deadline'}
-        item['deadline'] = json.loads(r['payload_json'] or '{}').get('deadline')
+        payload = json.loads(r['payload_json'] or '{}')
+        item['deadline'] = payload.get('deadline')
+        if payload.get('approval_request'):
+            from . import approvals
+            item['approval_request'] = approvals.envelope(store, payload['approval_request']['id'])
+            item['deadline'] = item['approval_request']['expires_at']
+            if item['deadline'] <= at:
+                continue  # Expired requests stay in the audit history, outside the active decision queue.
+            item['body'] = '请核对以下完整审批内容；批准后仍需按已批准的内容执行。'
         out.append(item)
+        if len(out) >= limit:
+            break
     return out
 
 

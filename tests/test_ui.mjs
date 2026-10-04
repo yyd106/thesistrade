@@ -728,3 +728,5 @@ console.log('Diagnostic age, coverage and chronological build order passed.');
 
 await import('./test_macro_relevance_ui.mjs');
 await import('./test_review_relevance_ui.mjs');
+
+await import('./test_approval_ui.mjs');

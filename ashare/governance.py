@@ -45,7 +45,7 @@ TRANSITIONS = {'DRAFT': ('READY', 'REJECTED', 'SUPERSEDED'), 'READY': ('APPROVED
 # States a replacing proposal may be in; a proposal can only be superseded by one still in play.
 LIVE = ('DRAFT', 'READY', 'APPROVED', 'ADOPTED')
 RESERVED_PAYLOAD = ('history', 'superseded_by', 'supersedes')
-# A decision that changes production must name who approved it; agents may only prepare.
+# Production changes need a version-bound confirmation receipt; a name is never authority.
 USER_DECISIONS = ('APPROVED', 'ADOPTED', 'RETIRED')
 
 
@@ -149,11 +149,19 @@ def draft_proposal(store, *, source, kind, target, title, payload, at, dedupe_ke
     at = normalize_time(at)
     # Lifecycle fields are written only by decide().
     payload = {k: v for k, v in payload.items() if k not in RESERVED_PAYLOAD}
+    if kind == 'RESEARCH_GUIDANCE':
+        # New proposals explicitly default to an additional, complementary rule.
+        payload.setdefault('replaces', [])
+        _replacement_ids(payload['replaces'])
     if dedupe_key:
         row = store.db.execute('SELECT * FROM strategy_proposals WHERE dedupe_key=?', (dedupe_key,)).fetchone()
         if row:
             ignored = set(RESERVED_PAYLOAD) | {'last_seen_at', 'dedupe_key'}
-            content = lambda value: json.dumps({k: v for k, v in value.items() if k not in ignored}, ensure_ascii=False, sort_keys=True)
+            def content(value):
+                value = {k: v for k, v in value.items() if k not in ignored}
+                if kind == 'RESEARCH_GUIDANCE':
+                    value.setdefault('replaces', [])
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
             if ((row['source'], row['kind'], row['target'], row['title']) != (source, kind, target, title)
                     or content(json.loads(row['payload_json'])) != content(payload)):
                 raise ValueError(f"dedupe_key 已关联提案 {row['id']}（{row['status']}），内容不一致；新增证据须单独登记，修订方案请使用新版本和新的 dedupe_key")
@@ -179,21 +187,40 @@ def validate_guidance(value):
     return {**value, 'text': text}
 
 
-def check_decision(store, proposal_id, status, *, decided_by, note, replaced_by=None):
-    """Validate a transition without writing; returns the proposal row."""
+def proposal_version(row):
+    """Hash the complete original proposal, excluding only lifecycle bookkeeping."""
+    ignored = set(RESERVED_PAYLOAD) | {'last_seen_at', 'dedupe_key'}
+    payload = {k: v for k, v in json.loads(row['payload_json']).items() if k not in ignored}
+    # Historical proposals without this field mean unspecified, not an implicit approval.
+    content = {k: row[k] for k in ('source', 'kind', 'target', 'title')}
+    content['payload'] = payload
+    return digest(json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False))
+
+
+def _replacement_ids(value):
+    if not isinstance(value, list) or any(not isinstance(v, str) or not v.strip() or v != v.strip() for v in value):
+        raise ValueError('replaces 必须明确列出旧研究规则编号；不替代时填写空列表 []')
+    if len(set(value)) != len(value):
+        raise ValueError('replaces 不能包含重复规则编号')
+    return sorted(value)
+
+
+def needs_confirmation(row, status):
+    return (status in USER_DECISIONS or row['status'] == 'APPROVED'
+            or (row['status'] == 'REJECTED' and bool(row['decided_by'])))
+
+
+def check_decision(store, proposal_id, status, *, decided_by=None, note, replaced_by=None):
+    """Check the lifecycle only. Authorization is checked atomically by decide()."""
     row = store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (proposal_id,)).fetchone()
     if not row:
         raise ValueError(f'未找到提案 {proposal_id}')
     if status not in TRANSITIONS.get(row['status'], ()):
         raise ValueError(f"提案 {proposal_id} 的状态不能从{row['status']}变为{status}")
-    if status in USER_DECISIONS and (not decided_by or not decided_by.strip()):
-        raise ValueError('批准、上线或撤下须写明批准人（用户本人确认），代理不能自行批准')
-    if row['status'] == 'REJECTED' and row['decided_by'] and (not decided_by or not decided_by.strip()):
-        raise ValueError(f"该提案由 {row['decided_by']} 驳回，改标须写明批准人")
-    if row['status'] == 'APPROVED' and (not decided_by or not decided_by.strip()):
-        raise ValueError('用户已批准的提案，改变状态须写明批准人')
-    if not note or not note.strip():
+    if not isinstance(note, str) or not note.strip():
         raise ValueError('需要记录决定理由或实施说明')
+    if len(note.strip()) > 1000:
+        raise ValueError('决定理由或实施说明不能超过1000字')
     if status == 'SUPERSEDED':
         if not replaced_by:
             raise ValueError('标记为被新版替代须写明新版提案编号（--replaced-by）')
@@ -209,37 +236,184 @@ def check_decision(store, proposal_id, status, *, decided_by, note, replaced_by=
     return row
 
 
-def decide(store, proposal_id, status, *, decided_by, note, at=None, replaced_by=None):
-    """Move a proposal through its lifecycle. Production-changing states require the approver's name.
-    Every transition is kept in the payload's history, so a relabel does not erase the earlier decision."""
+def _guidance_version(store, row):
+    """Full rule content and lifecycle, plus the version of its owning proposal."""
+    result = {k: row[k] for k in ('id', 'route', 'scope', 'text', 'status', 'proposal_id',
+                                 'adopted_at', 'retired_at', 'approved_by')}
+    payload = json.loads(row['payload_json'])
+    result['payload_hash'] = digest(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False))
+    owner = store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (row['proposal_id'],)).fetchone()
+    result['proposal_version'] = None if owner is None else {
+        'id': owner['id'], 'status': owner['status'], 'hash': proposal_version(owner)}
+    return result
+
+
+def _plan_summary(payload):
+    """Only authored proposal summaries leave the local store, never evidence objects/paths."""
+    result = {}
+    for key in ('hypothesis', 'change', 'test_plan', 'failure_criteria', 'rollback'):
+        value = payload.get(key)
+        if isinstance(value, str):
+            result[key] = value if len(value) <= 1200 else value[:1200] + '…（摘要省略；完整原稿已绑定版本）'
+        elif value is not None:
+            result[key] = '原稿为结构化内容；完整版本已绑定，请在本机提案详情核对。'
+    evidence = payload.get('evidence')
+    if evidence is not None:
+        count = len(evidence) if isinstance(evidence, list) else 1
+        result['evidence_summary'] = f'已绑定原稿证据 {count} 项；仅显示摘要，不展开本机路径或原始资料。'
+    return result
+
+
+def _decision_plan(store, row, status, note, replaces, replaced_by, at):
+    payload = json.loads(row['payload_json'])
+    version = proposal_version(row)
+    rule, old_rules, replacement_ids = None, [], None
+    if replaces is not None and (row['kind'] != 'RESEARCH_GUIDANCE' or status not in ('APPROVED', 'ADOPTED')):
+        raise ValueError('replaces 仅用于批准或采纳研究规则')
+    if row['kind'] == 'RESEARCH_GUIDANCE' and status in ('APPROVED', 'ADOPTED'):
+        rule = validate_guidance(payload.get('guidance'))
+        selected = replaces if replaces is not None else payload.get('replaces')
+        if selected is None:
+            raise ValueError('批准或采纳前须明确 replaces 列表；互补新增请明确填写 []')
+        else:
+            replacement_ids = _replacement_ids(selected)
+            for gid in replacement_ids:
+                old = store.db.execute('SELECT * FROM strategy_guidance WHERE id=?', (gid,)).fetchone()
+                if not old or old['status'] != 'ADOPTED' or old['retired_at'] is not None or old['adopted_at'] > at:
+                    raise ValueError(f'被替代规则 {gid} 不存在或当前未生效')
+                if old['proposal_id'] == row['id'] or gid == 'G-' + row['id']:
+                    raise ValueError('研究规则不能替代自身')
+                if (rule['route'] != old['route'] and 'ALL' not in (rule['route'], old['route'])) or (
+                        rule['scope'] != old['scope'] and 'ALL' not in (rule['scope'], old['scope'])):
+                    raise ValueError(f'被替代规则 {gid} 与新规则没有线路和适用范围交集')
+                old_version = _guidance_version(store, old)
+                owner = old_version['proposal_version']
+                if old['proposal_id'] and owner is None:
+                    raise ValueError(f'被替代规则 {gid} 的所属提案不存在')
+                if owner is not None and owner['status'] != 'ADOPTED':
+                    raise ValueError(f'被替代规则 {gid} 与所属提案的状态不一致')
+                old_rules.append(old_version)
+    if status == 'RETIRED':
+        old_rules = [_guidance_version(store, g) for g in store.db.execute(
+            "SELECT * FROM strategy_guidance WHERE proposal_id=? AND status='ADOPTED' ORDER BY id", (row['id'],))]
+        if any(g['retired_at'] is not None or g['adopted_at'] > at for g in old_rules):
+            raise ValueError('待撤下规则的生效时间或状态不一致')
+    approved = next((h for h in reversed(payload.get('history') or [])
+                     if isinstance(h, dict) and h.get('to') == 'APPROVED'), None)
+    legacy = row['status'] == 'APPROVED' and not (approved and approved.get('approval_id'))
+    if status == 'ADOPTED' and not legacy:
+        if not approved or approved.get('proposal_hash') != version:
+            raise ValueError('已批准提案的内容版本已改变，请登记完整新版本并重新批准')
+        if row['kind'] == 'RESEARCH_GUIDANCE' and approved.get('replaces') != replacement_ids:
+            raise ValueError('采纳的替代列表与已批准方案不一致，请登记完整新版本并重新批准')
+    newer = None
+    if replaced_by:
+        replacement = store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (replaced_by,)).fetchone()
+        newer = {'id': replacement['id'], 'status': replacement['status'], 'hash': proposal_version(replacement)}
+    snapshot = {'version': 'proposal-decision-v1', 'proposal_hash': version, 'status': row['status'],
+                'action': status, 'note': note.strip(), 'replaces': replacement_ids, 'rules': old_rules,
+                'replaced_by': newer, 'legacy_approval': legacy}
+    summary = {'proposal_id': row['id'], 'title': row['title'], 'kind': row['kind'], 'target': row['target'],
+               'from': row['status'], 'to': status, 'note': note.strip(), 'proposal_hash': version,
+               'guidance': rule, 'replaces': old_rules, 'legacy_approval': legacy,
+               'plan': _plan_summary(payload)}
+    if newer:
+        summary['replaced_by'] = newer
+    if legacy:
+        summary['approval_notice'] = '原APPROVED记录没有本版确认回执；本次确认绑定当前完整提案与本次动作，不追认旧批准。'
+    return snapshot, summary
+
+
+def request_decision(store, proposal_id, status, note, replaces=None, replaced_by=None, at=None):
+    """Freeze the exact proposed action for a separate human confirmation. Never applies it."""
+    from . import approvals
     at = normalize_time(at or now())
-    row = check_decision(store, proposal_id, status, decided_by=decided_by, note=note, replaced_by=replaced_by)
+    with approvals.atomic(store):
+        row = check_decision(store, proposal_id, status, note=note, replaced_by=replaced_by)
+        if status in ('DRAFT', 'READY'):
+            raise ValueError('草稿整理动作不需要用户审批，可直接记录决定')
+        snapshot, summary = _decision_plan(store, row, status, note, replaces, replaced_by, at)
+        return approvals.create_request(store, kind='PROPOSAL_DECISION', subject_id=proposal_id,
+                                        action=status, snapshot=snapshot, summary=summary, at=at)
+
+
+def _record_transition(store, row, status, actor, note, at, *, approval_id=None, version=None,
+                       replaces=None, replaced_by=None, replacing_guidance=None):
     payload = json.loads(row['payload_json'])
     history = [h for h in payload.get('history') or [] if isinstance(h, dict)]
     if row['decided_at'] and not any(h.get('at') == row['decided_at'] for h in history):
-        # A decision recorded before the history existed (0.15.2 and earlier) is kept first.
-        history = [{'from': None, 'to': row['status'], 'at': row['decided_at'], 'by': row['decided_by'],
-                    'note': (row['decision_note'] or '')[:300]}] + history
-    payload['history'] = history + [{'from': row['status'], 'to': status, 'at': at,
-                                     'by': (decided_by or '').strip()[:120] or None, 'note': note.strip()[:300]}]
+        history.insert(0, {'from': None, 'to': row['status'], 'at': row['decided_at'], 'by': row['decided_by'],
+                           'note': (row['decision_note'] or '')[:300]})
+    event = {'from': row['status'], 'to': status, 'at': at, 'by': actor, 'note': note.strip()}
+    if approval_id:
+        event.update(approval_id=approval_id, proposal_hash=version, replaces=replaces)
+    if replacing_guidance:
+        event['replaced_by_guidance'] = replacing_guidance
+    payload['history'] = history + [event]
     if status == 'SUPERSEDED':
         payload['superseded_by'] = replaced_by
-    with store.db:
+    store.db.execute('UPDATE strategy_proposals SET status=?,decided_at=?,decided_by=?,decision_note=?,payload_json=? WHERE id=?',
+                     (status, at, actor, note.strip(), json.dumps(payload, ensure_ascii=False), row['id']))
+
+
+def _retire_guidance(store, item, at, approval_id, actor, note, replacing_guidance=None):
+    payload = json.loads(store.db.execute('SELECT payload_json FROM strategy_guidance WHERE id=?', (item['id'],)).fetchone()[0])
+    event = {'action': 'RETIRED', 'at': at, 'approval_id': approval_id, 'by': actor, 'note': note}
+    if replacing_guidance:
+        event['replaced_by_guidance'] = replacing_guidance
+    payload['history'] = [h for h in payload.get('history', []) if isinstance(h, dict)] + [event]
+    store.db.execute("UPDATE strategy_guidance SET status='RETIRED',retired_at=?,payload_json=? WHERE id=? AND status='ADOPTED'",
+                     (at, json.dumps(payload, ensure_ascii=False), item['id']))
+
+
+def decide(store, proposal_id, status, *, decided_by=None, note, at=None, replaced_by=None,
+           approval_id=None, replaces=None):
+    """Consume one exact confirmation and apply the complete lifecycle action atomically."""
+    from . import approvals
+    at = normalize_time(at or now())
+    with approvals.atomic(store):
+        row = check_decision(store, proposal_id, status, note=note, replaced_by=replaced_by)
+        snapshot, summary = _decision_plan(store, row, status, note, replaces, replaced_by, at)
+        required = needs_confirmation(row, status)
+        if required or approval_id:
+            if not approval_id:
+                raise ValueError('需要用户确认回执 approval_id；填写批准人姓名不能授权')
+            receipt = approvals.check_receipt(store, approval_id, kind='PROPOSAL_DECISION', subject_id=proposal_id,
+                                              action=status, snapshot=snapshot, at=at)
+            actor = receipt['actor']
+        else:
+            # A caller cannot impersonate a named user's rejection or other decision.
+            if decided_by and decided_by.strip():
+                raise ValueError('具名用户决定须通过确认回执，不能仅填写批准人')
+            actor = None
         if status == 'SUPERSEDED':
             new = json.loads(store.db.execute('SELECT payload_json FROM strategy_proposals WHERE id=?', (replaced_by,)).fetchone()[0])
             new['supersedes'] = sorted(set(new.get('supersedes', [])) | {proposal_id})
             store.db.execute('UPDATE strategy_proposals SET payload_json=? WHERE id=?', (json.dumps(new, ensure_ascii=False), replaced_by))
-        store.db.execute('UPDATE strategy_proposals SET payload_json=? WHERE id=?', (json.dumps(payload, ensure_ascii=False), proposal_id))
+        gid = 'G-' + proposal_id
         if status == 'ADOPTED' and row['kind'] == 'RESEARCH_GUIDANCE':
-            g = validate_guidance(payload.get('guidance'))
+            g = summary['guidance']
+            for old in snapshot['rules']:
+                _retire_guidance(store, old, at, approval_id, actor, note.strip(), gid)
+                if old['proposal_id']:
+                    old_proposal = store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (old['proposal_id'],)).fetchone()
+                    _record_transition(store, old_proposal, 'RETIRED', actor, note, at, approval_id=approval_id,
+                                       version=proposal_version(old_proposal), replacing_guidance=gid)
             store.db.execute('INSERT INTO strategy_guidance VALUES(?,?,?,?,?,?,?,?,?,?)',
-                             ('G-' + proposal_id, g['route'], g['scope'], g['text'], 'ADOPTED', proposal_id, at, None,
-                              decided_by.strip()[:120], json.dumps({'note': note.strip()[:600]}, ensure_ascii=False)))
+                             (gid, g['route'], g['scope'], g['text'], 'ADOPTED', proposal_id, at, None,
+                              actor, json.dumps({'note': note.strip(), 'approval_id': approval_id,
+                                                 'proposal_hash': snapshot['proposal_hash'], 'replaces': snapshot['replaces']}, ensure_ascii=False)))
         if status == 'RETIRED':
-            store.db.execute("UPDATE strategy_guidance SET status='RETIRED',retired_at=? WHERE proposal_id=? AND status='ADOPTED'", (at, proposal_id))
-        store.db.execute('UPDATE strategy_proposals SET status=?,decided_at=?,decided_by=?,decision_note=? WHERE id=?',
-                         (status, at, (decided_by or '').strip()[:120] or None, note.strip()[:1000], proposal_id))
-    return dict(store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (proposal_id,)).fetchone())
+            for old in snapshot['rules']:
+                _retire_guidance(store, old, at, approval_id, actor, note.strip())
+        _record_transition(store, row, status, actor, note, at, approval_id=approval_id,
+                           version=snapshot['proposal_hash'], replaces=snapshot['replaces'], replaced_by=replaced_by)
+        if approval_id:
+            approvals.consume(store, approval_id, result={'id': proposal_id, 'status': status,
+                              'guidance_id': gid if status == 'ADOPTED' and row['kind'] == 'RESEARCH_GUIDANCE' else None,
+                              'retired_guidance': [g['id'] for g in snapshot['rules']] if status in ('ADOPTED', 'RETIRED') else []}, at=at)
+        result = dict(store.db.execute('SELECT * FROM strategy_proposals WHERE id=?', (proposal_id,)).fetchone())
+    return result
 
 
 def _proposal(store, row):

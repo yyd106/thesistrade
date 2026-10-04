@@ -4,7 +4,7 @@ Every setting belongs to one class:
   OPERATIONAL  schedules, collection volume, retention, evaluation cadence. No effect on what gets
                bought or sold. An agent may change these within the validated ranges and must tell the user.
   STRATEGY     anything that changes research judgments, trading rules, the model or how results are
-               measured. Requires the name of the person who approved it (the user). Keys that change
+               measured. Requires a receipt for this exact change, confirmed by an authenticated administrator. Keys that change
                judgments or rules are part of the build id (build.STRATEGY_KEYS); evaluation settings are
                not, but still need approval so the yardstick cannot move quietly.
   FORBIDDEN    capital, withdrawal rules, market scope, execution mode, hard risk caps, fees, identity and
@@ -15,7 +15,8 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from .storage import now, json_write
+from .storage import Store, now
+from . import config_journal as journal
 
 OPERATIONAL = {'collection_times', 'review_time', 'evaluation_time', 'weekly_report_time', 'weekly_report_weekday', 'digest_time',
                'research_reuse_hours', 'portfolio_refresh_minutes', 'external_news_enabled', 'external_news_articles_per_source',
@@ -53,46 +54,129 @@ def parse_value(text):
         return text
 
 
-def apply(config_path, changes, *, reason, approved_by=None, data_dir=None, setup=False):
-    """changes: {key: new_value}. Returns the change log entries. Raises before writing on any violation.
-    setup=True is used by the reports setup command alone, for the keys in SETUP."""
-    if not reason or not reason.strip():
+def _subject(path):
+    return journal.sha(str(path).encode())
+
+
+def _prepare(path, changes, reason, setup=False):
+    """Validate locally; return raw data only to the publisher, never to the approval request."""
+    if not isinstance(reason, str) or not reason.strip():
         raise ValueError('需要写明修改理由')
-    path = Path(config_path).resolve()
-    raw = json.loads(path.read_text())
+    if len(reason.strip()) > 2000:
+        raise ValueError('修改理由不能超过2000字')
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError('至少指定一项设置修改')
+    if any(not isinstance(key, str) for key in changes):
+        raise ValueError('设置键必须是字符串')
+    raw_bytes = path.read_bytes()
+    raw = json.loads(raw_bytes)
     entries = []
-    for key, value in changes.items():
-        kind = classify(key)
-        if setup and key in SETUP:
-            kind = 'SETUP'
+    for key, value in sorted(changes.items()):
+        kind = 'SETUP' if setup and key in SETUP else classify(key)
         if kind == 'FORBIDDEN':
             raise ValueError(f'{key} 不允许通过命令修改（本金、提取档位、市场范围、执行方式、硬风控与凭据类设置只能由用户本人决定）')
         if key in LIMITS:
             low, high = LIMITS[key]
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f'{key} 不允许设为 {value!r}：须为 {low}–{high} 的整数')
-        if kind == 'STRATEGY' and not (approved_by and approved_by.strip()):
-            raise ValueError(f'{key} 属于策略类设置，必须写明批准人（--approved-by，填用户本人确认的记录）')
-        entries.append({'key': key, 'class': kind, 'before': raw.get(key), 'after': value})
-        raw[key] = value
+        entries.append({'key': key, 'class': kind, 'before': raw.get(key),
+                        'before_present': key in raw, 'after': value})
     from .pipeline import load_config
     from .build import info
-    before_build = info(load_config(path))['build_id']
-    # Validate the complete result with the normal loader before replacing the live file.
-    fd, temp = tempfile.mkstemp(prefix='.config-check-', suffix='.json', dir=str(path.parent))
+    before = load_config(path, configure_model=False)
+    changed = {**raw, **changes}
+    fd, temporary = tempfile.mkstemp(prefix='.config-check-', suffix='.json', dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as handle:
-            json.dump(raw, handle, ensure_ascii=False, indent=2)
-        checked = load_config(temp)
+            json.dump(changed, handle, ensure_ascii=False, indent=2)
+        checked = load_config(temporary, configure_model=False)
     finally:
-        Path(temp).unlink(missing_ok=True)
-    after_build = info({**checked, 'data_dir': checked['data_dir']})['build_id']
-    json_write(path, raw)
-    stamp = now()
-    log = Path(data_dir or checked['data_dir']) / 'workflow' / 'changes' / 'config-changes.jsonl'
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open('a', encoding='utf-8') as handle:
-        for e in entries:
-            handle.write(json.dumps({**e, 'at': stamp, 'reason': reason.strip(), 'approved_by': (approved_by or '').strip() or None,
-                                     'build_before': before_build, 'build_after': after_build}, ensure_ascii=False) + '\n')
-    return {'changes': entries, 'build_before': before_build, 'build_after': after_build, 'log': str(log)}
+        Path(temporary).unlink(missing_ok=True)
+    before_build, after_build = info(before), info(checked)
+    # Include all editable effective settings in the state hash. Build identity alone deliberately
+    # omits e.g. evaluation settings, which nevertheless require exact approval here.
+    state = {key: before.get(key) for key in sorted(OPERATIONAL | STRATEGY | SETUP)}
+    snapshot = {'version': 'config-change-v1', 'changes': entries, 'reason': reason.strip(),
+                'before': {'build': before_build,
+                           'editable_config_hash': journal.sha(json.dumps(state, sort_keys=True, ensure_ascii=False).encode())},
+                'after_build': after_build}
+    return {'entries': entries, 'snapshot': snapshot, 'checked': checked,
+            'before_sha': journal.sha(raw_bytes), 'after_sha': journal.sha(journal.encoded(changed)),
+            'build_before': before_build['build_id'], 'build_after': after_build['build_id']}
+
+
+def _store(path, data_dir):
+    from .pipeline import load_config
+    store = Store(data_dir or load_config(path, configure_model=False)['data_dir'])
+    journal.ensure(store)
+    return store
+
+
+def request_change(config_path, changes, *, reason, data_dir=None):
+    """Freeze one exact STRATEGY change for authenticated review; does not modify configuration."""
+    from . import approvals
+    path = Path(config_path).resolve()
+    with journal.locked(path):
+        store = _store(path, data_dir)
+        try:
+            journal.recover_locked(store, path, _subject(path))
+            with approvals.atomic(store):
+                prepared = _prepare(path, changes, reason)
+                if not any(e['class'] == 'STRATEGY' for e in prepared['entries']):
+                    raise ValueError('运行类设置无需策略审批，请直接使用 config set')
+                return approvals.create_request(store, kind='CONFIG', subject_id=_subject(path), action='APPLY',
+                    snapshot=prepared['snapshot'], summary={'title': '策略设置变更',
+                        'reason': reason.strip(), 'changes': prepared['entries'],
+                        'build_before': prepared['build_before'], 'build_after': prepared['build_after']})
+        finally:
+            store.close()
+
+
+def recover(config_path, *, data_dir=None):
+    """Finish a previously authorized interrupted publication. Never approves a new operation."""
+    path = Path(config_path).resolve()
+    with journal.locked(path):
+        store = _store(path, data_dir)
+        try:
+            return journal.recover_locked(store, path, _subject(path))
+        finally:
+            store.close()
+
+
+def apply(config_path, changes, *, reason, approved_by=None, approval_id=None, data_dir=None, setup=False):
+    """Publish exact approved strategy changes, or validated operational/setup changes.
+
+    approved_by is a legacy compatibility argument and grants no permission. All writers share a lock;
+    strategy authorization and the durable publication intent are reserved in one SQLite transaction.
+    """
+    from . import approvals
+    import uuid
+    path = Path(config_path).resolve()
+    with journal.locked(path):
+        store = _store(path, data_dir)
+        try:
+            journal.recover_locked(store, path, _subject(path))
+            operation_id = 'CC-' + uuid.uuid4().hex
+            with approvals.atomic(store):
+                prepared = _prepare(path, changes, reason, setup)
+                strategy = any(e['class'] == 'STRATEGY' for e in prepared['entries'])
+                if strategy and not approval_id:
+                    raise ValueError('策略类设置需要已确认的精确审批收据（--approval-id）；批准人字符串不授予权限')
+                if approval_id and not strategy:
+                    raise ValueError('运行类设置不使用策略审批收据')
+                receipt = None
+                if strategy:
+                    receipt = approvals.check_receipt(store, approval_id, kind='CONFIG', subject_id=_subject(path),
+                                                       action='APPLY', snapshot=prepared['snapshot'])
+                    approvals.reserve(store, approval_id, operation_id)
+                payload = {k: prepared[k] for k in ('entries', 'snapshot', 'before_sha', 'after_sha', 'build_before', 'build_after')}
+                payload.update(at=now(), reason=reason.strip(), actor=receipt.get('actor') if receipt else None,
+                               approval_id=approval_id)
+                store.db.execute('''INSERT INTO config_apply_journal
+                    (id,subject_id,approval_id,status,created_at,completed_at,payload_json) VALUES(?,?,?,?,?,?,?)''',
+                    (operation_id, _subject(path), approval_id, 'APPLYING', payload['at'], None,
+                     json.dumps(payload, ensure_ascii=False, sort_keys=True)))
+            row = store.db.execute('SELECT * FROM config_apply_journal WHERE id=?', (operation_id,)).fetchone()
+            return journal.finish(store, path, row)
+        finally:
+            store.close()

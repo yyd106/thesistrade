@@ -34,7 +34,7 @@ def deliver_notices(store,config):
     back with every ledger pull."""
     from . import notices
     if role(config)!='research' or not remote_supports(store,'notices'):return None
-    new=notices.pending(store)
+    new=notices.pending(store,include_approvals=remote_supports(store,'approval_receipts_v1'))
     if not new:return None
     at=now()
     answer=request(config,'/api/sync/notices',{'notices':[notices.outgoing(n) for n in new],'known':[]})

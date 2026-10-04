@@ -1,3 +1,4 @@
+from approval_fixture import decide as confirmed_decide
 import json
 import tempfile
 import unittest
@@ -152,8 +153,8 @@ class WorkflowTests(unittest.TestCase):
                 payload={'guidance':{'route':'watchlist','scope':'ALL','text':'只有公司披露明确的经营变化时才改变结论'}},at='2026-09-15T20:07:00+08:00')
         governance.decide(self.store,pid,'READY',decided_by=None,note='整理完成',at='2026-09-15T20:07:00+08:00')
         with self.assertRaises(ValueError):governance.decide(self.store,pid,'APPROVED',decided_by='',note='代理不能自行批准',at='2026-09-15T20:07:00+08:00')
-        governance.decide(self.store,pid,'APPROVED',decided_by='Dean',note='同意试行',at='2026-09-15T20:08:00+08:00')
-        governance.decide(self.store,pid,'ADOPTED',decided_by='Dean',note='已上线',at='2026-09-15T20:09:00+08:00')
+        confirmed_decide(self.store,pid,'APPROVED',decided_by='Dean',note='同意试行',at='2026-09-15T20:08:00+08:00')
+        confirmed_decide(self.store,pid,'ADOPTED',decided_by='Dean',note='已上线',at='2026-09-15T20:09:00+08:00')
         adopted=make_snapshot(self.store,self.cfg,SYMBOL,at='2026-09-15T20:10:00+08:00')
         self.assertEqual([g['text'] for g in adopted['adopted_guidance']],['只有公司披露明确的经营变化时才改变结论'])
         self.assertEqual(model_packet(adopted,self.cfg)['已采纳研究规则'][0]['id'],'G-'+pid)
