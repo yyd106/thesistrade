@@ -9,8 +9,9 @@ from .storage import now, normalize_time, digest
 from .cloud_protocol import canonical
 from .cloud_runtime import value, put
 
-FEATURE = 'review_news_display_v1'
-VERSION = 'review-news-display-v1'
+FEATURE = 'review_news_display_v2'
+VERSION = 'review-news-display-v2'
+LEGACY_VERSION = 'review-news-display-v1'
 REVIEW_BYTES = 1_000_000
 MACRO_BYTES = 8_000_000
 EVENT_LIMIT = 60
@@ -44,7 +45,7 @@ def public_fields():
       cashflow_adjusted_change_between_marks_cents mark_times actions created_at basis source title url published_at first_seen_at
       catalyst_at lifecycle screening reactions related_reports citations revisions theme_label materiality assessment admitted
       assessed_at measurement_gap measurement_proxy measurement_basis sources state label review_due_at actionable next_step
-      observation waiting changed before_headline after_headline before_directions after_directions source_replacements
+      observation diagnostic_only waiting changed before_headline after_headline before_directions after_directions source_replacements
       source_replacement_total source_status replaced_at event_id archived_items followup_items history_items library
       window_hours assets markets news_counts article_coverage impact_learning news_screening source_coverage event_count
       observation_counts execution extracted note assessed admitted_pairs background measured_outcomes forward_samples
@@ -199,7 +200,7 @@ def collect(store, config, at=None):
 
 def receive(store, packet, at):
     required = {'version','generated_at','reviews','macro','content_hash'}
-    if not isinstance(packet, dict) or set(packet) != required or packet['version'] != VERSION:
+    if not isinstance(packet, dict) or set(packet) != required or packet['version'] not in (VERSION, LEGACY_VERSION):
         raise ValueError('复盘与新闻独立展示摘要版本或字段无效')
     stamp = normalize_time(packet['generated_at'])
     if datetime.fromisoformat(stamp) > datetime.fromisoformat(normalize_time(at)) + timedelta(minutes=5):
@@ -214,6 +215,12 @@ def receive(store, packet, at):
             raise ValueError('新闻展示列表大小无效')
     if bounded(packet['reviews'],[0])!=packet['reviews'] or bounded(macro,[0])!=macro:
         raise ValueError('展示摘要包含未授权字段或超限内容')
+    def contains_diagnostic(value):
+        if isinstance(value, dict):
+            return 'diagnostic_only' in value or any(contains_diagnostic(v) for v in value.values())
+        return isinstance(value, list) and any(contains_diagnostic(v) for v in value)
+    if packet['version'] == LEGACY_VERSION and (contains_diagnostic(packet['reviews']) or contains_diagnostic(macro)):
+        raise ValueError('页面辅助计算标记需要新版展示摘要协议')
     if packet['content_hash'] != content_hash(packet):
         raise ValueError('展示摘要内容哈希不符')
     prior = value(store, STATE)

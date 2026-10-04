@@ -1568,9 +1568,12 @@ function drawMacroEvent(box,event,assets,options={}){
     const reviewed=a.impacts.filter(i=>i.materiality?.assessment?.direction).map(i=>({asset:i.asset,direction:i.materiality.assessment.direction}));
     if(reviewed.length)card.append(el('p',(historical?'当时独立评估：':'独立评估：')+macroDirectionSummary(reviewed,assets),'subtle'));
     if(a.impacts.some(i=>i.materiality?.assessment?.direction&&i.materiality.assessment.direction!==i.direction))card.append(el('p','初步推演与独立评估存在方向分歧，请分别核对依据。','caution'));
-    const outcomes=(event.reactions||[]).filter(r=>r.observation);
+    const outcomes=(event.reactions||[]).filter(r=>r.observation),recorded=outcomes.filter(r=>!r.observation.diagnostic_only),diagnostics=outcomes.filter(r=>r.observation.diagnostic_only);
     if(outcomes.length){
-      card.append(el('p','已记录观察：'+outcomes.slice(0,3).map(r=>r.name+' '+(r.observation.change>0?'+':'')+r.observation.change+r.observation.change_unit).join('；'),'macro-library-summary'));
+      for(const [title,rows] of [['已记录观察：',recorded],['页面辅助观察：',diagnostics]]){
+        if(rows.length)card.append(el('p',title+rows.slice(0,3).map(r=>r.name+' '+(r.observation.change>0?'+':'')+r.observation.change+r.observation.change_unit).join('；'),'macro-library-summary'));
+      }
+      if(diagnostics.length)card.append(el('p','页面辅助观察仅供回看，不写入研究历史或交易决策。','subtle'));
       card.append(el('p','日级相关变化，不等于因果验证或交易收益。','subtle'));
     }else if(event.reactions?.length)card.append(el('p','观察缺口：'+event.reactions[0].waiting,'subtle'));
     if(event.revisions?.total||event.revisions?.source_replacement_total)card.append(el('p','研究修订 '+(event.revisions.total||0)+' 次 · 原文后续修订 '+(event.revisions.source_replacement_total||0)+' 条，详情可追溯。','subtle'));
@@ -1597,7 +1600,7 @@ function drawMacroEvent(box,event,assets,options={}){
   for(const report of event.related_reports||[])detail.append(link('同一事件报道：'+report.source+' · '+report.title,report.url));
   for(const cite of event.citations){detail.append(link(cite.source+' · '+cite.title,cite.url),el('blockquote',cite.quote));}
   detail.append(el('p',event.basis==='RETROSPECTIVE'?'历史补采研究：形成判断时事件已经发生，存在回看偏差。':'前向口径：从该次研究完成后观察对应指标。','subtle'));
-  for(const r of event.reactions){const o=r.observation;if(o){detail.append(el('p',r.name+' · '+o.baseline.date+' → '+o.end.date+' · '+(o.change>0?'+':'')+o.change+o.change_unit),link('查看指标来源',o.url),el('p',o.method,'subtle'));}else detail.append(el('p',r.name+'：'+r.waiting,'subtle'));}
+  for(const r of event.reactions){const o=r.observation;if(o){detail.append(el('p',(o.diagnostic_only?'页面辅助观察 · ':'')+r.name+' · '+o.baseline.date+' → '+o.end.date+' · '+(o.change>0?'+':'')+o.change+o.change_unit),link('查看指标来源',o.url),el('p',o.method,'subtle'));}else detail.append(el('p',r.name+'：'+r.waiting,'subtle'));}
   detail.append(el('p','研究更新 '+shortTime(event.created_at)+'；市场方向是条件判断，不代表已提交交易。','subtle'));body.append(detail);
   drawMacroRevisions(body,event,assets);
   if(compact)card.append(body);box.append(card);

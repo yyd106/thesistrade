@@ -182,31 +182,80 @@ class MacroRelevanceTests(unittest.TestCase):
     def market(self):
         points = [{'date': date, 'value': value} for date, value in
                   [('2026-10-02', 4), ('2026-10-04', 4.1), ('2026-10-05', 4.2), ('2026-10-06', 4.3)]]
-        payload = {'points': points, 'url': 'https://example.com/series', 'series': 'DGS10', 'raw_path': 'synthetic'}
+        payload = {'points': points, 'url': 'https://example.com/series', 'series': 'DGS10', 'raw_path': 'synthetic', 'unit':'%', 'as_of':self.at(days=5)}
         self.store.db.execute('INSERT INTO macro_markets VALUES(?,?,?,?,?)', ('US10Y', self.at(days=5), 'OK', json.dumps(payload), None))
         self.store.db.commit()
 
-    def test_more_than_600_completed_events_do_not_block_a_new_observation(self):
-        for i in range(601):
+    def research_packet(self, event, at):
+        news=dict(self.store.db.execute('SELECT * FROM dynamic_news WHERE id=?',(event['news_id'],)).fetchone())
+        news['title']='央行利率政策：合成研究输入'
+        packets=[]
+        def capture(prompt,*args):
+            packets.append(json.loads(prompt.split('<UNTRUSTED_WORLD_NEWS>',1)[1].split('</UNTRUSTED_WORLD_NEWS>',1)[0]))
+            raise RuntimeError('synthetic input capture')
+        with patch('ashare.observation.view',return_value={'items':[]}):
+            with self.assertRaisesRegex(RuntimeError,'synthetic input capture'):
+                macro.research(self.store,{},[news],at,model_fn=capture)
+        return packets[0]
+
+    def test_beyond_600_completed_events_is_display_only_and_not_research_input(self):
+        for i in range(600):
             e = self.event(str(i))
-            if i < 600:
-                self.store.db.execute('INSERT INTO macro_observations VALUES(?,?,?,?,?)', (e['id'], 'US10Y', self.at(days=4), 'FORWARD', '{"unchanged":true}'))
+            self.store.db.execute('INSERT INTO macro_observations VALUES(?,?,?,?,?)', (e['id'], 'US10Y', self.at(days=4), 'FORWARD', '{"unchanged":true}'))
+        new_event=self.event('new',self.at(hours=1))
         self.market()
         before = list(self.store.db.execute('SELECT event_id,payload_json FROM macro_observations ORDER BY event_id'))
-        self.assertEqual(macro.measure(self.store, self.at(days=6)), 1)
-        new = json.loads(self.store.db.execute("SELECT payload_json FROM macro_observations WHERE event_id='e-600'").fetchone()[0])
+        self.assertEqual(macro.measure(self.store, self.at(days=6)), 0)
+        model_before=self.research_packet(new_event,self.at(days=6))
+        dump_before=list(self.store.db.iterdump());changes=self.store.db.total_changes
+        result=macro.view(self.store,self.at(days=6))
+        event=next(e for e in result['followup_items'] if e['id']==new_event['id'])
+        new=event['reactions'][0]['observation']
         self.assertEqual(new['change'], 30)
         self.assertEqual(new['change_unit'], 'bp')
+        self.assertTrue(new['diagnostic_only'])
+        self.assertIn('未登记为研究证据',new['method'])
+        self.assertEqual(list(self.store.db.iterdump()),dump_before)
+        self.assertEqual(self.store.db.total_changes,changes)
+        self.assertEqual(self.research_packet(new_event,self.at(days=6)),model_before)
+        expired=macro.view(self.store,self.at(days=8))
+        archived=next(e for e in expired['history_items'] if e['id']==new_event['id'])
+        self.assertIn('页面辅助计算',archived['lifecycle']['next_step'])
+        self.assertNotIn('已记录',archived['lifecycle']['next_step'])
         self.assertEqual(macro.measure(self.store, self.at(days=6)), 0)
-        self.assertEqual([tuple(r) for r in before], [tuple(r) for r in self.store.db.execute("SELECT event_id,payload_json FROM macro_observations WHERE event_id!='e-600' ORDER BY event_id")])
+        self.assertEqual([tuple(r) for r in before], [tuple(r) for r in self.store.db.execute('SELECT event_id,payload_json FROM macro_observations ORDER BY event_id')])
 
-    def test_incomplete_old_events_do_not_block_new_missing_outcomes(self):
+    def test_incomplete_old_prefix_does_not_hide_readonly_page_result(self):
         for i in range(601):
             self.event('stale-' + str(i), self.at(days=-90))
         self.event('new')
         self.market()
-        self.assertEqual(macro.measure(self.store, self.at(days=6)), 1)
-        self.assertEqual(self.store.db.execute('SELECT event_id FROM macro_observations').fetchone()[0], 'e-new')
+        self.assertEqual(macro.measure(self.store, self.at(days=6)), 0)
+        changes=self.store.db.total_changes
+        result=macro.view(self.store,self.at(days=6))
+        event=next(e for e in result['followup_items'] if e['id']=='e-new')
+        self.assertTrue(event['reactions'][0]['observation']['diagnostic_only'])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM macro_observations').fetchone()[0],0)
+        self.assertEqual(self.store.db.total_changes,changes)
+
+    def test_original_production_window_registers_once_and_existing_results_win(self):
+        self.event('registered');self.market()
+        self.assertEqual(macro.measure(self.store,self.at(days=6)),1)
+        self.assertEqual(macro.measure(self.store,self.at(days=6)),0)
+        saved=json.loads(self.store.db.execute('SELECT payload_json FROM macro_observations').fetchone()[0])
+        self.assertNotIn('diagnostic_only',saved)
+        self.assertEqual(saved['change'],30)
+        result=macro.view(self.store,self.at(days=6))
+        self.assertEqual(result['followup_items'][0]['reactions'][0]['observation'],saved)
+
+    def test_page_diagnostic_requires_available_market_completed_window_and_valid_event(self):
+        self.event();self.market()
+        self.assertIsNone(macro.view(self.store,self.at(days=4))['followup_items'][0]['reactions'][0]['observation'])
+        self.store.db.execute('UPDATE macro_markets SET checked_at=?',(AT,));self.store.db.commit()
+        self.assertIsNone(macro.view(self.store,self.at(days=3))['followup_items'][0]['reactions'][0]['observation'])
+        self.assertTrue(macro.view(self.store,self.at(days=4))['followup_items'][0]['reactions'][0]['observation']['diagnostic_only'])
+        self.store.db.execute("UPDATE macro_events SET status='INVALIDATED'");self.store.db.commit()
+        self.assertIsNone(macro.view(self.store,self.at(days=4))['history_items'][0]['reactions'][0]['observation'])
 
 
 if __name__ == '__main__':

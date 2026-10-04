@@ -100,12 +100,52 @@ def observation_waiting(spec, event, at):
     return '等待事件后数据发布并形成完整观察窗口。'
 
 
+def diagnostic_observation(store, event, asset, at, markets):
+    """Compute a missing page result without registering research evidence.
+
+    Production macro.measure retains its original first-600-event scan. This
+    separate read-only calculation covers only the bounded events being shown;
+    it must never be inserted into macro_observations or sent to research.
+    """
+    from .macro_sources import ASSETS
+    spec = ASSETS.get(asset, {})
+    if not spec.get('series') or event['status'] == 'INVALIDATED':
+        return None
+    if event['created_at'] > at or event['published_at'] > at:
+        return None
+    if asset not in markets:
+        row = store.db.execute("SELECT payload_json FROM macro_markets WHERE asset=? AND status='OK' AND checked_at<=?", (asset, at)).fetchone()
+        markets[asset] = json.loads(row[0]) if row else None
+    data = markets[asset]
+    if not data:
+        return None
+    anchor = (event['created_at'] if event['basis'] == 'FORWARD' else event['published_at'])[:10]
+    before = [point for point in data['points'] if point['date'] < anchor]
+    after = [point for point in data['points'] if anchor < point['date'] < at[:10]]
+    if not before or len(after) < 3:
+        return None
+    base, end = before[-1], after[2]
+    if (datetime.fromisoformat(anchor) - datetime.fromisoformat(base['date'])).days > 7 or (datetime.fromisoformat(end['date']) - datetime.fromisoformat(anchor)).days > 14:
+        return None
+    unit = spec.get('change_unit', '%')
+    if unit == '%' and base['value'] <= 0:
+        return None
+    change = (end['value'] - base['value']) * 100 if unit == 'bp' else (end['value'] / base['value'] - 1) * 100
+    return {'baseline': base, 'end': end, 'change': round(change, 3), 'change_unit': unit,
+            'value_unit': spec['unit'], 'url': data['url'], 'series': data['series'],
+            'diagnostic_only': True,
+            'method': '页面辅助计算，未登记为研究证据；事件/研究日前最近观测至之后第3个观测日；日级指标、发布有延迟，不是交易收益或因果验证；使用获取时的数据版本。'}
+
+
 def next_step(event):
     life = event['lifecycle']
     if life['state'] == 'INVALIDATED':
         return '查看修订来源与后续研究；旧方向只供追溯。'
     if life['state'] == 'ENDED':
-        measured = sum(bool(r.get('observation')) for r in event.get('reactions', []))
+        observations = [r['observation'] for r in event.get('reactions', []) if r.get('observation')]
+        measured = sum(not o.get('diagnostic_only') for o in observations)
+        if observations and not measured:
+            return '查看页面辅助计算的市场变化及数据缺口；这些结果未登记为研究证据。'
         return ('查看已记录的市场变化及数据缺口，供后续方案比较。' if measured else
                 '保留原判断和数据缺口供回看；有新事实时按新事件研究。')
     if life['state'] == 'BACKGROUND':

@@ -205,7 +205,7 @@ class ExperimentIntegrationTests(unittest.TestCase):
         scheduler = self.scheduler()
         scheduler.stop = Event()
         scheduler.supervision_cancel = Event()
-        for name in ('supervision_pool', 'pool', 'dynamic_pool', 'global_pool', 'monitor', 'sync_pool', 'reports_pool'):
+        for name in ('supervision_pool', 'pool', 'dynamic_pool', 'global_pool', 'monitor', 'sync_pool', 'reports_pool', 'page_display_pool'):
             setattr(scheduler, name, MagicMock())
         scheduler.experiment_pool = MagicMock()
         scheduler.experiment_pool.shutdown.side_effect = lambda **kw: self.assertTrue(scheduler.experiment_cancel.is_set())

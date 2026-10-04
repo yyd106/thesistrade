@@ -23,7 +23,7 @@ from .notices import open_for_display as open_notices
 from . import auth,__version__
 
 
-def status(config, *, overview=False):
+def status(config, *, overview=False, page_diagnostics=True):
     store=Store(config['data_dir'])
     try:
         at=now()
@@ -85,7 +85,7 @@ def status(config, *, overview=False):
             'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,
             'market_phase':phase(at),'quote_max_age_seconds':config['quote_max_age_seconds'],'schedule':{'collection':config['collection_times'],'slots':config['slot_times'],'review':config['review_time'],
                                                'execution_mode':config['slot_execution_mode']},
-            'fixed_watchlist':config['watchlist'],'watchlist':plans,'observation':observation_view(store,at,config),'dynamic':dynamic_view(store,config,at),'account':a,'reviews':reviews,'followups':followup_view(store,at),
+            'fixed_watchlist':config['watchlist'],'watchlist':plans,'observation':observation_view(store,at,config),'dynamic':dynamic_view(store,config,at,page_diagnostics=page_diagnostics),'account':a,'reviews':reviews,'followups':followup_view(store,at),
             'industry':__import__('ashare.industry_presentation',fromlist=['current']).current(__import__('ashare.industry',fromlist=['view']).view(store,config,at),at),
             'supervision':supervision_view(store),
             'next_runs':next_runs(config,at),'portfolio':portfolio(store,config,a,at),

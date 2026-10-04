@@ -139,6 +139,9 @@ class Scheduler:
         self.config_path=config_path;self.stop=Event();self.pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix='ashare')
         self.futures={};self.last_settle=0;self.last_followups=0;self.last_maintenance=0;self.last_dividends=0
         self.sync_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='cloud-sync');self.sync_future=None;self.last_sync=0
+        # Page collection and HTTPS must never occupy the ledger/strategy worker.
+        self.page_display_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='page-display')
+        self.page_display_future=None;self.last_page_display=None
         self.dynamic_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='dynamic')
         self.dynamic_futures={}
         self.global_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='global-paper')
@@ -223,6 +226,7 @@ class Scheduler:
                 if self.sync_future is None and time.monotonic()-self.last_sync>=60:
                     from .cloud_sync import sync_once
                     self.sync_future=self.sync_pool.submit(sync_once,config);self.last_sync=time.monotonic()
+                self.page_display_tick(store,config)
                 with store.db:store.db.execute("UPDATE jobs SET status='MIGRATED',finished_at=? WHERE kind IN ('slot','dynamic_slot','global_slot','settle') AND status='PENDING'",(stamp,))
             elif role(config)=='cloud':
                 from .cloud_runtime import value,fence
@@ -348,6 +352,24 @@ class Scheduler:
             self.supervision_cancel=Event()
             self.supervision_future=self.supervision_pool.submit(supervision.worker,dict(config),pending['id'],self.supervision_cancel)
 
+    def page_display_tick(self,store,config):
+        """One independent, feature-gated page refresh at most every minute."""
+        from .cloud_sync import page_display_once,remote_supports
+        from .page_display import FEATURE
+        if self.page_display_future is not None and self.page_display_future.done():
+            try:self.page_display_future.result()
+            except Exception as exc:
+                from .cloud_runtime import put
+                try:
+                    with store.db:put(store,'page_display_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
+                except Exception:pass
+            self.page_display_future=None
+        if self.stop.is_set() or role(config)!='research' or not remote_supports(store,FEATURE):return
+        if self.page_display_future is not None:return
+        if self.last_page_display is not None and time.monotonic()-self.last_page_display<60:return
+        self.last_page_display=time.monotonic()
+        self.page_display_future=self.page_display_pool.submit(page_display_once,dict(config),self.stop)
+
     def experiment_tick(self,store,config,stamp,offline=None):
         """Bounded local observation work; research and supervision take priority."""
         if role(config)=='cloud':
@@ -414,3 +436,4 @@ class Scheduler:
         self.supervision_cancel.set()
         self.supervision_pool.shutdown(wait=True,cancel_futures=True)
         self.stop.set();self.pool.shutdown(wait=True,cancel_futures=True);self.dynamic_pool.shutdown(wait=True,cancel_futures=True);self.global_pool.shutdown(wait=True,cancel_futures=True);self.monitor.close();self.sync_pool.shutdown(wait=True,cancel_futures=True);self.reports_pool.shutdown(wait=True,cancel_futures=True)
+        self.page_display_pool.shutdown(wait=True,cancel_futures=True)

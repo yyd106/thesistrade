@@ -161,42 +161,27 @@ def research(store,config,news,at,model_fn=None):
 
 def measure(store,at):
  count=0
- # Select missing event/asset outcomes, not a fixed prefix of event history.
- # Completed, unsupported, and permanently incomplete older events cannot keep
- # newer measurable events out of the scan. Existing observations stay immutable.
- supported=[asset for asset,spec in ASSETS.items() if spec.get('series')]
- if not supported:return 0
- marks=','.join('?' for _ in supported)
- rows=store.db.execute("""SELECT e.id,e.created_at,e.basis,n.published_at,
-  json_extract(i.value,'$.asset') AS asset FROM macro_events e
-  JOIN dynamic_news n ON n.id=e.news_id JOIN json_each(e.payload_json,'$.impacts') i
-  WHERE e.status!='INVALIDATED' AND e.created_at<=? AND n.published_at<=? AND n.first_seen_at<=?
-  AND json_extract(i.value,'$.asset') IN ("""+marks+""")
-  AND NOT EXISTS (SELECT 1 FROM macro_observations o WHERE o.event_id=e.id AND o.asset=json_extract(i.value,'$.asset'))
-  ORDER BY e.created_at,e.id,asset""",(at,at,at,*supported)).fetchall()
- markets={}
- for row in rows:
-  e=dict(row);anchor=(e['created_at'] if e['basis']=='FORWARD' else e['published_at'])[:10]
-  asset=e['asset'];spec=ASSETS[asset]
-  if asset not in markets:
+ for row in store.db.execute("SELECT e.*,n.published_at FROM macro_events e JOIN dynamic_news n ON n.id=e.news_id WHERE e.status!='INVALIDATED' ORDER BY e.created_at LIMIT 600").fetchall():
+  e=dict(row);payload=json.loads(e['payload_json']);anchor=(e['created_at'] if e['basis']=='FORWARD' else e['published_at'])[:10]
+  for impact in payload['impacts']:
+   asset=impact['asset'];spec=ASSETS.get(asset,{})
+   if not spec.get('series') or store.db.execute('SELECT 1 FROM macro_observations WHERE event_id=? AND asset=?',(e['id'],asset)).fetchone():continue
    r=store.db.execute("SELECT * FROM macro_markets WHERE asset=? AND status='OK' AND checked_at<=?",(asset,at)).fetchone()
-   markets[asset]=json.loads(r['payload_json']) if r else None
-  p=markets[asset]
-  if not p:continue
-  before=[x for x in p['points'] if x['date']<anchor];after=[x for x in p['points'] if anchor<x['date']<at[:10]]
-  if not before or len(after)<3:continue
-  base,end=before[-1],after[2]
-  if (datetime.fromisoformat(anchor)-datetime.fromisoformat(base['date'])).days>7 or (datetime.fromisoformat(end['date'])-datetime.fromisoformat(anchor)).days>14:continue
-  unit=spec.get('change_unit','%')
-  if unit=='%' and base['value']<=0:continue
-  change=(end['value']-base['value'])*100 if unit=='bp' else (end['value']/base['value']-1)*100
-  observation={'baseline':base,'end':end,'change':round(change,3),'change_unit':unit,'value_unit':spec['unit'],'url':p['url'],'series':p['series'],'raw_path':p['raw_path'],
-   'method':'事件/研究日前最近观测至之后第3个观测日；日级指标、发布有延迟，不是交易收益或因果验证；使用获取时的数据版本'}
-  with store.db:written=store.db.execute('INSERT OR IGNORE INTO macro_observations VALUES(?,?,?,?,?)',(e['id'],asset,at,e['basis'],encode(observation))).rowcount
-  count+=written
+   if not r:continue
+   p=json.loads(r['payload_json']);before=[x for x in p['points'] if x['date']<anchor];after=[x for x in p['points'] if anchor<x['date']<at[:10]]
+   if not before or len(after)<3:continue
+   base,end=before[-1],after[2]
+   if (datetime.fromisoformat(anchor)-datetime.fromisoformat(base['date'])).days>7 or (datetime.fromisoformat(end['date'])-datetime.fromisoformat(anchor)).days>14:continue
+   unit=spec.get('change_unit','%')
+   if unit=='%' and base['value']<=0:continue
+   change=(end['value']-base['value'])*100 if unit=='bp' else (end['value']/base['value']-1)*100
+   observation={'baseline':base,'end':end,'change':round(change,3),'change_unit':unit,'value_unit':spec['unit'],'url':p['url'],'series':p['series'],'raw_path':p['raw_path'],
+    'method':'事件/研究日前最近观测至之后第3个观测日；日级指标、发布有延迟，不是交易收益或因果验证；使用获取时的数据版本'}
+   with store.db:store.db.execute('INSERT OR IGNORE INTO macro_observations VALUES(?,?,?,?,?)',(e['id'],asset,at,e['basis'],encode(observation)))
+   count+=1
  return count
 
-def view(store,at,config=None):
+def view(store,at,config=None,*,page_diagnostics=True):
  at=normalize_time(at)
  from .observation import registry
  assets=registry(store)
@@ -206,9 +191,9 @@ def view(store,at,config=None):
  assessments=context(store,at)
  screened={r['news_id']:json.loads(r['payload_json']) for r in store.db.execute('SELECT news_id,payload_json FROM macro_news_triage WHERE version=? AND created_at<=?',(TRIAGE_VERSION,at))}
  start=normalize_time((datetime.fromisoformat(at)-timedelta(hours=48)).isoformat())
- from .macro_presentation import select_rows,observation_waiting,next_step,revisions
+ from .macro_presentation import select_rows,observation_waiting,diagnostic_observation,next_step,revisions
  selection=select_rows(store,at,start,config,assessments,screened)
- enriched={}
+ enriched={};diagnostic_markets={}
  # Full analysis is loaded only for the current 48-hour window and the bounded
  # library slices. Counts and lifecycle routing use lightweight event metadata.
  for row in [*selection['items'],*selection['archived_items'],*selection['followup_items'],*selection['history_items']]:
@@ -219,7 +204,8 @@ def view(store,at,config=None):
   for impact in e['analysis']['impacts']:
    impact['materiality']=assessments.get((e['id'],impact['asset']))
    asset=impact['asset'];spec=assets.get(asset,{'name':asset});r=store.db.execute('SELECT payload_json FROM macro_observations WHERE event_id=? AND asset=? AND ready_at<=?',(e['id'],asset,at)).fetchone()
-   reactions.append({'asset':asset,'name':spec['name'],'observation':json.loads(r[0]) if r else None,
+   observation=json.loads(r[0]) if r else diagnostic_observation(store,e,asset,at,diagnostic_markets) if page_diagnostics else None
+   reactions.append({'asset':asset,'name':spec['name'],'observation':observation,
     'waiting':observation_waiting(spec,e,at)})
   e['reactions']=reactions
   e['related_reports']=[dict(r) for r in store.db.execute('SELECT n.title,n.source,n.url,n.published_at FROM macro_news_queue q JOIN dynamic_news n ON n.id=q.news_id WHERE q.representative_id=? AND q.news_id!=? AND n.status!=? AND n.published_at<=? AND n.first_seen_at<=? ORDER BY n.published_at DESC LIMIT 10',(e['news_id'],e['news_id'],'REVISED',at,at))]

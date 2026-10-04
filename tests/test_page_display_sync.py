@@ -75,6 +75,7 @@ class PageDisplaySyncTests(unittest.TestCase):
         self.assertEqual(facts['daily_accounting']['totals']['period_profit_cents'],-450)
         self.assertEqual(packet['macro']['library']['followup_total'],1)
         self.assertIn('review_news_display_v1',ledger.FEATURES)
+        self.assertIn(pages.FEATURE,ledger.FEATURES)
 
     def test_independent_send_updates_cloud_without_research_or_ledger_changes(self):
         before=self.snapshot(self.cloud);lease=runtime.lease(self.cloud,self.cloud_cfg,AT);version=ledger.version(self.cloud)
@@ -121,13 +122,27 @@ class PageDisplaySyncTests(unittest.TestCase):
         self.assertEqual(runtime.value(self.cloud,pages.STATE)['content_hash'],first['page_display']['content_hash'])
 
     def test_old_cloud_gate_and_unrecognized_ack_never_mark_delivery(self):
-        with self.store.db:runtime.put(self.store,'remote_features',['supervision_summary'])
+        with self.store.db:runtime.put(self.store,'remote_features',['supervision_summary','review_news_display_v1'])
         with patch('ashare.cloud_sync.request',side_effect=AssertionError('old cloud')):
             self.assertIsNone(sync.deliver_page_display(self.store,self.cfg))
         with self.store.db:runtime.put(self.store,'remote_features',[pages.FEATURE])
         with patch('ashare.cloud_sync.request',return_value={'status':'ACCEPTED'}):
             with self.assertRaisesRegex(ValueError,'未确认'):sync.deliver_page_display(self.store,self.cfg)
         self.assertIsNone(runtime.value(self.store,'page_display_sent_hash'))
+
+    def test_new_cloud_accepts_legacy_display_but_diagnostics_require_v2(self):
+        legacy=self.packet();legacy['version']='review-news-display-v1'
+        with self.cloud.db:result=pages.receive(self.cloud,legacy,AT)
+        self.assertEqual(result['page_display']['status'],'UPDATED')
+        self.assertEqual(runtime.value(self.cloud,pages.STATE)['version'],'review-news-display-v1')
+        diagnostic=self.packet(LATER)
+        diagnostic['macro']['items'][0]['reactions'][0]['observation']={'diagnostic_only':True,'change':30,'method':'页面辅助计算，未登记为研究证据'}
+        diagnostic['content_hash']=pages.content_hash(diagnostic)
+        outdated=copy.deepcopy(diagnostic);outdated['version']='review-news-display-v1'
+        with self.assertRaisesRegex(ValueError,'新版展示摘要协议'),self.cloud.db:pages.receive(self.cloud,outdated,LATER)
+        with self.cloud.db:result=pages.receive(self.cloud,diagnostic,LATER)
+        self.assertEqual(result['page_display']['status'],'UPDATED')
+        self.assertTrue(runtime.value(self.cloud,pages.STATE)['macro']['items'][0]['reactions'][0]['observation']['diagnostic_only'])
 
     def test_mixed_strategy_or_oversize_content_is_rejected_before_any_mutation(self):
         packet=self.packet();before=self.snapshot(self.cloud)
@@ -150,13 +165,17 @@ class PageDisplaySyncTests(unittest.TestCase):
         self.assertEqual(shown['reviews'][0]['id'],'new-review')
 
     def test_periodic_sync_isolates_display_failure_from_accounting(self):
-        # The existing minute loop must call the new channel even with no strategy
-        # publication, and record its failure separately from successful ledger sync.
+        # The ledger worker never calls the display transport. Its separate
+        # worker records failures without altering a successful ledger sync.
         with patch('ashare.cloud_sync.pull',return_value={'ledger_version':'same'}),patch('ashare.cloud_sync.flush',return_value=None),\
              patch('ashare.cloud_sync.deliver_notices'),patch('ashare.cloud_sync.deliver_supervision'),\
              patch('ashare.cloud_sync.deliver_page_display',side_effect=ValueError('synthetic display failure')) as delivery:
             result=sync.sync_once(self.cfg)
-        self.assertEqual(result['status'],'SYNCED');delivery.assert_called_once()
+            delivery.assert_not_called()
+            displayed=sync.page_display_once(self.cfg)
+            delivery.assert_called_once()
+        self.assertEqual(result['status'],'SYNCED')
+        self.assertEqual(displayed['status'],'FAILED')
         self.assertEqual(runtime.value(self.store,'last_sync')['status'],'OK')
         self.assertEqual(runtime.value(self.store,'page_display_sync')['status'],'FAILED')
         self.assertIsNone(runtime.value(self.store,'research_completed_at'))

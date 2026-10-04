@@ -321,7 +321,7 @@ def cycle(store,config,end=None,model_fn=None,collect_fn=None,impact_model_fn=No
   with store.db:store.db.execute('UPDATE dynamic_runs SET finished_at=?,status=?,payload_json=? WHERE id=?',(now(),'FAILED',encode({'failures':[str(exc)[:300]]}),rid))
   raise
 
-def view(store,config,at):
+def view(store,config,at,*,page_diagnostics=True):
  from .dynamic_paper import case_position,balance
  from .macro import view as global_view
  latest=store.db.execute('SELECT * FROM dynamic_runs ORDER BY started_at DESC LIMIT 1').fetchone()
@@ -341,7 +341,7 @@ def view(store,config,at):
  counts=dict(store.db.execute('SELECT status,count(*) FROM dynamic_news GROUP BY status'))
  total=store.db.execute('SELECT count(*),coalesce(sum(fee_cents),0),coalesce(sum(realized_cents),0) FROM dynamic_fills').fetchone()
  next_at=normalize_time((datetime.fromisoformat(window(at)[1])+timedelta(minutes=30)).isoformat()) if config.get('dynamic_enabled') and config['scheduler_enabled'] else None
- return {'enabled':config.get('dynamic_enabled',False),'global':global_view(store,at,config),'last_run':current,'last_finished_at':store.db.execute('SELECT max(finished_at) FROM dynamic_runs').fetchone()[0],'next_at':next_at,'items':items,'news_counts':counts,
+ return {'enabled':config.get('dynamic_enabled',False),'global':global_view(store,at,config,page_diagnostics=page_diagnostics),'last_run':current,'last_finished_at':store.db.execute('SELECT max(finished_at) FROM dynamic_runs').fetchone()[0],'next_at':next_at,'items':items,'news_counts':counts,
   'case_count':store.db.execute('SELECT count(*) FROM dynamic_cases').fetchone()[0],
   'observation_counts':dict(store.db.execute('SELECT basis,count(*) FROM dynamic_observations GROUP BY basis')),
   'balance':balance(store,at),'fill_count':total[0],'fees_cents':total[1],'realized_cents':total[2],

@@ -71,7 +71,9 @@ def source_records(store,decisions):
 
 def display_packet(config):
     from .dashboard import status
-    s=status(config,overview=False)
+    # Traditional strategy publications must not compute or transport the new
+    # page-only observations, including when the peer only understands v1.
+    s=status(config,overview=False,page_diagnostics=False)
     # UI summaries only; account, credentials, jobs, raw documents and model files are excluded.
     keep=('fixed_watchlist','watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds','supervision','industry')
     result={k:s[k] for k in keep};previews={}
@@ -356,11 +358,6 @@ def sync_once(config):
                 deliver_supervision(store,config)
             except Exception as exc:
                 with store.db:put(store,'supervision_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
-            try:
-                deliver_page_display(store,config)
-            except Exception as exc:
-                # A stale page must never stop accounting or renew strategy authority.
-                with store.db:put(store,'page_display_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
             return answer or {'status':'SYNCED'}
     except Exception as exc:
         if str(exc).startswith('BUSY:'):return {'status':'BUSY'}
@@ -385,13 +382,50 @@ def deliver_supervision(store,config):
     return answer
 
 
-def deliver_page_display(store,config):
+def page_display_once(config,cancel_event=None):
+    """Separate connection and lock: a slow page cannot hold strategy sync work."""
+    from .storage import Store
+    from .workflow import task_lock
+    from .page_display import FEATURE
+    if role(config)!='research' or (cancel_event is not None and cancel_event.is_set()):
+        return {'status':'SKIPPED'}
+    store=None
+    try:
+        store=Store(config['data_dir'])
+        if not remote_supports(store,FEATURE):return {'status':'UNSUPPORTED'}
+        with task_lock(store.root,'page-display'):
+            if cancel_event is not None and cancel_event.is_set():return {'status':'CANCELLED'}
+            result=deliver_page_display(store,config,cancel_event=cancel_event)
+            if result is None and cancel_event is not None and cancel_event.is_set():return {'status':'CANCELLED'}
+            return result or {'status':'UNCHANGED'}
+    except Exception as exc:
+        if str(exc).startswith('BUSY:'):return {'status':'BUSY'}
+        failure={'at':now(),'status':'FAILED','error':str(exc)[:300]}
+        if store is not None:
+            try:
+                if store.db.in_transaction:store.db.rollback()
+                with store.db:put(store,'page_display_sync',failure)
+            except Exception:
+                # Even a diagnostic-state write failure must remain in this
+                # worker; it cannot change last_sync or fail the ledger worker.
+                pass
+        return failure
+    finally:
+        if store is not None:store.close()
+
+
+def deliver_page_display(store,config,*,cancel_event=None):
     """Publish only bounded review/news presentation, independently of research."""
     from .page_display import FEATURE, collect
     if role(config)!='research' or not remote_supports(store,FEATURE):return None
+    # A newer strategy display can temporarily replace the independent page.
+    # Capture its publication before collection: a concurrent upload must still
+    # make the next page refresh resend, even when its semantic hash is unchanged.
+    upload_stamp=(value(store,'last_upload') or {}).get('bundle_id')
     packet=collect(store,config)
+    if cancel_event is not None and cancel_event.is_set():return None
     fingerprint=packet['content_hash']
-    if value(store,'page_display_sent_hash')==fingerprint:return None
+    if value(store,'page_display_sent_hash')==fingerprint and value(store,'page_display_sent_upload')==upload_stamp:return None
     answer=request(config,'/api/sync/reviews',{'page_display':packet})
     receipt=answer.get('page_display') or {}
     if answer.get('status')!='ACCEPTED' or receipt.get('status') not in ('UPDATED','UNCHANGED','IGNORED_STALE'):
@@ -403,6 +437,7 @@ def deliver_page_display(store,config):
         raise ValueError('云端展示摘要回执与本次发送不一致')
     with store.db:
         put(store,'page_display_sent_hash',fingerprint)
+        put(store,'page_display_sent_upload',upload_stamp)
         put(store,'page_display_sync',{'at':now(),'status':'OK','generated_at':packet['generated_at'],
             'content_hash':fingerprint,'review_bytes':len(canonical(packet['reviews'])),'news_bytes':len(canonical(packet['macro']))})
     return answer

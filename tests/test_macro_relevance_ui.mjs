@@ -63,6 +63,13 @@ drawMacro(measured,measuredEvent,assets,{compact:true,historical:true});
 assert.match(visibleText(measured),/已记录观察：美国10年期国债收益率 \+30bp/);
 assert.match(visibleText(measured),/不等于因果验证或交易收益/);
 
+const auxiliary=new Element('div'),auxiliaryEvent=structuredClone(measuredEvent);
+auxiliaryEvent.reactions[0].observation.diagnostic_only=true;
+drawMacro(auxiliary,auxiliaryEvent,assets,{compact:true,historical:true});
+assert.match(visibleText(auxiliary),/页面辅助观察：美国10年期国债收益率 \+30bp/);
+assert.match(visibleText(auxiliary),/不写入研究历史或交易决策/);
+assert.doesNotMatch(visibleText(auxiliary),/已记录观察：/);
+
 const historical=new Element('div');
 drawMacro(historical,macroEventFixture('invalid',{invalid:true}),assets,{compact:true,historical:true});
 assert.match(visibleText(historical),/原判断已失效/);
