@@ -60,6 +60,8 @@ def status(store,config):
     cache['supervision']=value(store,'display_supervision',cache.get('supervision',{'items':[]}))
     from .page_display import apply as apply_page_display
     apply_page_display(store,cache)
+    from .review_presentation import refresh_accounting
+    refresh_accounting(store, cache['reviews'])
     result={**cache,'version':__version__,'at':at,'mode':'paper','live_execution':False,'model_auth':'LOCAL_RESEARCH','deployment_role':'cloud',
       'research_lease':lease(store,config,at),'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,'market_phase':phase(at),
       'account':a,'portfolio':portfolio(store,config,a,at),'trade_effects':trade_effects(store,config,at),'portfolio_strategy':view(store,config,at),

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from ashare import governance, proposal_presentation, supervision
 from ashare.dashboard import status
-from ashare.review_presentation import projection
+from ashare.review_presentation import projection, refresh_accounting
 from ashare.storage import Store
 from test_config import load_config
 
@@ -93,6 +93,125 @@ class ReviewPresentationTests(unittest.TestCase):
         self.assertEqual(compact['payload']['facts']['daily_accounting']['dividend_cents'], 175)
         self.assertEqual(compact['history'], {'total': 1, 'shown': 1, 'omitted': 0})
         self.assertNotIn('daily_portfolio', compact['payload']['facts'])
+
+    def flow(self, identity, kind, amount, at, account='DEMO_PAPER'):
+        with self.store.db:
+            self.store.db.execute('INSERT OR IGNORE INTO paper_accounts VALUES(?,?,?,1,0)', (account, 10000000, 10000000))
+            self.store.db.execute('INSERT INTO paper_flows VALUES(?,?,?,?,?,?)',
+                                 (identity, account, kind, amount, identity, at))
+
+    def test_zero_period_dividend_does_not_erase_lifetime_account_profit(self):
+        row, payload = insert_review_fixture(self.store)
+        self.flow('initial', 'SIMULATED_INITIAL', 10000000, OLD)
+        self.flow('prior-dividend', 'CASH_DIVIDEND', 25100, '2026-09-30T10:00:00+00:00')
+        # Credits at the exclusive cutoff and those from another account do not count.
+        self.flow('future-dividend', 'CASH_DIVIDEND', 12300, row['window_end'])
+        self.flow('other-dividend', 'CASH_DIVIDEND', 45600, OLD, 'OTHER_ACCOUNT')
+        daily = payload['facts']['daily_portfolio']
+        daily['totals']['cumulative_profit_cents'] = 7921
+        daily['closing'].update(cumulative_realized_cents=-26179, unrealized_cents=34100, equity_cents=10033021)
+        before = copy.deepcopy(payload)
+        changes = self.store.db.total_changes
+        display = projection(self.store, row, payload, AT)['daily']
+        self.assertEqual(display['period_dividend_cents'], 0)
+        self.assertEqual(display['dividend_cents'], 0)
+        self.assertEqual(display['cumulative_dividend_cents'], 25100)
+        self.assertEqual(display['cumulative_dividend_count'], 1)
+        self.assertEqual(display['account_cumulative_profit_cents'], 33021)
+        self.assertEqual(display['reconciliation_difference_cents'], 0)
+        self.assertEqual(display['accounting_basis'], 'FROZEN_EQUITY_WITH_LEDGER_FLOWS')
+        self.assertEqual(payload, before)
+        self.assertEqual(self.store.db.total_changes, changes)
+
+    def test_withdrawal_is_not_a_loss_and_unexplained_cash_remains_visible(self):
+        row, payload = insert_review_fixture(self.store)
+        self.flow('initial', 'SIMULATED_INITIAL', 10000000, OLD)
+        self.flow('withdrawal', 'SIMULATED_WITHDRAWAL', -50000, '2026-10-01T10:00:00+00:00')
+        daily = payload['facts']['daily_portfolio']
+        daily['closing']['equity_cents'] = 9950800
+        view = projection(self.store, row, payload, AT)['daily']
+        self.assertEqual(view['account_cumulative_profit_cents'], 800)
+        self.assertEqual(view['reconciliation_difference_cents'], 0)
+        # A separate cash discrepancy must not be attributed to dividends.
+        daily['closing']['equity_cents'] += 400
+        view = projection(self.store, row, payload, AT)['daily']
+        self.assertEqual(view['cumulative_dividend_cents'], 0)
+        self.assertEqual(view['reconciliation_difference_cents'], 400)
+
+    def test_missing_flow_history_does_not_invent_zero_cumulative_dividends(self):
+        row, payload = insert_review_fixture(self.store)
+        view = projection(self.store, row, payload, AT)['daily']
+        self.assertEqual(view['dividend_cents'], 175)
+        self.assertIsNone(view['cumulative_dividend_cents'])
+        self.assertIsNone(view['account_cumulative_profit_cents'])
+        self.assertEqual(view['accounting_basis'], 'FLOW_HISTORY_UNAVAILABLE')
+
+    def test_quote_provenance_matches_frozen_time_price_and_receipt(self):
+        row, payload = insert_review_fixture(self.store)
+        quote_at = '2026-09-30T08:14:58+00:00'
+        receipt = '2026-09-30T10:00:44+00:00'
+        position = payload['facts']['daily_portfolio']['positions'][0]
+        position['origin'] = 'watchlist'
+        position['closing'].update(quote_at=quote_at, quote_first_seen_at=receipt)
+        with self.store.db:
+            self.store.db.execute('INSERT INTO quotes VALUES(?,?,?,?,?,?,?,?,?)',
+                ('q-frozen', position['symbol'], '合成公司', 1005, 1000, quote_at, receipt,
+                 'tencent_public_research', 'PRIVATE_QUOTE_PATH'))
+            self.store.db.execute('INSERT INTO quotes VALUES(?,?,?,?,?,?,?,?,?)',
+                ('q-other-price', position['symbol'], '合成公司', 1006, 1000, quote_at, receipt,
+                 'wrong-provider', 'PRIVATE_QUOTE_PATH'))
+            self.store.db.execute('INSERT INTO quotes VALUES(?,?,?,?,?,?,?,?,?)',
+                ('q-later-receipt', position['symbol'], '合成公司', 1005, 1000, quote_at,
+                 '2026-09-30T10:01:00+00:00', 'different-provider', 'PRIVATE_QUOTE_PATH'))
+        changes = self.store.db.total_changes
+        before = copy.deepcopy(payload)
+        view = projection(self.store, row, payload, AT)['daily']
+        provenance = view['quote_provenance'][0]['closing']
+        self.assertEqual(provenance['quote_source'], 'tencent_public_research')
+        self.assertEqual(provenance['quote_at'], quote_at)
+        self.assertEqual(provenance['quote_first_seen_at'], receipt)
+        self.assertEqual(provenance['quote_time_kind'], 'PROVIDER_QUOTE_TIME')
+        self.assertIn('不能据此认定发生盘后成交', provenance['quote_time_notice'])
+        self.assertNotIn('PRIVATE_QUOTE_PATH', json.dumps(view))
+        self.assertEqual(payload, before)
+        self.assertEqual(self.store.db.total_changes, changes)
+
+    def test_cloud_supplement_preserves_frozen_values_and_signed_source(self):
+        row, payload = insert_review_fixture(self.store)
+        self.flow('initial', 'SIMULATED_INITIAL', 10000000, OLD)
+        self.flow('prior-dividend', 'CASH_DIVIDEND', 25100, '2026-09-30T10:00:00+00:00')
+        display = projection(self.store, row, payload, AT)
+        remote_quote = display['daily']['quote_provenance'][0]['closing']
+        remote_quote.update(quote_source='tencent_public_research', quote_source_label='腾讯公开行情',
+                            provenance_status='MATCHED', quote_time_kind='PROVIDER_QUOTE_TIME')
+        # Cloud does not necessarily retain the research node's post-close quote.
+        packet = [{**row, 'payload': {'facts': {'portfolio': payload['facts']['portfolio']}},
+                   'presentation': display}]
+        original_totals = copy.deepcopy(display['daily']['totals'])
+        changes = self.store.db.total_changes
+        refresh_accounting(self.store, packet)
+        projected = packet[0]['presentation']['daily']
+        self.assertEqual(projected['totals'], original_totals)
+        self.assertEqual(projected['period_dividend_cents'], 0)
+        self.assertEqual(projected['cumulative_dividend_cents'], 25100)
+        self.assertEqual(projected['quote_provenance'][0]['closing'], remote_quote)
+        self.assertEqual(self.store.db.total_changes, changes)
+
+    def test_cloud_missing_flow_history_keeps_signed_reconciliation(self):
+        row, payload = insert_review_fixture(self.store)
+        display = projection(self.store, row, payload, AT)
+        display['daily'].update(cumulative_dividend_cents=25100, cumulative_dividend_count=1,
+                                account_cumulative_profit_cents=26300, reconciliation_difference_cents=400)
+        remote = display['daily']['quote_provenance'][0]['closing']
+        remote.update(quote_source='tencent_public_research', quote_source_label='腾讯公开行情', provenance_status='MATCHED')
+        packet = [{**row, 'payload': {'facts': {'portfolio': payload['facts']['portfolio']}}, 'presentation': display}]
+        refresh_accounting(self.store, packet)
+        projected = packet[0]['presentation']['daily']
+        self.assertEqual(projected['cumulative_dividend_cents'], 25100)
+        self.assertEqual(projected['account_cumulative_profit_cents'], 26300)
+        self.assertEqual(projected['reconciliation_difference_cents'], 400)
+        self.assertEqual(projected['quote_provenance'][0]['closing'], remote)
+        self.assertEqual(projected['accounting_basis'], 'FROZEN_DISPLAY')
 
     def test_resolved_and_superseded_findings_leave_current_without_record_edits(self):
         row, payload = insert_review_fixture(self.store)

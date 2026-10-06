@@ -41,6 +41,9 @@ def public_fields():
       quality late_quote quote_first_seen_at cash_cents equity_cents valuation_complete key period_realized_cents
       period_profit_cents cumulative_profit_cents period_fee_cents period_fill_count entry_research_ids research_ids research_gap
       fill_ids holding_count reviewed_position_count dividend_cents dividend_count dividends_known plan thesis decision trigger
+      period_dividend_cents cumulative_dividend_cents cumulative_dividend_count account_cumulative_profit_cents
+      reconciliation_difference_cents accounting_basis accounting_notice quote_provenance quote_source quote_source_label
+      quote_time_kind quote_time_notice provenance_status
       position_key verdict reason supported_points contradicted_points pending_points next_check validation_warnings
       decision_count recording_policy recording_notice blocked_count fill_count fee_cents realized_pnl_cents win_rate
       cashflow_adjusted_change_between_marks_cents mark_times actions created_at basis source title url published_at first_seen_at

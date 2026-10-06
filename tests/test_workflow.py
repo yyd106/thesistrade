@@ -294,6 +294,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(p['holdings'][0]['sellable_qty'],0)
         self.assertEqual(p['holdings'][0]['average_cost_cents'],1002.5)
         self.assertEqual(p['holdings'][0]['unrealized_return_pct'],4.74)
+        self.assertEqual(p['holdings'][0]['quote_source'],'SYNTHETIC_FIXTURE')
+        self.assertEqual(p['holdings'][0]['quote_first_seen_at'],normalize_time(at))
+        self.assertEqual(p['cumulative_realized_cents'],0)
+        self.assertEqual(p['cumulative_dividend_cents'],0)
         self.assertEqual(p['unrealized_cents'],9500)
         self.assertAlmostEqual(p['cash_weight_pct']+p['stock_weight_pct'],100,places=2)
         # A missing quote is unknown P&L, never a fictitious zero return.
@@ -303,7 +307,38 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(missing['holdings'][0]['valuation_basis'],'COST_FALLBACK')
             self.assertEqual(missing['holdings'][0]['average_cost_cents'],1002.5)
             self.assertIsNone(missing['holdings'][0]['unrealized_return_pct'])
+            self.assertIsNone(missing['holdings'][0]['quote_source'])
+            self.assertIsNone(missing['holdings'][0]['quote_first_seen_at'])
             self.assertIsNone(trade_effects(self.store,self.cfg,at)['buy']['unrealized_cents'])
+
+    def test_dashboard_cumulative_components_include_closed_routes_and_prior_dividends(self):
+        import sqlite3
+        from types import SimpleNamespace
+        from ashare.reporting import portfolio
+        # Minimal isolated accounting fixture: no open positions, but every route
+        # has historical realized P&L. No execution engine or model is involved.
+        db=sqlite3.connect(':memory:')
+        self.addCleanup(db.close)
+        db.execute('CREATE TABLE paper_flows(account_id TEXT,kind TEXT,amount_cents INT,created_at TEXT)')
+        at=normalize_time(self.at);prior=normalize_time('2026-09-14T10:00:00+08:00');future=normalize_time('2026-09-16T10:00:00+08:00')
+        for table,profit in (('paper_fills',1000),('dynamic_fills',-200),('global_fills',300)):
+            db.execute('CREATE TABLE '+table+'(realized_cents INT,occurred_at TEXT)')
+            db.executemany('INSERT INTO '+table+' VALUES(?,?)',[(profit,prior),(9999,future)])
+        db.executemany('INSERT INTO paper_flows VALUES(?,?,?,?)',[
+            ('DEMO_PAPER','SIMULATED_INITIAL',10000000,prior),
+            ('DEMO_PAPER','CASH_DIVIDEND',25100,prior),
+            ('DEMO_PAPER','CASH_DIVIDEND',54321,future),
+            ('OTHER_ACCOUNT','CASH_DIVIDEND',45600,prior)])
+        account_view={'positions':{},'cash_cents':10026200,'equity_cents':10026200,
+                      'market_value_cents':0,'initial_cents':10000000,'withdrawn_cents':0}
+        changes=db.total_changes
+        result=portfolio(SimpleNamespace(db=db),self.cfg,account_view,at)
+        self.assertEqual(result['holdings'],[])
+        self.assertEqual(result['cumulative_realized_cents'],1100)
+        self.assertEqual(result['cumulative_dividend_cents'],25100)
+        self.assertEqual(result['total_profit_cents'],26200)
+        self.assertEqual(result['unrealized_cents'],0)
+        self.assertEqual(db.total_changes,changes)
 
     def test_cost_display_uses_remaining_lots_and_keeps_dynamic_basis_separate(self):
         from ashare.reporting import portfolio

@@ -335,8 +335,8 @@ function renderFailures(card,item) {
 }
 function renderAccount(s) {
   const a=s.account,p=s.portfolio;
-  renderChanged('metrics',[a.equity_cents,a.available_cents,p.total_profit_cents,p.stock_weight_pct,a.valuation_complete],box=>{
-    [[a.valuation_complete?'总资产（元）':'总资产估值（元）',money(a.equity_cents)],['可用现金（元）',money(a.available_cents)],['累计盈亏（含已提取）',signed(p.total_profit_cents)],['持仓比例',percent(p.stock_weight_pct)]].forEach(([title,value],i)=>{const d=el('div',null,'metric');d.append(el('span',title),el('strong',value));if(i===2)d.append(el('span','涨跌相抵，已计交易费用','metric-note'));box.append(d);});
+  renderChanged('metrics',[a.equity_cents,a.available_cents,p.total_profit_cents,p.stock_weight_pct,a.valuation_complete,p.cumulative_dividend_cents],box=>{
+    [[a.valuation_complete?'总资产（元）':'总资产估值（元）',money(a.equity_cents)],['可用现金（元）',money(a.available_cents)],['累计盈亏（含已提取）',signed(p.total_profit_cents)],['持仓比例',percent(p.stock_weight_pct)]].forEach(([title,value],i)=>{const d=el('div',null,'metric');d.append(el('span',title),el('strong',value));if(i===2)d.append(el('span','已计交易费用'+(Number.isFinite(p.cumulative_dividend_cents)?'，含累计现金分红 '+money(p.cumulative_dividend_cents)+' 元':'，包含已入账现金分红'),'metric-note'));box.append(d);});
   });
   $('position-count').textContent=p.holdings.length?p.holdings.length+' 只股票':'当前空仓';
   renderChanged('allocation',[p.holdings,p.cash_weight_pct],box=>{
@@ -344,7 +344,7 @@ function renderAccount(s) {
     [{name:'现金',weight:p.cash_weight_pct},...p.holdings.map(h=>({name:h.name,weight:h.weight_pct}))].forEach((v,i)=>{const part=el('span'),entry=el('span'),dot=el('i');part.style.width=Math.max(0,Math.min(100,v.weight||0))+'%';part.style.background=colors[i%colors.length];part.title=v.name+' '+percent(v.weight);dot.style.background=colors[i%colors.length];bar.append(part);entry.append(dot,document.createTextNode(v.name+' '+percent(v.weight)));legend.append(entry);});box.append(bar,legend);
   });
   table('holdings',['资产','市值 / 占比','浮动盈亏'],[['现金',money(a.cash_cents)+' / '+percent(p.cash_weight_pct),'—'],...p.holdings.map(h=>[h.name+(h.origin==='global'?'（现货 / 美股）':h.origin==='dynamic'?'（动态）':'（公司与资产）')+' · '+h.qty+' 股（可卖 '+h.sellable_qty+'）',money(h.market_value_cents)+' / '+percent(h.weight_pct),signed(h.unrealized_cents)+(h.valuation_basis==='COST_FALLBACK'?'（缺少报价）':'')])]);
-  $('valuation').textContent=p.holdings.length?'报价时间：'+p.holdings.map(h=>h.name+' '+shortTime(h.quote_at)).join('；'):'尚未建仓。满足研究和盘面条件后，持仓会在这里更新。';
+  $('valuation').textContent=p.holdings.length?'当前持仓浮动合计 '+signed(p.unrealized_cents)+' 元。按本页所在节点已取得的报价估值；每日复盘保留研究端截止时的报价快照，可能与本页不同。行情源时间：'+p.holdings.map(h=>h.name+' '+when(h.quote_at)+(h.quote_source?'（'+quoteSourceLabel(h.quote_source)+'）':'')).join('；'):'尚未建仓。满足研究和盘面条件后，持仓会在这里更新。';
   renderChanged('effects',s.trade_effects,box=>{
     const t=s.trade_effects;
     if(!t.totals.fill_count){const empty=el('div',null,'empty');empty.append(el('strong','还没有成交'),el('span','首次模拟成交后，这里会显示买入后的浮动盈亏和卖出的实际结果。'));box.append(empty);return;}
@@ -470,6 +470,34 @@ function drawReviewFindings(body,r) {
   if(data.omitted)section.append(el('p','另有 '+data.omitted+' 条发现保留在本机记录。','subtle'));
   section.append(el('p','复盘发现只生成工程问题或提案草稿，不会直接进入研究规则。','subtle'));body.append(section);
 }
+function quoteSourceLabel(source) {
+  return ({tencent_public_research:'腾讯公开行情',tencent_dynamic:'腾讯公开行情',tencent_minute_fallback:'腾讯分时备用行情'})[source]||source||'来源未记录';
+}
+function drawReviewReconciliation(body,r,daily,portfolio) {
+  const stock=daily?.totals?.cumulative_profit_cents,dividend=daily?.cumulative_dividend_cents,account=daily?.account_cumulative_profit_cents;
+  if(!Number.isFinite(stock)||!Number.isFinite(dividend)||!Number.isFinite(account)){
+    body.append(el('p','旧记录尚无截止累计分红对账；24小时分红为零不代表历史累计分红为零。','subtle'));return;
+  }
+  const historicalDifference=account-stock-dividend;
+  body.append(el('p','复盘截止对账：成交与持仓累计 '+signed(stock)+' 元 + 累计现金分红 '+signed(dividend)+' 元 = '+(historicalDifference?'分项合计 ':'账户累计 ')+signed(stock+dividend)+' 元。','subtle'));
+  if(historicalDifference)body.append(el('p','截止账户权益计算值为 '+signed(account)+' 元，与分项合计仍差 '+signed(historicalDifference)+' 元，待核对其他资金流水。','caution'));
+  if(daily.accounting_basis==='TRADE_PNL_PLUS_LEDGER_DIVIDENDS')body.append(el('p','本条截止账户累计按成交与持仓损益加分红计算，未提供可独立核对的历史账户权益。','subtle'));
+  const current=state?.portfolio,close=daily.closing||{},now=state?.at;
+  const nowTime=Date.parse(now),cutoff=Date.parse(r.window_end);
+  if(!current||!Number.isFinite(nowTime)||!Number.isFinite(cutoff)||nowTime<cutoff||!Number.isFinite(current.total_profit_cents))return;
+  const differences=[current.unrealized_cents,close.unrealized_cents,current.cumulative_realized_cents,close.cumulative_realized_cents,current.cumulative_dividend_cents];
+  if(!differences.every(Number.isFinite)||!Number.isFinite(daily.reconciliation_difference_cents))return;
+  const floating=current.unrealized_cents-close.unrealized_cents,realized=current.cumulative_realized_cents-close.cumulative_realized_cents,cash=current.cumulative_dividend_cents-dividend;
+  const positions=(portfolio.positions||[]).filter(x=>x.closing?.qty),holdings=current.holdings||[];
+  const sameCutoff=!portfolio.window_end||Date.parse(portfolio.window_end)===cutoff;
+  const samePositions=sameCutoff&&Array.isArray(portfolio.positions)&&Array.isArray(current.holdings)&&positions.length===holdings.length&&positions.every(x=>{
+    const h=holdings.find(h=>h.symbol===x.symbol&&h.origin===x.origin),c=x.closing,scale=c.qty_scale??1;
+    return h&&[h.qty,c.qty,h.cost_cents,c.cost_cents,scale].every(Number.isFinite)&&scale>0&&h.qty===c.qty/scale&&h.cost_cents===c.cost_cents;
+  });
+  const remainder=current.total_profit_cents-account-floating-realized-cash;
+  const pieces=[['复盘截止账户累计',account],[samePositions&&realized===0?'报价快照差':'持仓浮动变化',floating],['后续已实现变化',realized],['后续分红',cash],['其他待核对差额',remainder]].filter((x,i)=>i<2||x[1]!==0);
+  body.append(el('p','与账户概览对照（'+when(now)+'）：'+pieces.map(([name,value])=>name+' '+signed(value)).join('；')+' → 当前账户累计 '+signed(current.total_profit_cents)+' 元。',remainder?'caution':'subtle'));
+}
 function drawDailyReview(body,r) {
   const facts=r.payload.facts||{},analysis=r.payload.analysis||{},p=facts.portfolio;
   const daily=r.presentation?.daily||facts.daily_accounting||facts.daily_portfolio||(!facts.context_48h?p:null),context=r.presentation?.context||facts.context_48h;
@@ -478,10 +506,11 @@ function drawDailyReview(body,r) {
   if(p){
     const t=daily?.totals,closing=daily?.closing||p.closing||{},metrics=el('div',null,'review-metrics');
     const cumulative=daily?.totals?.cumulative_profit_cents??p.totals?.cumulative_profit_cents;
-    for(const [title,value] of [['本期盈亏（24小时持仓）',t?.period_profit_cents],['截止累计盈亏（持仓口径）',cumulative],['截止持仓浮动盈亏',closing.unrealized_cents],['累计已实现（成交）',closing.cumulative_realized_cents]]){
+    for(const [title,value] of [['本期盈亏（24小时持仓）',t?.period_profit_cents],['截止账户累计盈亏（含分红）',daily?.account_cumulative_profit_cents],['截止累计盈亏（成交与持仓）',cumulative],['截止持仓浮动盈亏',closing.unrealized_cents],['累计已实现（成交）',closing.cumulative_realized_cents]]){
       const metric=el('div');metric.append(el('span',title,'subtle'),el('strong',signed(value)+' 元',value>0?'profit':value<0?'loss':''));metrics.append(metric);
     }
-    body.append(metrics,el('p','上述持仓损益已计成交费用，不含现金分红；不能与含分红的账户累计收益直接对照。','subtle'));
+    body.append(metrics,el('p','成交与持仓损益已计成交费用，不含现金分红；账户累计另加自开户以来已入账分红。复盘冻结研究端截止报价，持仓页使用所在节点的当前报价，浮动盈亏可能不同。','subtle'));
+    drawReviewReconciliation(body,r,daily,p);
     if(!daily)body.append(el('p','这份旧记录未提供独立24小时核算；不能用48小时金额代替。','caution'));
     const dividendKnown=daily?.dividends_known??Object.prototype.hasOwnProperty.call(daily||{},'dividends');
     if(dividendKnown){const cash=daily.dividend_cents??(daily.dividends||[]).reduce((n,x)=>n+(Number.isFinite(x.amount_cents)?x.amount_cents:0),0);body.append(el('p','24小时已入账现金分红 '+signed(cash)+' 元（另计）。除息造成的价格调整须结合分红阅读。','subtle'));}
@@ -493,13 +522,22 @@ function drawDailyReview(body,r) {
     drawReviewChecks(body,r);
     if(analysis.summary){const d=details('模型复盘摘要（待验证）','review-summary:'+r.id);d.append(proposalText('p',analysis.summary,'review-summary'));body.append(d);}
     const verdicts={SUPPORTED:'观点获得支持',CONTRADICTED:'观点已被反证',MIXED:'部分支持，部分反证',PENDING:'仍待验证',INSUFFICIENT:'研究依据不足'};
-    const qualities={RECENT:'截止前有效报价',CLOSE:'收盘后报价',INTRADAY_LAST:'盘中末次报价',STALE:'历史旧报价',MISSING:'报价缺失',NO_POSITION:'已无持仓'};
+    const qualities={RECENT:'截止前有效报价',CLOSE:'行情源盘后时间戳',INTRADAY_LAST:'盘中末次报价',STALE:'历史旧报价',MISSING:'报价缺失',NO_POSITION:'已无持仓'};
     const positions=p.positions||[],extra=details('其余持仓回看（'+Math.max(0,Math.min(positions.length,20)-3)+' 个）','review-positions:'+r.id);
     for(const [index,position] of positions.slice(0,20).entries()){
       const c=position.closing||{},a=(analysis.positions||[]).find(x=>x.position_key===position.key),card=el('article',null,'review-position');
       const head=el('div',null,'section-head');head.append(el('h3',position.name+' · '+position.symbol),el('span',a?'模型：'+(verdicts[a.verdict]||'结论待核对'):'模型分析待补齐','badge'));card.append(head);
       card.append(el('p',(context?'48小时持仓损益 ':'本期持仓损益 ')+signed(position.period_profit_cents)+' 元 · 截止浮动 '+signed(c.unrealized_cents)+' 元'));
-      if(c.qty)card.append(el('p',(qualities[c.quality]||c.quality||'行情待核对')+' '+(c.quote_at?when(c.quote_at):'')+(c.late_quote?' · 补录于 '+when(c.quote_first_seen_at):''),'subtle'));
+      const quoteDetails=context?.quote_provenance||daily?.quote_provenance||r.presentation?.quote_provenance||[];
+      const candidate=quoteDetails.find(x=>x.key===position.key)?.closing||{};
+      const provenance=candidate.quote_at&&c.quote_at&&Date.parse(candidate.quote_at)!==Date.parse(c.quote_at)?{}:candidate;
+      if(c.qty){
+        card.append(el('p',(qualities[c.quality]||c.quality||'行情待核对')+' '+(c.quote_at?when(c.quote_at):'')+' · 来源：'+(provenance.quote_source_label||quoteSourceLabel(provenance.quote_source)),'subtle'));
+        const received=provenance.quote_first_seen_at||c.quote_first_seen_at;
+        if(received)card.append(el('p','系统首次取得 '+when(received)+(c.late_quote?' · 截止后补录':''),'subtle'));
+        if(provenance.quote_time_notice)card.append(el('p',provenance.quote_time_notice,'subtle'));
+        else if(c.quality==='CLOSE')card.append(el('p','该时间来自行情记录，晚于15:00仅表示盘后时间戳，不表示该时刻成交，也不能据此认定为官方收盘价。','subtle'));
+      }
       if(a?.next_check)card.append(proposalText('p','模型建议下次核对：'+proposalExcerpt(a.next_check,180),'review-next-check'));
       const detail=details('持仓事实与模型依据','review-position:'+r.id+':'+position.key);
       detail.append(el('p','截止 '+((c.qty||0)/(c.qty_scale||1)).toLocaleString('zh-CN',{maximumFractionDigits:8})+' 股 / 份 · 买入均价 '+costPrice(c.average_cost_cents)+' 元 · 截止报价 '+money(c.price_cents)+' 元','subtle'),el('p','累计已实现（成交） '+signed(position.cumulative_realized_cents)+' 元'));
@@ -810,8 +848,8 @@ function renderActivity(s) {
     box.append(el('p',(s.watchlist.find(w=>w.symbol===d.symbol)?.name||d.symbol)+' · '+label(d.action)+' · '+label(d.status)),el('p',decisionReason(d.reason),'subtle'),el('p',shortTime(d.at),'subtle'));
   });
   table('decisions',['时间','股票 / 操作','提交结果','依据'],s.decisions.map(d=>[shortTime(d.at),d.symbol+' '+label(d.action),label(d.status),decisionReason(d.reason)]));
-  table('fills',['时间','股票 / 方向','股数 / 均价','费用 / 已实现盈亏'],s.fills.map(f=>[shortTime(f.occurred_at),f.symbol+' '+label(f.side),f.qty+' / '+money(f.price_cents),money(f.fee_cents)+' / '+(f.side==='SELL'?signed(f.realized_cents):'尚未卖出')]));
-  renderChanged('reviews',{items:s.reviews,hour:Math.floor(Date.parse(s.at)/3600000)},box=>{
+  table('fills',['时间','股票 / 方向','股数 / 均价','费用 / 已实现盈亏'],s.fills.map(f=>[shortTime(f.occurred_at),f.symbol+' '+label(f.side),f.qty+' / '+money(f.price_cents),money(f.fee_cents)+' / '+(f.side==='SELL'?signed(f.realized_cents):'买入不结算已实现盈亏')]));
+  renderChanged('reviews',{items:s.reviews,at:s.at,portfolio:s.portfolio},box=>{
     if(!s.reviews.length){box.append(el('p','还没有复盘记录，首次复盘完成后显示。','empty'));return;}
     s.reviews.slice(0,5).forEach((r,index)=>{const body=el('div',null,'review');drawDailyReview(body,r);
       if(!index)box.append(body);else{const det=details('较早复盘 · '+when(r.window_end),'review:'+r.id);det.append(body);box.append(det);}
@@ -1494,7 +1532,7 @@ async function refreshStock(){
   });
   renderChanged('stock-history',data.history,box=>{for(const [key,title] of [['fills','成交记录'],['orders','委托记录'],['decisions','买卖依据']]){const info=data.history[key],section=details(title+'（共 '+info.total+' 条）','history:'+key);if(key==='fills')section.open=true;
     const rows=info.items;if(!rows.length)section.append(el('p',info.total?'本页没有此类记录。':'暂无'+title+'。','empty'));
-    else if(key==='fills')dataTable(section,['时间 / 方向','股数 / 成交价','费用 / 已实现盈亏'],rows.map(r=>[shortTime(r.occurred_at)+' · '+label(r.side),r.qty+' 股 / '+money(r.price_cents),money(r.fee_cents)+' / '+(r.side==='SELL'?signed(r.realized_cents):'尚未卖出')]));
+    else if(key==='fills')dataTable(section,['时间 / 方向','股数 / 成交价','费用 / 已实现盈亏'],rows.map(r=>[shortTime(r.occurred_at)+' · '+label(r.side),r.qty+' 股 / '+money(r.price_cents),money(r.fee_cents)+' / '+(r.side==='SELL'?signed(r.realized_cents):'买入不结算已实现盈亏')]));
     else if(key==='orders')dataTable(section,['提交时间 / 方向','委托数量 / 限价','状态'],rows.map(r=>[shortTime(r.created_at)+' · '+label(r.side),r.qty+' 股 / '+money(r.limit_cents),label(r.status)]));
     else dataTable(section,['时间 / 判断','结果','原因'],rows.map(r=>[shortTime(r.at)+' · '+label(r.action),label(r.status),decisionReason(r.reason)]));box.append(section);}});
   const max=Math.max(...Object.values(data.history).map(h=>h.total));$('history-page').textContent='第 '+(historyOffset/30+1)+' / '+Math.max(1,Math.ceil(max/30))+' 页';$('history-prev').disabled=historyOffset===0;$('history-next').disabled=historyOffset+30>=max;updateButtons();

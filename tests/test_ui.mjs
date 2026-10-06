@@ -730,3 +730,5 @@ await import('./test_macro_relevance_ui.mjs');
 await import('./test_review_relevance_ui.mjs');
 
 await import('./test_approval_ui.mjs');
+await import('./test_fill_labels_ui.mjs');
+await import('./test_pnl_provenance_ui.mjs');

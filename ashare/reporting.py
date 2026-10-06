@@ -50,6 +50,8 @@ def portfolio(store, config, a, at):
             'unrealized_cents': unrealized,
             'unrealized_return_pct': pct(unrealized, cost) if unrealized is not None else None,
             'quote_same_day': bool(q and local(q['observed_at']).date() == local(at).date()),
+            'quote_source': q.get('source', 'tencent_dynamic') if q else None,
+            'quote_first_seen_at': q.get('first_seen_at') if q else None,
             'valuation_basis': 'LAST_QUOTE' if q else 'COST_FALLBACK',
         })
     from .investment_policy import FIXED
@@ -64,6 +66,8 @@ def portfolio(store, config, a, at):
         'cash_weight_pct': pct(a['cash_cents'], a['equity_cents']),
         'stock_weight_pct': pct(a['market_value_cents'], a['equity_cents']),
         'total_profit_cents': a['equity_cents'] + a['withdrawn_cents'] - a['initial_cents'],
+        'cumulative_dividend_cents': store.db.execute("SELECT coalesce(sum(amount_cents),0) FROM paper_flows WHERE account_id='DEMO_PAPER' AND kind='CASH_DIVIDEND' AND created_at<=?", (normalize_time(at),)).fetchone()[0],
+        'cumulative_realized_cents': sum(store.db.execute(f'SELECT coalesce(sum(realized_cents),0) FROM {table} WHERE occurred_at<=?', (normalize_time(at),)).fetchone()[0] for table in ('paper_fills', 'dynamic_fills', 'global_fills')),
         'unrealized_cents': sum(p['unrealized_cents'] for p in holdings)
             if all(p['unrealized_cents'] is not None for p in holdings) else None,
     }
