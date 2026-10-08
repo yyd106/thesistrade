@@ -102,6 +102,11 @@ def reconcile(store,config,at):
  allocation=allocate(store,all_items(store,at),at,config)
  with store.db:
   for item in allocation['items']+allocation['archived_items']:
+   # Industry research also supplies targets without a macro event. Register only
+   # their identity before the FK-backed state; admission still comes from links.
+   identity={k:item[k] for k in ('asset','symbol','name','category','kind','unit','identity_source') if k in item}
+   store.db.execute('INSERT INTO macro_watchlist VALUES(?,?,?,?) ON CONFLICT(asset) DO NOTHING',
+    (item['asset'],item['added_at'],item['updated_at'],json.dumps(identity,ensure_ascii=False)))
    data={k:item[k] for k in ('pool_tier','pool_reason','priority_score','protected','last_catalyst_at','review_due_at','expires_at')}
    old=store.db.execute('SELECT payload_json FROM macro_watch_state WHERE asset=?',(item['asset'],)).fetchone();prior=json.loads(old[0]) if old else {}
    if (prior.get('pool_tier'),prior.get('protected'))!=(data['pool_tier'],data['protected']):

@@ -116,7 +116,13 @@ def all_items(store,at):
  from .industry import links as industry_links
  by_asset={i['asset']:i for i in items}
  for asset,item in industry_links(store,at).items():
-  if asset in by_asset:by_asset[asset]['links']+=item['links']
+  if asset in by_asset:
+   existing=by_asset[asset]
+   # A persisted identity is not a macro research result. Keep industry-only
+   # presentation stable without overwriting the registered identity timestamps.
+   if not existing['links']:
+    existing.update({k:item[k] for k in ('status','strength','direction','conflicting')})
+   existing['links']+=item['links']
   else:items.append(item)
  return items
 
