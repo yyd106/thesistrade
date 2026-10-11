@@ -1,6 +1,8 @@
 """One local scheduler; durable job keys; never replay a missed trading Slot."""
 from __future__ import annotations
 import json
+import logging
+import sqlite3
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +14,27 @@ from .storage import Store,now,normalize_time
 from .workflow import execute
 from .cloud_protocol import role
 from .connectivity import NEEDS_NETWORK,PAUSE_SECONDS,Offline,log_interval,offline_since
+
+
+LOG = logging.getLogger(__name__)
+
+
+class JobCompletionPending(RuntimeError):
+    """The work has ended; retry recording its outcome, never execute it again."""
+    def __init__(self, completion, cause):
+        self.completion = {**completion, 'worker_error': type(cause).__name__ + ': ' + str(cause)[:500]}
+        super().__init__('任务完成状态尚未保存：' + self.completion['worker_error'])
+
+
+def persist_completion(store, jid, completion):
+    """Idempotent finalization; a later terminal/recovery state must not be overwritten."""
+    with store.db:
+        store.db.execute('''UPDATE jobs SET status=?,finished_at=?,result_json=?,error=?
+            WHERE id=? AND status IN ('PENDING','RUNNING')''',
+            (completion['status'], completion['finished_at'], completion['result_json'], completion['error'], jid))
+        if completion.get('worker_error'):
+            store.db.execute("INSERT OR REPLACE INTO service_state VALUES('scheduler_worker_error',?)",
+                (completion['finished_at'] + ' ' + jid + ' ' + completion['worker_error'],))
 
 
 def enqueue(store,kind,scheduled,key=None,status='PENDING',payload=None):
@@ -138,6 +161,7 @@ class Scheduler:
     def __init__(self,config_path):
         self.config_path=config_path;self.stop=Event();self.pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix='ashare')
         self.futures={};self.last_settle=0;self.last_followups=0;self.last_maintenance=0;self.last_dividends=0
+        self.pending_completions={}
         self.sync_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='cloud-sync');self.sync_future=None;self.last_sync=0
         # Page collection and HTTPS must never occupy the ledger/strategy worker.
         self.page_display_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='page-display')
@@ -177,13 +201,14 @@ class Scheduler:
         finally:store.close()
 
     def work(self,job):
-        config=load_config(self.config_path)
-        store=Store(config['data_dir'])
+        config=None
         try:
-            row=store.db.execute('SELECT payload_json FROM job_inputs WHERE job_id=?',(job['id'],)).fetchone()
-            payload=json.loads(row[0]) if row else {}
-        finally:store.close()
-        try:
+            config=load_config(self.config_path)
+            store=Store(config['data_dir'])
+            try:
+                row=store.db.execute('SELECT payload_json FROM job_inputs WHERE job_id=?',(job['id'],)).fetchone()
+                payload=json.loads(row[0]) if row else {}
+            finally:store.close()
             result=execute(config,job['kind'],key=job['id'] if job['kind'] in ('cycle','collect') else None,
                 symbol=payload.get('symbol'),
                 scheduled_at=job['scheduled_at'] if job['kind'] in ('slot','dynamic_slot') else None,
@@ -193,22 +218,52 @@ class Scheduler:
             if job['kind']=='slot' and isinstance(result,dict):
                 # No per-minute HOLD or rejected-attempt history in job payloads.
                 result={**result,'decisions':[d for d in result.get('decisions',[]) if d['status']=='SUBMITTED']}
+            result_json=json.dumps(result,ensure_ascii=False)
         except Offline as exc:
             # Stopped because this machine lost its network; research is redone after reconnect.
-            result=None;state='DEFERRED';error=str(exc)[:500]
+            result_json='null';state='DEFERRED';error=str(exc)[:500]
         except Exception as exc:
-            result=None;state='FAILED';error=type(exc).__name__+': '+str(exc)[:500]
-        store=Store(config['data_dir'])
+            result_json='null';state='FAILED';error=type(exc).__name__+': '+str(exc)[:500]
+        completion={'status':state,'finished_at':now(),'result_json':result_json,'error':error}
         try:
-            with store.db:store.db.execute('UPDATE jobs SET status=?,finished_at=?,result_json=?,error=? WHERE id=?',
-                (state,now(),json.dumps(result,ensure_ascii=False),error,job['id']))
-        finally:store.close()
+            # A failed initial config read is recorded by the scheduler's own Store.
+            if config is None:raise RuntimeError(error)
+            store=Store(config['data_dir'])
+            try:persist_completion(store,job['id'],completion)
+            finally:store.close()
+        except Exception as exc:
+            raise JobCompletionPending(completion,exc) from exc
+
+    def collect_workers(self,store,stamp):
+        """Consume each completed future once, then independently retry durable finalization."""
+        if not hasattr(self,'pending_completions'):self.pending_completions={}
+        for workers in (self.futures,self.dynamic_futures,self.global_futures):
+            for jid,future in list(workers.items()):
+                if not future.done():continue
+                try:future.result()
+                except JobCompletionPending as exc:
+                    self.pending_completions[jid]=exc.completion
+                    LOG.warning('Job %s completion needs persistence: %s',jid,exc)
+                except Exception as exc:
+                    error=type(exc).__name__+': '+str(exc)[:500]
+                    self.pending_completions[jid]={'status':'FAILED','finished_at':stamp,
+                        'result_json':'null','error':error,'worker_error':error}
+                    LOG.exception('Job %s worker failed',jid)
+                finally:del workers[jid]
+        for jid,completion in list(self.pending_completions.items()):
+            try:persist_completion(store,jid,completion)
+            except (sqlite3.Error,OSError):
+                # Keep only the final outcome, not the failed Future or its traceback.
+                # A service restart retains RUNNING as INTERRUPTED and never replays trades.
+                LOG.exception('Job %s completion could not be saved; will retry next tick',jid)
+            else:del self.pending_completions[jid]
 
     def tick(self):
         config=load_config(self.config_path);store=Store(config['data_dir'])
         self.poll_seconds=config['scheduler_poll_seconds']
         try:
             stamp=now()
+            self.collect_workers(store,stamp)
             offline=None
             if role(config)!='cloud':
                 # A long gap between ticks means the machine slept or the service was stopped.
@@ -242,9 +297,6 @@ class Scheduler:
                     minute=normalize_time(datetime.fromisoformat(stamp).replace(second=0,microsecond=0).isoformat())
                     enqueue(store,'global_slot',minute,'global_slot:'+minute)
                     with store.db:store.db.execute("UPDATE jobs SET status='MISSED',finished_at=? WHERE kind='global_slot' AND status='PENDING' AND scheduled_at<?",(stamp,minute))
-            for jid,f in list(self.futures.items()):
-                if f.done():
-                    f.result();del self.futures[jid]
             if config['scheduler_enabled']:
                 schedule_due(store,config,stamp)
                 schedule_dynamic_due(store,config,stamp)
@@ -264,7 +316,8 @@ class Scheduler:
                     self.experiment_cancel.set()
             with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('heartbeat',?)",(stamp,))
             # Process report queues and trading Slots in separate workers; slow PDF/model calls cannot stall the clock.
-            active_kinds={r[0] for r in store.db.execute("SELECT kind FROM jobs WHERE status='RUNNING'")}
+            active_kinds={r['kind'] for r in store.db.execute("SELECT id,kind FROM jobs WHERE status='RUNNING'")
+                if r['id'] not in self.pending_completions}
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind NOT IN ('dynamic_cycle','dynamic_slot','global_research','global_slot','portfolio_strategy') ORDER BY CASE kind WHEN 'slot' THEN 0 WHEN 'review' THEN 1 ELSE 2 END,scheduled_at LIMIT 40").fetchall():
                 if len(self.futures)>=3:break
                 if row['kind'] in active_kinds:continue
@@ -273,28 +326,21 @@ class Scheduler:
                 with store.db:
                     store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))
                 active_kinds.add(row['kind']);self.futures[row['id']]=self.pool.submit(self.work,dict(row))
-            for jid,f in list(self.dynamic_futures.items()):
-                if f.done():
-                    try:f.result()
-                    except Exception as exc:
-                        with store.db:store.db.execute("INSERT OR REPLACE INTO dynamic_state VALUES('worker_error',?)",(str(exc)[:200],))
-                    finally:del self.dynamic_futures[jid]
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind IN ('dynamic_cycle','dynamic_slot') ORDER BY CASE kind WHEN 'dynamic_slot' THEN 0 ELSE 1 END,scheduled_at DESC LIMIT 4").fetchall():
                 if len(self.dynamic_futures)>=2 or row['kind'] in active_kinds:continue
                 if offline and row['kind'] in NEEDS_NETWORK:continue
                 # Preserve watchlist's existing allocation order. Dynamic receives
                 # the remaining shared budget after that minute's original slot.
-                if row['kind']=='dynamic_slot' and store.db.execute("SELECT 1 FROM jobs WHERE kind='slot' AND scheduled_at=? AND status IN ('PENDING','RUNNING')",(row['scheduled_at'],)).fetchone():continue
+                if row['kind']=='dynamic_slot' and any(r[0] not in self.pending_completions for r in store.db.execute(
+                    "SELECT id FROM jobs WHERE kind='slot' AND scheduled_at=? AND status IN ('PENDING','RUNNING')",(row['scheduled_at'],))):continue
                 with store.db:store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))
                 active_kinds.add(row['kind']);self.dynamic_futures[row['id']]=self.dynamic_pool.submit(self.work,dict(row))
-            for jid,f in list(self.global_futures.items()):
-                if f.done():
-                    f.result();del self.global_futures[jid]
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind IN ('global_slot','global_research','portfolio_strategy') ORDER BY CASE kind WHEN 'global_slot' THEN 0 ELSE 1 END,scheduled_at DESC").fetchall():
                 if len(self.global_futures)>=2 or row['kind'] in active_kinds:continue
                 if offline and row['kind'] in NEEDS_NETWORK:continue
                 if row['kind'] in ('global_research','portfolio_strategy') and active_kinds & {'research','cycle','collect','repair','industry_research','review','dynamic_cycle','global_research','portfolio_strategy'}:continue
-                if row['kind']=='global_slot' and store.db.execute("SELECT 1 FROM jobs WHERE kind IN ('slot','dynamic_slot') AND scheduled_at=? AND status IN ('PENDING','RUNNING')",(row['scheduled_at'],)).fetchone():continue
+                if row['kind']=='global_slot' and any(r[0] not in self.pending_completions for r in store.db.execute(
+                    "SELECT id FROM jobs WHERE kind IN ('slot','dynamic_slot') AND scheduled_at=? AND status IN ('PENDING','RUNNING')",(row['scheduled_at'],))):continue
                 with store.db:store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))
                 active_kinds.add(row['kind']);self.global_futures[row['id']]=self.global_pool.submit(self.work,dict(row))
             # Outstanding paper orders need a post-decision quote, not a fictitious instant fill.
@@ -419,14 +465,23 @@ class Scheduler:
         return result
 
     def run(self):
-        self.recover()
+        recovered=False
         while not self.stop.is_set():
-            try:self.tick()
+            try:
+                if not recovered:
+                    self.recover();recovered=True
+                self.tick()
             except Exception as exc:
                 # Make scheduler failure visible without killing the local UI.
-                config=load_config(self.config_path);store=Store(config['data_dir'])
-                with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('last_error',?)",(now()+' '+str(exc)[:500],))
-                store.close()
+                LOG.exception('Scheduler iteration failed')
+                try:
+                    config=load_config(self.config_path);store=Store(config['data_dir'])
+                    try:
+                        with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('last_error',?)",(now()+' '+str(exc)[:500],))
+                    finally:store.close()
+                except Exception:
+                    # Logging remains visible when the same outage prevents the DB error record.
+                    LOG.exception('Scheduler error record could not be saved; will retry the loop')
             self.stop.wait(self.poll_seconds)
 
     def close(self):

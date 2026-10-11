@@ -76,7 +76,7 @@ def submit(store,config,case,side,q,at,reason):
   plan=json.loads(fresh['plan_json']);p=case_position(store,cid,at)
   if phase(at)!='CONTINUOUS':raise ValueError('当前不在交易时段')
   if not quote_ok(q,config,at):raise ValueError('动态报价过期')
-  guard=market_guard(sym,q)
+  guard=market_guard(sym,q,side)
   if guard:raise ValueError(guard)
   a=account_inside_transaction(store,at)
   if any(o['status']=='UNKNOWN' for o in a['orders']):raise ValueError('共用账户有待核对委托')
@@ -144,7 +144,15 @@ def settle(store,config,at):
    if o['expires_at']<=at or (o['side']=='BUY' and (case['status'] not in ('READY','HOLDING') or case['expires_at']<=at)):
     store.db.execute("UPDATE dynamic_orders SET status='EXPIRED',reserved_cents=0 WHERE id=?",(o['id'],));continue
    q=latest_quote(store,o['symbol'],at)
-   if phase(at)!='CONTINUOUS' or not quote_ok(q,config,at) or q['observed_at']<=o['created_at'] or market_guard(o['symbol'],q):continue
+   if o['side']=='BUY':
+    from .dynamic import eligibility
+    blockers,_=eligibility(store,config,case,at)
+    # Partial fills retain the case's remaining entry intent, not permanent
+    # permission to ignore new news, failed announcement checks or a hard exit.
+    risk_exit=quote_ok(q,config,at) and exit_reason(case,case_position(store,o['case_id'],at),q,at)
+    if blockers or risk_exit:
+     store.db.execute("UPDATE dynamic_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
+   if phase(at)!='CONTINUOUS' or not quote_ok(q,config,at) or q['observed_at']<=o['created_at'] or market_guard(o['symbol'],q,o['side']):continue
    if store.db.execute('SELECT 1 FROM dynamic_fills WHERE order_id=? AND quote_id=?',(o['id'],q['id'])).fetchone():continue
    price=(q['price_cents']*(10000+terms['paper_slippage_bps'])+9999)//10000 if o['side']=='BUY' else q['price_cents']*(10000-terms['paper_slippage_bps'])//10000
    if (o['side']=='BUY' and price>o['limit_cents']) or (o['side']=='SELL' and price<o['limit_cents']):continue

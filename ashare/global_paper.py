@@ -170,6 +170,10 @@ def settle(store, config, at, selected):
             limit_age = FX_SELL_MAX_AGE if o['side'] == 'SELL' else FX_BUY_MAX_AGE
             if not fresh(q, at, fx_max_age=limit_age) or q['observed_at'] <= o['created_at'] or not session_open(o['symbol'], at, json.loads(q['payload_json'])):
                 continue
+            if o['side']=='BUY' and exit_reason(store,config,o['symbol'],balance(store,at)['positions'].get(o['symbol']),q,at):
+                # A partially filled entry must stop increasing exposure as soon
+                # as the existing holding reaches its deterministic exit rule.
+                cancel();continue
             if store.db.execute('SELECT 1 FROM global_fills WHERE order_id=? AND quote_id=?', (o['id'], q['id'])).fetchone():
                 continue
             terms = json.loads(o['payload_json'])
