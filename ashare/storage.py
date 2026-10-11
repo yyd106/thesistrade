@@ -115,6 +115,8 @@ class Store:
         self.db.executescript(INDUSTRY_SCHEMA)
         from .approval_schema import SCHEMA as APPROVAL_SCHEMA
         self.db.executescript(APPROVAL_SCHEMA)
+        from .withdrawal_schema import SCHEMA as WITHDRAWAL_SCHEMA
+        self.db.executescript(WITHDRAWAL_SCHEMA)
 
     def raw(self, data, suffix=".bin"):
         h = digest(data)

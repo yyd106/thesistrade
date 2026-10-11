@@ -46,15 +46,19 @@ def account(store,at):
     global_account=global_balance(store,at)
     orders=[dict(r) for r in store.db.execute("SELECT * FROM paper_orders WHERE status IN ('OPEN','PARTIAL','UNKNOWN')")]+dynamic['orders']+global_account['orders']
     reserved=sum(o['reserved_cents'] for o in orders if o['side']=='BUY')
-    withdrawal=store.db.execute("SELECT coalesce(sum(planned_cents-transferred_cents),0) FROM paper_withdrawals WHERE status!='COMPLETED'").fetchone()[0]
+    from .withdrawals import reservation, pending
+    withdrawal=reservation(store)
     market_value+=dynamic['market_value_cents']+global_account['market_value_cents'];complete=complete and dynamic['valuation_complete'] and global_account['valuation_complete']
-    a.update({'positions':p,'dynamic_positions':dynamic['positions'],'global_positions':global_account['positions'],'orders':orders,'reserved_cents':reserved,'withdrawal_reserved_cents':withdrawal,
+    a.update({'positions':p,'dynamic_positions':dynamic['positions'],'global_positions':global_account['positions'],'orders':orders,'reserved_cents':reserved,'withdrawal_reserved_cents':withdrawal,'withdrawal_pending':pending(store),
         'available_cents':max(0,a['cash_cents']-reserved-withdrawal),
         'equity_cents':a['cash_cents']+market_value,'market_value_cents':market_value,'valuation_complete':complete})
     return a
 
 
-def mark_equity(store,at):
+def mark_equity(store,at,config=None):
+    if config is not None and config.get('deployment_role') != 'research':
+        from .withdrawals import refresh
+        refresh(store,config,at)
     a=account(store,at)
     dynamic_realized=store.db.execute('SELECT coalesce(sum(realized_cents),0) FROM dynamic_fills').fetchone()[0]
     dynamic_unrealized=sum(p['market_value_cents']-p['cost_cents'] for p in a.get('dynamic_positions',{}).values())
@@ -66,7 +70,7 @@ def mark_equity(store,at):
     with store.db:
         store.db.execute('INSERT OR IGNORE INTO equity_marks VALUES(?,?,?,?,?,?,?,?)',
             (digest(at+payload)[:24],at,now(),a['cash_cents'],a['equity_cents'],a['withdrawn_cents'],int(a['valuation_complete']),payload))
-    if a['valuation_complete']:
+    if config is None and a['valuation_complete']:
         PaperLedger(store).plan(a['equity_cents'])
     return a
 
@@ -125,11 +129,16 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
     if config['mode']!='paper':return {'status':'BLOCKED','reason':'RESEARCH_MODE'}
     if side not in ('BUY','SELL'):raise ValueError('无效方向')
     symbol=plan['symbol'];pid=plan['id'];at=normalize_time(at)
+    from .withdrawals import refresh as refresh_withdrawals, refresh_inside, pending
+    refresh_withdrawals(store,config,at)
     from .portfolio_risk import refresh, halted
     refresh(store,config,at)
     if side=='BUY' and halted(store):return {'status':'BLOCKED','reason':'ACCOUNT_DRAWDOWN_HALT'}
     store.db.execute('BEGIN IMMEDIATE')
     try:
+        refresh_inside(store,config,at)
+        if side=='BUY' and pending(store):
+            store.db.commit();return {'status':'BLOCKED','reason':'WITHDRAWAL_PENDING'}
         from .portfolio_risk import evaluate_inside
         risk=evaluate_inside(store,config,at)
         if side=='BUY' and risk['halted']:
@@ -159,7 +168,7 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
             if blockers:raise ValueError('PLAN_RECHECK: '+','.join(blockers))
             if params['kind']!='PAPER_TRADE':raise ValueError('NO_ENTRY_PLAN')
             if not levels['buy_low_cents']<=price<=levels['buy_high_cents']:raise ValueError('OUTSIDE_BUY_ZONE')
-            if a['withdrawal_reserved_cents']:raise ValueError('WITHDRAWAL_PENDING')
+            if a['withdrawal_pending']:raise ValueError('WITHDRAWAL_PENDING')
             if not a['valuation_complete']:raise ValueError('VALUATION_INCOMPLETE')
             limit=min(levels['buy_high_cents'],(price*(10000+config['paper_slippage_bps'])+9999)//10000)
             stock_budget=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100-(p['qty']+a.get('dynamic_positions',{}).get(symbol,{}).get('qty',0))*price
@@ -224,9 +233,10 @@ def _account_without_initialize(store,at):
     global_account=global_balance(store,at)
     orders=[dict(r) for r in store.db.execute("SELECT * FROM paper_orders WHERE status IN ('OPEN','PARTIAL','UNKNOWN')")]+dynamic['orders']+global_account['orders']
     reserved=sum(o['reserved_cents'] for o in orders if o['side']=='BUY')
-    withdrawal=store.db.execute("SELECT coalesce(sum(planned_cents-transferred_cents),0) FROM paper_withdrawals WHERE status!='COMPLETED'").fetchone()[0]
+    from .withdrawals import reservation, pending
+    withdrawal=reservation(store)
     mv+=dynamic['market_value_cents']+global_account['market_value_cents'];complete=complete and dynamic['valuation_complete'] and global_account['valuation_complete']
-    return {**a,'positions':p,'dynamic_positions':dynamic['positions'],'global_positions':global_account['positions'],'orders':orders,'reserved_cents':reserved,'withdrawal_reserved_cents':withdrawal,
+    return {**a,'positions':p,'dynamic_positions':dynamic['positions'],'global_positions':global_account['positions'],'orders':orders,'reserved_cents':reserved,'withdrawal_reserved_cents':withdrawal,'withdrawal_pending':pending(store),
         'available_cents':max(0,a['cash_cents']-reserved-withdrawal),'market_value_cents':mv,
         'equity_cents':a['cash_cents']+mv,'valuation_complete':complete}
 
@@ -237,10 +247,13 @@ def settle(store,config,at):
     fence(store,config,at)
     """Match only quotes strictly after order creation. Conservative lot-limited fills, no queue model."""
     at=normalize_time(at);results=[]
+    from .withdrawals import refresh as refresh_withdrawals, refresh_inside, pending
+    refresh_withdrawals(store,config,at)
     from .portfolio_risk import refresh
     refresh(store,config,at)
     store.db.execute('BEGIN IMMEDIATE')
     try:
+        refresh_inside(store,config,at)
         for order in store.db.execute("SELECT * FROM paper_orders WHERE status IN ('OPEN','PARTIAL') ORDER BY created_at,id").fetchall():
             o=dict(order)
             terms=store.db.execute('SELECT config_json FROM paper_order_terms WHERE order_id=?',(o['id'],)).fetchone()
@@ -254,7 +267,7 @@ def settle(store,config,at):
             if o['side']=='BUY':
                 from .portfolio_risk import halted
                 from .plan_recheck import check
-                if halted(store) or check(store,config,dict(plan),at):
+                if pending(store) or halted(store) or check(store,config,dict(plan),at):
                     store.db.execute("UPDATE paper_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
                 if quote_ok(q,config,at):
                     from .slots import hard_reason

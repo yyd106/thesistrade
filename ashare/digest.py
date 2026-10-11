@@ -264,9 +264,15 @@ def execution(store, config, a, b):
     orders = Counter(r['status'] for t in ('paper_orders', 'dynamic_orders', 'global_orders')
                      for r in _rows(store, f'SELECT status FROM {t} WHERE created_at>=? AND created_at<?', (a, b)))
     def mark(stamp):
-        rows = _rows(store, 'SELECT at,equity_cents,cash_cents,payload_json FROM equity_marks WHERE complete=1 AND at<? ORDER BY at DESC LIMIT 1', (stamp,))
+        rows = _rows(store, 'SELECT at,equity_cents,cash_cents,withdrawn_cents,payload_json FROM equity_marks WHERE complete=1 AND at<? '
+                     'ORDER BY at DESC,recorded_at DESC,rowid DESC LIMIT 1', (stamp,))
         return rows[0] if rows else None
     start, end = mark(a), mark(b)
+    # Match cashflows to the actual valuation endpoints, not to the calendar day:
+    # a transfer after the last mark must not appear as investment profit.
+    equity_change = end['equity_cents'] - start['equity_cents'] if start and end else None
+    withdrawn_change = end['withdrawn_cents'] - start['withdrawn_cents'] if start and end else None
+    withdrawals = _rows(store, "SELECT amount_cents FROM paper_flows WHERE kind='SIMULATED_WITHDRAWAL' AND created_at>=? AND created_at<?", (a, b))
     positions = []
     if end:
         account = _json(end['payload_json'], {})
@@ -289,6 +295,10 @@ def execution(store, config, a, b):
                               'qty': d['qty'], 'cash_per_share': format(d['cash'], 'f'), 'amount_cents': r['amount_cents']})
     return {'fills': fills, 'orders_created': dict(orders), 'dividends': dividends,
             'equity_start_cents': start['equity_cents'] if start else None, 'equity_end_cents': end['equity_cents'] if end else None,
+            'marked_start_at': start['at'] if start else None, 'equity_change_cents': equity_change,
+            'withdrawal_change_cents': withdrawn_change,
+            'cashflow_adjusted_change_cents': equity_change + withdrawn_change if equity_change is not None else None,
+            'withdrawals': {'count': len(withdrawals), 'amount_cents': -sum(r['amount_cents'] for r in withdrawals)},
             'cash_end_cents': end['cash_cents'] if end else None, 'marked_at': end['at'] if end else None,
             'positions': positions[:8], 'risk': {k: risk.get(k) for k in ('status', 'halted', 'drawdown_bps', 'peak_equity_cents') if k in risk}}
 
@@ -302,7 +312,7 @@ def quotes(store, a, b):
 def extras_errors(store):
     """On the research node: outage records or notice answers that failed to come over with the ledger."""
     from .cloud_runtime import value
-    return {k: e for k in ('quote_health', 'notices') if (e := value(store, 'extras_error_' + k))}
+    return {k: e for k in ('quote_health', 'notices', 'withdrawals') if (e := value(store, 'extras_error_' + k))}
 
 
 def review(store, a, b):
@@ -419,7 +429,8 @@ def flags(d, config, today):
     if q['minutes']['PRIMARY_DOWN'] >= 30:
         out.append(f"主行情接口累计 {q['minutes']['PRIMARY_DOWN']} 分钟没有给出可用报价")
     for key, e in (d.get('extras_errors') or {}).items():
-        out.append(f"{'行情中断记录' if key == 'quote_health' else '通知与答复'}没有同步到本机：{e.get('error', '')}")
+        label = {'quote_health': '行情中断记录', 'notices': '通知与答复', 'withdrawals': '模拟提取摘要'}.get(key, key)
+        out.append(f"{label}没有同步到本机：{e.get('error', '')}")
     g = d['governance']
     strategy_changes = list(dict.fromkeys(x['key'] for x in g['config_changes'] if x.get('class') == 'STRATEGY'))
     if strategy_changes:
@@ -439,7 +450,8 @@ EMPTY = {'availability': {'spans': [], 'offline_minutes': 0, 'paused_minutes': 0
                        'longest_online_gap': None, 'latest_actions': {}, 'latest_target_bps': 0, 'latest_summary': '',
                        'changes': [], 'publications': {}, 'publication_bytes': {'max': None, 'last': None}, 'longest_gap_hours': None},
          'execution': {'fills': {}, 'orders_created': {}, 'equity_start_cents': None, 'equity_end_cents': None, 'cash_end_cents': None,
-                       'marked_at': None, 'positions': [], 'risk': {}},
+                       'marked_at': None, 'marked_start_at': None, 'equity_change_cents': None, 'withdrawal_change_cents': None,
+                       'cashflow_adjusted_change_cents': None, 'withdrawals': {'count': 0, 'amount_cents': 0}, 'positions': [], 'risk': {}},
          'quotes': {'events': [], 'minutes': {'PRIMARY_DOWN': 0, 'NO_QUOTE': 0}, 'held_minutes': 0, 'breaches': [], 'exits_missed': [],
                     'check_errors': 0, 'open': 0},
          'review': {'status': 'NONE'},
@@ -559,9 +571,16 @@ def markdown(d):
         L.append('- 当天没有成交。')
     for x in e.get('dividends', []):
         L.append(f"- 分红入账：{x['name']} {x['qty']} 股 × 每股 {x['cash_per_share']} 元 = {_yuan(x['amount_cents'])} 元（税前，除息日 {x['ex_date']}）。")
+    withdrawals = e.get('withdrawals', {})
+    if withdrawals.get('count'):
+        L.append(f"- 当天模拟利润提取：{withdrawals['count']} 笔，共 {_yuan(withdrawals['amount_cents'])} 元；这是资金流出，不计投资亏损。")
     if e['equity_end_cents'] is not None:
-        change = '' if e['equity_start_cents'] is None else f"，较前一日 {(e['equity_end_cents'] - e['equity_start_cents']) / 100:+,.2f} 元"
-        L.append(f"- 净值 {_yuan(e['equity_end_cents'])} 元{change}；现金 {_yuan(e['cash_end_cents'])} 元（估值于 {_hm(e['marked_at'])}）。")
+        L.append(f"- 总资产 {_yuan(e['equity_end_cents'])} 元；现金 {_yuan(e['cash_end_cents'])} 元（估值于 {_md(e['marked_at'])}）。")
+        if e.get('cashflow_adjusted_change_cents') is not None:
+            L.append(f"- 两次估值之间（{_md(e.get('marked_start_at'))} 至 {_md(e['marked_at'])}）：资产变化 {e['equity_change_cents']/100:+,.2f} 元，"
+                     f"模拟利润提取 {_yuan(e['withdrawal_change_cents'])} 元；剔除提取影响后的投资损益 {e['cashflow_adjusted_change_cents']/100:+,.2f} 元。")
+        else:
+            L.append('- 缺少完整的起始估值，投资损益暂不能计算。')
     if e['positions']:
         L.append('- 持仓：' + '、'.join(f"{x['name']} {x['weight_pct']}%" for x in e['positions']) + '。')
     if e['risk']:
@@ -643,7 +662,8 @@ def rollup(store, config, since, until=None, folder=None, stem=None):
         cursor += timedelta(days=1)
     L = [f'# 运行汇总 {since} 至 {until}（北京时间）', '', '程序根据原始记录生成，不含模型判断；每天的明细见 workflow/digests/<日期>.md。', '',
          '## 逐日概况', '', '“离线 / 停顿”是本机断网和调度停止（睡眠或服务停止）的小时数；“最长间隔”括号里是其中离线或停顿的小时数。', '',
-         '| 日期 | 离线 / 停顿 | 抓取失败 | 模型研究 / 沿用 / 失败 | 组合发布 / 最长间隔 | 成交笔数 | 净值（元） | 复盘 | 需关注 |', '|---|---|---|---|---|---|---|---|---|']
+         '总资产已扣除模拟利润提取，不能直接将资产下降当作亏损；资金流和两次估值间的投资损益见每日日报。', '',
+         '| 日期 | 离线 / 停顿 | 抓取失败 | 模型研究 / 沿用 / 失败 | 组合发布 / 最长间隔 | 成交笔数 | 总资产（元） | 复盘 | 需关注 |', '|---|---|---|---|---|---|---|---|---|']
     for d in days:
         r, p, e, v = d['research'], d['portfolio'], d['execution'], d['availability']
         trades = sum(f['buy'] + f['sell'] for f in e['fills'].values())

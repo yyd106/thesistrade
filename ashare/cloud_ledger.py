@@ -9,7 +9,7 @@ APPEND=('quotes','dynamic_quotes','global_quotes','slots','decisions','paper_ord
 SUPPORT=('snapshots','studies','plans','global_plans','dynamic_news','dynamic_cases')
 BOOT=SUPPORT+APPEND+MUTABLE+('portfolio_runs','portfolio_decisions','reviews','lessons','research_methods','research_improvements','app_users')
 # Advertised by the cloud so a newer research node only uses what the deployed cloud understands.
-FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','cash_dividend_credit','quote_health','notices','supervision_summary','review_news_display_v1','review_news_display_v2','approval_receipts_v1')
+FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','cash_dividend_credit','quote_health','notices','supervision_summary','review_news_display_v1','review_news_display_v2','approval_receipts_v1','simulated_withdrawals_v1')
 PRIMARY={'latest_trade_checks':'symbol'}
 # Appended rows the cloud later updates in place; their updates travel through the change log.
 UPDATED_APPEND=('slots',)
@@ -111,7 +111,7 @@ def _close(store,tables,mutable,support):
                     bucket(ref).append(projection(ref,row));ids(ref).add(key);changed=True
 
 
-def export_ledger_v2(store,body,at,limit=1500):
+def export_ledger_v2(store,body,at,limit=1500,config=None):
     """Incremental replica feed: appended rows by rowid cursor, mutable rows by change-log cursor,
     plus only the referenced rows needed for foreign keys. Size no longer grows with history."""
     if not value(store,'initialized',False):raise ValueError('云端账本尚未初始化')
@@ -152,9 +152,11 @@ def export_ledger_v2(store,body,at,limit=1500):
         # Only asked for by 0.15.6+ research nodes, and only on the last page; older nodes never see the key.
         from .quote_health import changed_since
         from .notices import for_replica
+        from .withdrawals import status as withdrawal_status
         packet['extras']={}
         for key,build in (('quote_health',lambda:changed_since(store,extras['quote_health'],at)),
-                          ('notices',lambda:for_replica(store,extras['notices']))):
+                          ('notices',lambda:for_replica(store,extras['notices'])),
+                          ('withdrawals',lambda:withdrawal_status(store,config or {'deployment_role':'cloud','mode':'paper'},at))):
             if key not in extras:continue
             try:packet['extras'][key]=build()
             except Exception as exc:
@@ -163,8 +165,8 @@ def export_ledger_v2(store,body,at,limit=1500):
     return packet
 
 
-def export_ledger(store,cursors,at,limit=1500,body=None):
-    if body and body.get('protocol')==2:return export_ledger_v2(store,body,at,limit)
+def export_ledger(store,cursors,at,limit=1500,body=None,config=None):
+    if body and body.get('protocol')==2:return export_ledger_v2(store,body,at,limit,config)
     if not value(store,'initialized',False):raise ValueError('云端账本尚未初始化')
     result={};updated={};more=False
     for table in APPEND:
@@ -215,7 +217,7 @@ def import_extras(store,config,extras):
     if not isinstance(extras,dict):return
     from datetime import datetime,timezone
     stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
-    for key,apply in (('quote_health',_mirror_health),('notices',_mirror_notices)):
+    for key,apply in (('quote_health',_mirror_health),('notices',_mirror_notices),('withdrawals',_mirror_withdrawals)):
         if key+'_error' in extras:
             put(store,'extras_error_'+key,{'at':stamp,'error':'云端：'+str(extras[key+'_error'])[:200]});continue
         if key not in extras:continue
@@ -238,6 +240,18 @@ def _mirror_notices(store,data):
     from .notices import mirror
     since=mirror(store,data)
     if since:put(store,'cloud_notices_since',since)
+
+
+def _mirror_withdrawals(store,data):
+    """Only a display/reservation projection; it grants no local transfer authority."""
+    if (not isinstance(data,dict) or data.get('version')!='simulated-withdrawal-v1'
+            or data.get('account_id')!='DEMO_PAPER' or data.get('authority')!='cloud'
+            or type(data.get('current_stage')) is not int or data['current_stage']<1
+            or type(data.get('reserved_cents')) is not int or data['reserved_cents']<0):
+        raise ValueError('模拟提取摘要字段无效')
+    if len(canonical(data))>262144:
+        raise ValueError('模拟提取摘要过长')
+    put(store,'withdrawals',data)
 
 
 def import_ledger(store,config,packet):

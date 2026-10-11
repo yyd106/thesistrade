@@ -161,6 +161,7 @@ class Scheduler:
     def __init__(self,config_path):
         self.config_path=config_path;self.stop=Event();self.pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix='ashare')
         self.futures={};self.last_settle=0;self.last_followups=0;self.last_maintenance=0;self.last_dividends=0
+        self.last_withdrawal_check=None
         self.pending_completions={}
         self.sync_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='cloud-sync');self.sync_future=None;self.last_sync=0
         # Page collection and HTTPS must never occupy the ledger/strategy worker.
@@ -258,6 +259,27 @@ class Scheduler:
                 LOG.exception('Job %s completion could not be saved; will retry next tick',jid)
             else:del self.pending_completions[jid]
 
+    def withdrawal_tick(self,store,config,stamp):
+        if config.get('mode')!='paper' or role(config)=='research':return
+        if role(config)=='cloud':
+            from .cloud_runtime import value
+            if not value(store,'initialized',False):return
+        current=time.monotonic()
+        if self.last_withdrawal_check is not None and current-self.last_withdrawal_check<60:return
+        self.last_withdrawal_check=current
+        from .withdrawals import refresh
+        try:
+            refresh(store,config,stamp)
+        except Exception as exc:
+            LOG.exception('Withdrawal review failed; order transactions still recheck before execution')
+            try:
+                with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('withdrawal_error',?)",(stamp+' '+str(exc)[:300],))
+            except (sqlite3.Error,OSError):LOG.exception('Withdrawal error could not be saved')
+        else:
+            try:
+                with store.db:store.db.execute("DELETE FROM service_state WHERE key='withdrawal_error'")
+            except (sqlite3.Error,OSError):LOG.exception('Withdrawal error could not be cleared')
+
     def tick(self):
         config=load_config(self.config_path);store=Store(config['data_dir'])
         self.poll_seconds=config['scheduler_poll_seconds']
@@ -273,6 +295,7 @@ class Scheduler:
                 with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('tick_at',?)",(stamp,))
             if role(config)=='research':offline=offline_since(store,stamp)
             if role(config)!='research':self.monitor.tick(config)
+            self.withdrawal_tick(store,config,stamp)
             if role(config)=='research':
                 if self.sync_future and self.sync_future.done():
                     try:self.sync_future.result()

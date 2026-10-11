@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from .storage import digest, now, normalize_time
 
 VERSION = 'approval-v1'
-KINDS = {'PROPOSAL_DECISION', 'CONFIG'}
+KINDS = {'PROPOSAL_DECISION', 'CONFIG', 'WITHDRAWAL'}
 REQUEST_FIELDS = {'id', 'version', 'kind', 'subject_id', 'action', 'snapshot', 'summary',
                   'created_at', 'expires_at', 'notice_id', 'hash'}
 RECEIPT_FIELDS = {'id', 'request_id', 'request_hash', 'decision', 'actor', 'authority', 'issued_at'}
@@ -54,7 +54,8 @@ def _validate(value):
         raise ValueError('审批请求版本或来源无效')
     if not all(isinstance(value[k], str) and 0 < len(value[k]) <= 200 for k in ('subject_id', 'action')):
         raise ValueError('审批对象或动作无效')
-    actions = {'APPROVED', 'ADOPTED', 'RETIRED', 'REJECTED', 'SUPERSEDED'} if value['kind'] == 'PROPOSAL_DECISION' else {'APPLY'}
+    actions = ({'APPROVED', 'ADOPTED', 'RETIRED', 'REJECTED', 'SUPERSEDED'} if value['kind'] == 'PROPOSAL_DECISION'
+               else {'TRANSFER', 'CANCEL'} if value['kind'] == 'WITHDRAWAL' else {'APPLY'})
     if value['action'] not in actions or not isinstance(value['snapshot'], dict) or not isinstance(value['summary'], dict):
         raise ValueError('审批动作或冻结预览无效')
     if len(canonical(value).encode()) > 65536:
@@ -89,7 +90,7 @@ def receive_request(store, value):
     return value
 
 
-def create_request(store, *, kind, subject_id, action, snapshot, summary, at=None):
+def create_request(store, *, kind, subject_id, action, snapshot, summary, at=None, notify=True):
     stamp = normalize_time(at or now())
     with atomic(store):
         for row in store.db.execute('''SELECT r.id FROM approval_requests r
@@ -108,11 +109,12 @@ def create_request(store, *, kind, subject_id, action, snapshot, summary, at=Non
                  'notice_id': 'N-' + identity}
         value['hash'] = digest(canonical(value))
         receive_request(store, value)
-        from .notices import insert
-        title = '确认治理变更：' + str(summary.get('title') or subject_id)
-        insert(store, title=title[:80], body='请核对下方冻结的对象、内容版本、动作和替代范围。批准只授权本次动作，程序仍会在实施前再次核验；这不是策略有效性的证明。',
-               kind='DECISION', author='agent', at=stamp, notice_id=value['notice_id'],
-               payload={'deadline': value['expires_at'], 'approval_request': value})
+        if notify:
+            from .notices import insert
+            title = '确认治理变更：' + str(summary.get('title') or subject_id)
+            insert(store, title=title[:80], body='请核对下方冻结的对象、内容版本、动作和替代范围。批准只授权本次动作，程序仍会在实施前再次核验；这不是策略有效性的证明。',
+                   kind='DECISION', author='agent', at=stamp, notice_id=value['notice_id'],
+                   payload={'deadline': value['expires_at'], 'approval_request': value})
         return request_info(store, identity, at=stamp)
 
 
@@ -126,16 +128,23 @@ def _window(request, at):
         raise ValueError('审批请求已过期或尚未生效，请重新申请并由管理员确认')
 
 
+def require_admin_session(store, user, at=None):
+    """Authenticate before inspecting/replaying an operation, without issuing a receipt."""
+    stamp = normalize_time(at or now())
+    token_hash = user.get('token_hash') if isinstance(user, dict) else None
+    session = store.db.execute('''SELECT s.username FROM app_sessions s JOIN app_users u ON u.username=s.username
+        WHERE s.token_hash=? AND s.expires_at>? AND s.created_at<=? AND u.role='ADMIN' ''',
+                              (token_hash, stamp, stamp)).fetchone()
+    if not session or session['username'] != 'admin':
+        raise ValueError('审批须由已登录管理员确认，批准人文字不能授权')
+    return session['username']
+
+
 def approve(store, identity, expected_hash, user, decision='APPROVE', authority='LOCAL_ADMIN', at=None):
     """The HTTP handler supplies the verified session; no named CLI approval exists."""
     stamp = normalize_time(at or now())
     with atomic(store):
-        token_hash = user.get('token_hash') if isinstance(user, dict) else None
-        session = store.db.execute('''SELECT s.username FROM app_sessions s JOIN app_users u ON u.username=s.username
-            WHERE s.token_hash=? AND s.expires_at>? AND s.created_at<=? AND u.role='ADMIN' ''',
-                                  (token_hash, stamp, stamp)).fetchone()
-        if not session or session['username'] != 'admin':
-            raise ValueError('审批须由已登录管理员确认，批准人文字不能授权')
+        actor = require_admin_session(store, user, stamp)
         if authority not in ('LOCAL_ADMIN', 'CLOUD_ADMIN') or decision not in ('APPROVE', 'REJECT'):
             raise ValueError('审批来源或决定无效')
         request = envelope(store, identity)
@@ -148,7 +157,7 @@ def approve(store, identity, expected_hash, user, decision='APPROVE', authority=
             return old
         _window(request, stamp)
         receipt = {'id': 'AC-' + uuid.uuid4().hex, 'request_id': identity, 'request_hash': request['hash'],
-                   'decision': decision, 'actor': session['username'], 'authority': authority, 'issued_at': stamp}
+                   'decision': decision, 'actor': actor, 'authority': authority, 'issued_at': stamp}
         store.db.execute('INSERT INTO approval_receipts VALUES(?,?,?,?,?,?,?)', tuple(receipt[k] for k in
                          ('id', 'request_id', 'request_hash', 'decision', 'actor', 'authority', 'issued_at')))
         return receipt

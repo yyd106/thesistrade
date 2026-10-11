@@ -6,6 +6,7 @@ No inferred or cost-fallback valuations can set a new high-water mark.
 """
 import json
 from decimal import Decimal
+from fractions import Fraction
 from .storage import normalize_time, digest
 from .investment_policy import DRAWDOWN_BPS, enabled
 
@@ -19,6 +20,15 @@ def halted(store):
     return bool(state(store).get('halted'))
 
 
+def capital_units(value, initial=None):
+    ratio = value.get('capital_units_ratio')
+    return Fraction(*ratio) if ratio else Fraction(Decimal(value.get('capital_units', str(initial))))
+
+
+def decimal_ratio(value):
+    return Decimal(value.numerator) / Decimal(value.denominator)
+
+
 def evaluate_inside(store, config, at, account=None):
     """Caller owns transaction. Must commit the latch even when rejecting a BUY."""
     if not enabled(config):
@@ -29,23 +39,24 @@ def evaluate_inside(store, config, at, account=None):
     a = account or account_inside_transaction(store, at)
     at = normalize_time(at)
     previous = state(store)
-    units = Decimal(previous.get('capital_units', str(a['initial_cents'])))
+    units = capital_units(previous, a['initial_cents'])
     peak_nav = Decimal(previous.get('peak_unit_nav', '1'))
-    uncertainty = False
+    uncertainty = previous.get('historical_cashflow_gap', False)
     if 'capital_units' not in previous:
         # Existing installation has no withdrawals. Do not guess unit NAV if an
         # imported history lacks valuations at historical cashflow boundaries.
         uncertainty = a['withdrawn_cents'] != 0
         historical = store.db.execute('SELECT max(equity_cents) FROM equity_marks WHERE complete=1 AND withdrawn_cents=0 AND at<=? AND recorded_at<=?', (at, at)).fetchone()[0]
-        peak_nav = max(peak_nav, Decimal(historical or a['initial_cents'])/units)
+        peak_nav = max(peak_nav, decimal_ratio(Fraction(historical or a['initial_cents'])/units))
     complete = valuation_ready(store, a, at) and not uncertainty
-    nav = Decimal(a['equity_cents'])/units if units > 0 else Decimal(0)
+    nav = decimal_ratio(Fraction(a['equity_cents'])/units) if units > 0 else Decimal(0)
     if complete:
         peak_nav = max(peak_nav, nav)
     drawdown = max(0, int((peak_nav-nav)*10000/peak_nav)) if complete and peak_nav else None
     breached = drawdown is not None and drawdown >= DRAWDOWN_BPS
     result = {**previous, 'halted': previous.get('halted', False) or breached,
-              'capital_units': str(units), 'peak_unit_nav': str(peak_nav), 'unit_nav': str(nav),
+              'capital_units': str(decimal_ratio(units)), 'capital_units_ratio': [units.numerator, units.denominator],
+              'peak_unit_nav': str(peak_nav), 'unit_nav': str(nav),
               'equity_cents': a['equity_cents'], 'drawdown_bps': drawdown,
               'threshold_bps': DRAWDOWN_BPS, 'valuation_complete': complete,
               'checked_at': at, 'basis': 'CASHFLOW_UNITIZED_NAV', 'automatic_resume': False,
@@ -104,11 +115,16 @@ def adjust_withdrawal_inside(store, at, amount_cents):
     """Unit cancellation at the transfer's actual pre-flow portfolio valuation."""
     from .paper import account_inside_transaction
     previous = state(store)
+    if previous.get('historical_cashflow_gap'):
+        raise ValueError('历史提取缺少单位净值依据，需人工复核')
     if 'capital_units' not in previous:
         return
     a = account_inside_transaction(store, at)
     if not valuation_ready(store, a, at) or amount_cents >= a['equity_cents']:
         raise ValueError('提取时估值不足，无法核算单位净值')
-    units = Decimal(previous['capital_units'])*(a['equity_cents']-amount_cents)/a['equity_cents']
-    previous.update(capital_units=str(units), last_transfer_at=at)
+    before_units = capital_units(previous)
+    units = before_units*Fraction(a['equity_cents']-amount_cents, a['equity_cents'])
+    previous.update(capital_units=str(decimal_ratio(units)), capital_units_ratio=[units.numerator, units.denominator],
+                    equity_cents=a['equity_cents']-amount_cents,
+                    unit_nav=str(decimal_ratio(Fraction(a['equity_cents'])/before_units)), last_transfer_at=at)
     store.db.execute('UPDATE portfolio_risk SET updated_at=?,payload_json=? WHERE id=?', (at, json.dumps(previous), 'DEMO_PAPER'))
