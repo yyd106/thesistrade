@@ -656,6 +656,30 @@ for(const track of ['primary','quick'])assert.ok(diagnosticNodes.some(n=>n.tag==
 assert.equal(JSON.stringify(diagnosticFixture),diagnosticBefore);
 assert.equal(workspaceView('#score-diagnostics-section').board,'activity');
 
+// New date-cohort summaries and frozen legacy summaries retain distinct labels.
+const dateCohortDiagnostic={...diagnosticFixture,
+  primary:{...diagnosticFixture.primary,sampling_method:'entry-date-cohort-v1'},
+  quick:{...diagnosticFixture.quick,sampling_method:'entry-date-cohort-v1'}};
+diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,dateCohortDiagnostic);
+const dateCohortOutput=JSON.stringify(diagnosticBox);
+for(const track of descendants(diagnosticBox).filter(n=>n.className?.split(' ').includes('diagnostic-track'))){
+  const output=JSON.stringify(track);
+  for(const text of ['入场日期批次采样：8 份观察；3 个时间簇','按路线和期限','同日标的一起保留','跨期限汇总仍可能重叠','时间簇不保证独立','不是前向预注册','不足 30 个时间簇'])assert.ok(output.includes(text),text);
+  assert.doesNotMatch(output,/持有期不重叠|旧摘要未标注/);
+}
+assert.match(dateCohortOutput,/不同生成时点的摘要也不能累计样本/);
+for(const sampling of [undefined,'legacy-unversioned','unknown','<img src=x onerror=alert(1)>']){
+  diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...dateCohortDiagnostic,
+    primary:{...dateCohortDiagnostic.primary,sampling_method:sampling}});
+  const output=JSON.stringify(descendants(diagnosticBox).filter(n=>n.className?.split(' ').includes('diagnostic-track'))[0]);
+  if(!sampling||sampling==='legacy-unversioned'){
+    assert.match(output,/旧摘要未标注采样版本/);assert.match(output,/旧口径持有期采样/);
+  }else{
+    assert.match(output,/采样版本待核对/);assert.match(output,/口径待核对的采样/);
+  }
+  assert.doesNotMatch(output,/入场日期批次采样|<img|undefined|NaN/);
+}
+
 // Eight empty labels collapse into a single maturity message in each track.
 const emptyDiagnosticGroups=Object.fromEntries(['trend_filter','research_veto','portfolio_allow','global_stance'].map(name=>[name,{WAIT:{daily:{n:0},non_overlapping:{n:0}},LONG:{daily:{n:0},non_overlapping:{n:0}}}]));
 diagnosticBox=new FakeElement('section');drawScoreDiagnostics(diagnosticBox,{...diagnosticFixture,
