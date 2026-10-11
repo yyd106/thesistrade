@@ -83,6 +83,7 @@ BOARDS={'MAIN':('sh600','sh601','sh603','sh605','sz000','sz001','sz002','sz003')
 LIMIT_GUARD={'MAIN':0.095,'CHINEXT':0.195,'STAR':0.195}
 # Risk warning (ST/*ST/S*ST), delisting arrangement (退), first-days listing prefixes (N/C + Chinese name).
 SPECIAL_NAME=re.compile(r'^S?\*?ST|退|^[NC](?=[^\x00-\x7f])')
+ST_NAME=re.compile(r'^S?\*?ST')
 
 
 def board(symbol):
@@ -107,9 +108,12 @@ def sell_quantity(symbol,wanted,held,sellable):
     return wanted
 
 
-def market_guard(symbol,q):
+def market_guard(symbol,q,side='BUY'):
     if not board(symbol):return 'UNSUPPORTED_BOARD'
-    if SPECIAL_NAME.search((q.get('name') or '').strip().upper()):return 'SPECIAL_SECURITY'
+    name=(q.get('name') or '').strip().upper()
+    # Risk-warning status forbids entry, not liquidation of an existing holding.
+    # Keep the other special-security and near-limit protections unchanged.
+    if SPECIAL_NAME.search(name) and not (side=='SELL' and ST_NAME.match(name) and '退' not in name):return 'SPECIAL_SECURITY'
     if abs(q['price_cents']/q['prev_close_cents']-1)>=LIMIT_GUARD[board(symbol)]:return 'NEAR_PRICE_LIMIT_OR_CORPORATE_ACTION'
     return None
 
@@ -140,7 +144,7 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
             raise ValueError('PLAN_INACTIVE')
         if phase(at)!='CONTINUOUS':raise ValueError('MARKET_CLOSED')
         if not quote_ok(q,config,at):raise ValueError('STALE_QUOTE')
-        guard=market_guard(symbol,q)
+        guard=market_guard(symbol,q,side)
         if guard:raise ValueError(guard)
         a=account_inside_transaction(store,at)
         p=a['positions'].get(symbol,{'qty':0,'sellable_qty':0,'cost_cents':0})
@@ -252,7 +256,15 @@ def settle(store,config,at):
                 from .plan_recheck import check
                 if halted(store) or check(store,config,dict(plan),at):
                     store.db.execute("UPDATE paper_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
-            if phase(at)!='CONTINUOUS' or not quote_ok(q,config,at) or q['observed_at']<=o['created_at'] or market_guard(o['symbol'],q):continue
+                if quote_ok(q,config,at):
+                    from .slots import hard_reason
+                    params=json.loads(plan['payload_json']);levels=params.get('levels') or {}
+                    # A standing limit order may improve on the entry price, but it must
+                    # not keep adding shares after this plan or holding requires exit.
+                    if (q['price_cents']<=levels.get('stop_cents',0) or
+                            hard_reason(q,positions(store,at).get(o['symbol']),params,config)):
+                        store.db.execute("UPDATE paper_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
+            if phase(at)!='CONTINUOUS' or not quote_ok(q,config,at) or q['observed_at']<=o['created_at'] or market_guard(o['symbol'],q,o['side']):continue
             if store.db.execute('SELECT 1 FROM paper_fills WHERE order_id=? AND quote_id=?',(o['id'],q['id'])).fetchone():continue
             price=(q['price_cents']*(10000+order_config['paper_slippage_bps'])+9999)//10000 if o['side']=='BUY' else q['price_cents']*(10000-order_config['paper_slippage_bps'])//10000
             if (o['side']=='BUY' and price>o['limit_cents']) or (o['side']=='SELL' and price<o['limit_cents']):continue

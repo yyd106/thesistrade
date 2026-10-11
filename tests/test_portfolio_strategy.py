@@ -186,9 +186,10 @@ class PortfolioStrategyTests(unittest.TestCase):
         self.cfg['paper_max_fill_qty']=10000
         self.news=dynamic_fixtures.DynamicTests.news.__get__(self);self.case=dynamic_fixtures.DynamicTests.case.__get__(self)
         c=self.case();q=dynamic_fixtures.DynamicTests.quote(self)
-        with patch('ashare.dynamic.eligibility',return_value=([],{'passed':True})):
-            self.approve({'dynamic:'+c['id']:{'action':'ALLOW','target_bps':500}})
-            order=dp.submit(self.store,self.cfg,c,'BUY',q,self.at,'test')
+        self.cfg['watchlist']=[{'symbol':SYMBOL,'name':c['name']}]
+        dynamic_fixtures.DynamicTests.prepare_execution(self,c,self.at)
+        self.approve({'dynamic:'+c['id']:{'action':'ALLOW','target_bps':500}})
+        order=dp.submit(self.store,self.cfg,c,'BUY',q,self.at,'test')
         self.assertIn('id',order,order);self.assertLessEqual(order['reserved_cents'],500000)
         dynamic_fixtures.DynamicTests.quote(self,at=self.later(60));self.assertEqual(len(dp.settle(self.store,self.cfg,self.later(60))),1)
         at=normalize_time('2026-09-16T10:00:00+08:00');q=dynamic_fixtures.DynamicTests.quote(self,at=at)

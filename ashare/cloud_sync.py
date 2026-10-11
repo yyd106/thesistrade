@@ -1,5 +1,6 @@
 """Compact strategy publications, completed-research receipts and cloud ledger feedback."""
-import json
+import json,uuid
+from contextlib import contextmanager
 from datetime import datetime,timedelta
 from .storage import now,normalize_time,digest,json_write
 from .cloud_protocol import role,canonical,packed,request
@@ -277,19 +278,22 @@ def handle(store,config,path,body,at):
         put(store,'execution_enabled',True);return {'status':'ACTIVE'}
     if path=='/api/sync/invalidate':
         changed=normalize_time(body['changed_at'])
-        if abs((datetime.fromisoformat(at)-datetime.fromisoformat(changed)).total_seconds())>300:raise ValueError('失效通知时间无效')
-        keys=body.get('keys')
-        if changed>value(store,'research_completed_at',''):
-            if isinstance(keys,list) and keys and '*' not in keys:
+        # The signed request has its own replay window. An event can legitimately
+        # be older after an outage; its business timestamp must survive retries.
+        if (datetime.fromisoformat(changed)-datetime.fromisoformat(normalize_time(at))).total_seconds()>300:raise ValueError('失效通知时间无效')
+        keys=_invalidation_keys(body['keys']) if 'keys' in body else None
+        targeted=keys is not None and '*' not in keys
+        applied=changed>value(store,'research_completed_at','')
+        if applied:
+            if targeted:
                 # Only the listed candidates (and decisions depending on them) stop buying.
-                if len(keys)>200 or any(not isinstance(k,str) or not 3<=len(k)<=120 for k in keys):raise ValueError('失效标的格式无效')
                 current=value(store,'invalidated_keys') or {}
                 for k in keys:current[k]=max(current.get(k,''),changed)
                 put(store,'invalidated_keys',current)
-            else:put(store,'invalidated_at',changed)
+            else:put(store,'invalidated_at',max(value(store,'invalidated_at',''),changed))
             from .portfolio_strategy import cancel_incompatible_buys
             cancel_incompatible_buys(store,config,at,'research-invalidation')
-        return {'status':'ACCEPTED','scope':'KEYS' if isinstance(keys,list) and keys and '*' not in keys else 'ALL'}
+        return {'status':'ACCEPTED','scope':'KEYS' if targeted else 'ALL','outcome':'APPLIED' if applied else 'COVERED'}
     if path=='/api/sync/notices':
         from .notices import receive
         return receive(store,body,at)
@@ -443,11 +447,48 @@ def deliver_page_display(store,config,*,cancel_event=None):
     return answer
 
 
+def _invalidation_keys(keys):
+    if (not isinstance(keys,list) or not keys or len(keys)>200 or
+        any(not isinstance(k,str) or (k!='*' and not 3<=len(k)<=120) for k in keys) or
+        len(set(keys))!=len(keys)):
+        raise ValueError('失效标的格式无效')
+    return keys
+
+
+@contextmanager
+def _invalidation_write(store):
+    """Serialize read/modify/write without committing a caller's transaction."""
+    nested=store.db.in_transaction
+    if nested:store.db.execute('SAVEPOINT cloud_invalidation')
+    else:store.db.execute('BEGIN IMMEDIATE')
+    try:
+        if nested:
+            # SAVEPOINT alone does not lock out writers. Acquire the write lock
+            # before reading, including when the pending row does not exist.
+            # A stale outer read snapshot fails here; its owner must roll back
+            # and retry the outer transaction instead of overwriting newer data.
+            store.db.execute("UPDATE cloud_state SET value=value WHERE key='pending_invalidation'")
+        yield
+        if nested:store.db.execute('RELEASE cloud_invalidation')
+        else:store.db.commit()
+    except BaseException:
+        if nested:
+            store.db.execute('ROLLBACK TO cloud_invalidation')
+            store.db.execute('RELEASE cloud_invalidation')
+        else:store.db.rollback()
+        raise
+
+
 def queue_invalidation(store,keys,at):
     """Persist revocation before networking; failed sends survive process restarts."""
-    prior=value(store,'pending_invalidation') or {}
-    combined=set(prior.get('keys',[]))|set(keys)
-    with store.db:put(store,'pending_invalidation',{'changed_at':max(at,prior.get('changed_at','')),'keys':sorted(combined)})
+    keys=_invalidation_keys(keys);at=normalize_time(at)
+    with _invalidation_write(store):
+        prior=value(store,'pending_invalidation') or {}
+        combined=set(prior.get('keys',[]))|set(keys)
+        # A wildcard bounds the queue when accumulated events exceed one packet.
+        if '*' in combined or len(combined)>200:combined={'*'}
+        put(store,'pending_invalidation',{'changed_at':max(at,prior.get('changed_at','')),
+            'keys':sorted(combined),'revision':uuid.uuid4().hex})
 
 
 def deliver_invalidation(store,config):
@@ -456,7 +497,7 @@ def deliver_invalidation(store,config):
     body={'changed_at':pending['changed_at']}
     if '*' not in pending['keys'] and remote_supports(store,'targeted_invalidation'):body['keys']=pending['keys']
     result=request(config,'/api/sync/invalidate',body)
-    with store.db:
+    with _invalidation_write(store):
         # Another worker may have appended a later revocation while this request ran.
         if value(store,'pending_invalidation')==pending:put(store,'pending_invalidation',None)
         put(store,'last_invalidation',{**body,'receipt':result,'acknowledged_at':now()})

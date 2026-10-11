@@ -220,6 +220,7 @@ class DynamicAuditTests(unittest.TestCase):
     case = dyn.DynamicTests.case
     quote = dyn.DynamicTests.quote
     buy = dyn.DynamicTests.buy
+    prepare_execution = dyn.DynamicTests.prepare_execution
     fill = dyn.DynamicTests.fill
 
     def checks(self):
