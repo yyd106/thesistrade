@@ -40,9 +40,24 @@ class DynamicTests(unittest.TestCase):
   with self.store.db:self.store.db.execute('INSERT OR IGNORE INTO dynamic_quotes VALUES(?,?,?,?,?,?,?,?)',(identity,symbol,'海康威视',price,1000,at,at,'synthetic'))
   return ds.latest_quote(self.store,symbol,at)
  def buy(self,c,at=None):
-  at=at or self.at;q=self.quote(at)
-  with patch('ashare.dynamic.eligibility',return_value=([],{'passed':True})):
-   return dp.submit(self.store,self.cfg,c,'BUY',q,at,'synthetic eligibility')
+  at=at or self.at;self.prepare_execution(c,at);q=self.quote(at,symbol=c['symbol'])
+  return dp.submit(self.store,self.cfg,c,'BUY',q,at,'synthetic eligibility')
+ def prepare_execution(self,c,at):
+  """Real eligibility inputs stay valid for submission and every partial fill."""
+  from ashare.calendar import last_completed_day
+  if not dynamic.history_stats(self.store,c['symbol'],c['event_type'],c['direction'],at)['passed']:
+   base=datetime.fromisoformat(at)-timedelta(days=220)
+   for i in range(30):
+    started=base+timedelta(days=i*7);ended=started+timedelta(days=3)
+    h=self.case('execution-history:'+c['symbol']+':'+str(i),started.isoformat(),symbol=c['symbol'])
+    with self.store.db:
+     self.store.db.execute("UPDATE dynamic_cases SET status='CLOSED' WHERE id=?",(h['id'],))
+     self.store.db.execute('INSERT INTO dynamic_observations VALUES(?,?,?,?,?,?)',
+      (h['id'],started.isoformat(),ended.isoformat(),ended.isoformat(),'FORWARD',json.dumps({'status':'MEASURED','net_return_bps':150,'excess_return_bps':100})))
+  market={'name':c['name'],'bars':[[last_completed_day(at),1000]],'announcement_checked_at':at,'announcement_status':'OK','announcements':[]}
+  with self.store.db:
+   self.store.db.execute("INSERT OR REPLACE INTO dynamic_state VALUES('news_watermark',?)",(at,))
+   self.store.db.execute('INSERT OR REPLACE INTO dynamic_market VALUES(?,?,?)',(c['symbol'],at,json.dumps(market)))
  def fill(self,at='2026-09-15T10:00:10+08:00',price=1000):
   at=normalize_time(at);self.quote(at,price);return dp.settle(self.store,self.cfg,at)
  def original_plan(self):
@@ -133,7 +148,7 @@ class DynamicTests(unittest.TestCase):
   a=account(self.store,normalize_time('2026-09-16T10:00:10+08:00'));self.assertEqual(a['positions'][SYMBOL]['qty'],original_qty);self.assertFalse(a['dynamic_positions'])
  def test_dynamic_holdings_never_enter_original_slot_scope(self):
   c=self.case(symbol='sh600547');q=self.quote(symbol='sh600547')
-  with patch('ashare.dynamic.eligibility',return_value=([],{})):o=dp.submit(self.store,self.cfg,c,'BUY',q,self.at,'test')
+  self.prepare_execution(c,self.at);o=dp.submit(self.store,self.cfg,c,'BUY',q,self.at,'test')
   later=normalize_time('2026-09-15T10:00:10+08:00');self.quote(later,symbol='sh600547');dp.settle(self.store,self.cfg,later)
   self.original_plan();result=self.original_slot('2026-09-15T10:01:00+08:00')
   self.assertEqual({d['symbol'] for d in result['decisions']},{SYMBOL})
