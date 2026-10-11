@@ -81,13 +81,14 @@ def status(config, *, overview=False, page_diagnostics=True):
         from .observation import view as observation_view
         from .cloud_dashboard import add_strategy_times
         from .supervision import view as supervision_view
+        from .withdrawals import status as withdrawal_status
         return add_strategy_times(store,{'deployment_role':config.get('deployment_role','standalone'),'version':__version__,'at':at,'mode':config['mode'],'live_execution':False,'model_auth':'CHATGPT_SUBSCRIPTION',
             'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,
             'market_phase':phase(at),'quote_max_age_seconds':config['quote_max_age_seconds'],'schedule':{'collection':config['collection_times'],'slots':config['slot_times'],'review':config['review_time'],
                                                'execution_mode':config['slot_execution_mode']},
             'fixed_watchlist':config['watchlist'],'watchlist':plans,'observation':observation_view(store,at,config),'dynamic':dynamic_view(store,config,at,page_diagnostics=page_diagnostics),'account':a,'reviews':reviews,'followups':followup_view(store,at),
             'industry':__import__('ashare.industry_presentation',fromlist=['current']).current(__import__('ashare.industry',fromlist=['view']).view(store,config,at),at),
-            'supervision':supervision_view(store),
+            'supervision':supervision_view(store),'withdrawals':withdrawal_status(store,config,at),
             'next_runs':next_runs(config,at),'portfolio':portfolio(store,config,a,at),
             'trade_effects':trade_effects(store,config,at),'portfolio_strategy':portfolio_strategy_view(store,config,at),
             'active_jobs':[dict(r) for r in store.db.execute("SELECT * FROM jobs WHERE status IN ('PENDING','RUNNING') ORDER BY scheduled_at")],
@@ -191,6 +192,26 @@ def make_handler(config_path,token,port):
                         for key in ('jobs','active_jobs','source_checks','background_failures','notices'):value[key]=[]
                         value['state']={k:v for k,v in value['state'].items() if k=='heartbeat'}
                     self.send(200,value)
+                elif path.path in ('/api/withdrawals','/api/withdrawals/result'):
+                    from .withdrawals import status as withdrawal_status
+                    if path.path.endswith('/result'):
+                        if user['role']!='ADMIN':
+                            self.send(403,{'code':'ADMIN_REQUIRED','error':'仅管理员可核对模拟提取结果。'});return
+                        if cfg.get('deployment_role')!='cloud':
+                            self.send(403,{'code':'CLOUD_REQUIRED','error':'请在云端工作台核对模拟提取结果。'});return
+                    store=Store(cfg['data_dir'])
+                    try:
+                        if path.path=='/api/withdrawals':
+                            self.send(200,withdrawal_status(store,cfg,now()))
+                        else:
+                            from .approvals import request_info
+                            query=urllib.parse.parse_qs(path.query)
+                            result=request_info(store,query.get('approval_id',[''])[0])
+                            if result['kind']!='WITHDRAWAL':raise ValueError('不是模拟提取操作。')
+                            self.send(200,{'request_id':result['id'],'status':result['status'],
+                                'approval':{key:result[key] for key in ('id','kind','action','hash','expires_at','snapshot')} if not result['consumption'] else None,
+                                'result':result['consumption']['result'] if result['consumption'] else None})
+                    finally:store.close()
                 elif path.path=='/api/observations':
                     from .observation import view as observation_view
                     query=urllib.parse.parse_qs(path.query);offset=int(query.get('offset',['0'])[0])
@@ -322,6 +343,26 @@ def make_handler(config_path,token,port):
                         row=decide(store,body['id'],body['action'],user,expected_hash=body.get('expected_hash'),
                                    authority='CLOUD_ADMIN' if cfg.get('deployment_role')=='cloud' else 'LOCAL_ADMIN')
                         self.send(200,{'id':row['id'],'status':row['status'],'answered_at':row['acked_at']})
+                    finally:store.close()
+                elif self.path in ('/api/withdrawals/request','/api/withdrawals/execute'):
+                    if cfg.get('deployment_role')!='cloud':
+                        self.send(403,{'code':'CLOUD_REQUIRED','error':'模拟提取须在云端工作台由管理员确认。'});return
+                    from . import withdrawals
+                    preview=self.path.endswith('/request')
+                    fields={'action'} if preview else {'approval_id','expected_hash'}
+                    if set(body)!=fields or any(not isinstance(body[k],str) for k in fields):
+                        raise ValueError('模拟提取请求内容无效。')
+                    if preview and body['action'] not in ('TRANSFER','CANCEL'):
+                        raise ValueError('模拟提取只支持提取或取消未完成部分。')
+                    store=Store(cfg['data_dir'])
+                    try:
+                        result=(withdrawals.request(store,cfg,now(),action=body['action']) if preview else
+                                withdrawals.execute(store,cfg,body['approval_id'],user,body['expected_hash'],now()))
+                        conflict=result['status'] in ('STALE','BLOCKED','REVIEW_REQUIRED')
+                        if conflict:
+                            result={**result,'error':('资产或计划已变化，请重新查看并生成预览。' if result['status']=='STALE' else
+                                '当前条件未满足或需要复核，请查看模拟提取中的阻塞原因。')}
+                        self.send(409 if conflict else 200,result)
                     finally:store.close()
                 elif self.path=='/api/settings':
                     if cfg.get('deployment_role')=='cloud':raise auth.AuthError('交易配置由本地研究端管理',403)

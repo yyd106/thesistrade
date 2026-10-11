@@ -197,7 +197,7 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
             elif command=='review':result=run_review(store,config,end,use_model)
             elif command=='settle':
                 refresh_market(store,config,False)
-                result={'fills':settle(store,config,now()),'account':mark_equity(store,now())}
+                result={'fills':settle(store,config,now()),'account':mark_equity(store,now(),config)}
             else:raise ValueError('未知阶段')
             if config.get('industry_enabled'):
                 from .universe import reconcile

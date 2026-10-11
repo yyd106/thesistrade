@@ -65,6 +65,8 @@ def submit(store, config, symbol, side, q, plan, item, at):
     from . import portfolio_strategy as ps
     if side not in ('BUY', 'SELL'):
         raise ValueError('无效方向')
+    from .withdrawals import refresh as refresh_withdrawals, refresh_inside, pending
+    refresh_withdrawals(store,config,at)
     refresh(store, config, at)
     intent = (plan['id'] if plan else symbol)+':'+side+(':'+at[:16] if side == 'SELL' else '')
     if side=='BUY' and ps.enabled(config):
@@ -72,6 +74,9 @@ def submit(store, config, symbol, side, q, plan, item, at):
         intent+=':portfolio:'+(d['portfolio_id'] if d else 'pending')
     store.db.execute('BEGIN IMMEDIATE')
     try:
+        refresh_inside(store,config,at)
+        if side=='BUY' and pending(store):
+            store.db.commit();return {'status':'BLOCKED','reason':'WITHDRAWAL_PENDING'}
         from .portfolio_risk import evaluate_inside,valuation_ready
         risk=evaluate_inside(store,config,at)
         if side=='BUY' and risk['halted']:
@@ -97,7 +102,7 @@ def submit(store, config, symbol, side, q, plan, item, at):
             blockers = eligibility(store, dict(current) if current else None, item, at)
             if blockers:
                 raise ValueError('；'.join(blockers))
-            if p or not valuation_ready(store,a,at) or a['withdrawal_reserved_cents']:
+            if p or not valuation_ready(store,a,at) or a['withdrawal_pending']:
                 raise ValueError('已有持仓、估值缺失或提取处理中')
             content = json.loads(current['payload_json']);levels = content['levels']
             if not levels['buy_low_micros'] <= q['price_micros'] <= levels['buy_high_micros']:
@@ -149,6 +154,8 @@ def settle(store, config, at, selected):
     from .cloud_runtime import execution_allowed,fence
     execution_allowed(store,config,at)
     fence(store,config,at)
+    from .withdrawals import refresh as refresh_withdrawals, refresh_inside, pending
+    refresh_withdrawals(store,config,at)
     from .paper import account_inside_transaction, fee
     from .portfolio_risk import refresh, halted, valuation_ready
     from .global_research import eligibility
@@ -157,6 +164,7 @@ def settle(store, config, at, selected):
     fills = []
     from . import portfolio_strategy as ps
     try:
+        refresh_inside(store,config,at)
         for row in store.db.execute("SELECT * FROM global_orders WHERE status IN ('OPEN','PARTIAL') ORDER BY created_at,id").fetchall():
             o = dict(row)
             def cancel(status='CANCELLED'):
@@ -164,7 +172,7 @@ def settle(store, config, at, selected):
             if o['expires_at'] <= at:
                 cancel('EXPIRED');continue
             plan = store.db.execute('SELECT * FROM global_plans WHERE id=?', (o['plan_id'],)).fetchone()
-            if o['side'] == 'BUY' and (halted(store) or eligibility(store, dict(plan) if plan else None, selected.get(o['symbol']), at)):
+            if o['side'] == 'BUY' and (pending(store) or halted(store) or eligibility(store, dict(plan) if plan else None, selected.get(o['symbol']), at)):
                 cancel();continue
             q = latest(store, o['symbol'], at)
             limit_age = FX_SELL_MAX_AGE if o['side'] == 'SELL' else FX_BUY_MAX_AGE
@@ -256,6 +264,6 @@ def tick(store, config, at=None, fetch_quotes=True):
             result = submit(store, config, symbol, 'SELL' if reason else 'BUY', q, plan, selected[symbol], at)
             results.append({'symbol': symbol, **result})
     from .paper import mark_equity
-    mark_equity(store, at)
+    mark_equity(store, at, config)
     return {'status': 'SUCCEEDED', 'market': market, 'fills': len(fills), 'submitted': sum('id' in r for r in results),
             'checks': [{'symbol': r['symbol'], 'status': r['status'], 'reason': r.get('reason')} for r in results]}

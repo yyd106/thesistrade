@@ -189,7 +189,7 @@ def run_slot(store,config,scheduled_at=None,use_model=True,refresh_fn=None,model
                 if not refresh_fn and config.get('background_market_enabled') else refresh(store,config,True))
         cutoff=normalize_time(clock())
         settle(store,config,cutoff)
-        a=mark_equity(store,cutoff)
+        a=mark_equity(store,cutoff,config)
         from .portfolio_risk import refresh as refresh_risk, halted
         risk_state=refresh_risk(store,config,cutoff)
         symbols=sorted({i['symbol'] for i in company_targets(store,config,cutoff)}|set(a['positions']))

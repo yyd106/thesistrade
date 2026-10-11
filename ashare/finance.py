@@ -32,6 +32,45 @@ def total_profit(equity_cents, withdrawn_cents, external_capital_cents):
     return equity_cents + withdrawn_cents - external_capital_cents
 
 
+def transfer_inside(store, at, amount_cents, reference):
+    """Book an already-authorized whole simulated transfer in its caller's lock."""
+    from fractions import Fraction
+    from .paper import account_inside_transaction
+    from . import portfolio_risk
+    if not store.db.in_transaction:
+        raise RuntimeError('提取记账需要资金事务')
+    if not isinstance(amount_cents, int) or isinstance(amount_cents, bool) or amount_cents <= 0:
+        raise ValueError('提取金额必须为正整数分')
+    before = account_inside_transaction(store, at)
+    risk = portfolio_risk.state(store)
+    if 'capital_units' not in risk or risk.get('historical_cashflow_gap'):
+        raise ValueError('单位净值依据不足')
+    if amount_cents > before['cash_cents'] or amount_cents >= before['equity_cents']:
+        raise ValueError('模拟可取现金不足')
+    units = portfolio_risk.capital_units(risk)
+    if units <= 0:
+        raise ValueError('单位份额无效')
+    portfolio_risk.adjust_withdrawal_inside(store, at, amount_cents)
+    identity = digest(reference)
+    store.db.execute('INSERT INTO paper_flows VALUES(?,?,?,?,?,?)',
+                     (identity, before['id'], 'SIMULATED_WITHDRAWAL', -amount_cents, reference, at))
+    store.db.execute('UPDATE paper_accounts SET cash_cents=cash_cents-?,withdrawn_cents=withdrawn_cents+? WHERE id=?',
+                     (amount_cents, amount_cents, before['id']))
+    after = account_inside_transaction(store, at)
+    adjusted = portfolio_risk.state(store)
+    if (after['cash_cents'] != before['cash_cents']-amount_cents
+            or after['equity_cents'] != before['equity_cents']-amount_cents
+            or after['withdrawn_cents'] != before['withdrawn_cents']+amount_cents
+            or total_profit(after['equity_cents'], after['withdrawn_cents'], after['initial_cents']) !=
+               total_profit(before['equity_cents'], before['withdrawn_cents'], before['initial_cents'])
+            or Fraction(before['equity_cents'])/units != Fraction(after['equity_cents'])/portfolio_risk.capital_units(adjusted)
+            or adjusted.get('halted') != risk.get('halted') or adjusted.get('peak_unit_nav') != risk.get('peak_unit_nav')):
+        raise ValueError('模拟提取对账不一致')
+    return {'flow_id': identity, 'amount_cents': amount_cents, 'before_cash_cents': before['cash_cents'],
+            'after_cash_cents': after['cash_cents'], 'before_equity_cents': before['equity_cents'],
+            'after_equity_cents': after['equity_cents'], 'withdrawn_cents': after['withdrawn_cents']}
+
+
 class PaperLedger:
     def __init__(self, store):
         self.db = store.db
@@ -56,6 +95,8 @@ class PaperLedger:
             a = self.db.execute("SELECT * FROM paper_accounts WHERE id=?", (account,)).fetchone()
             if not a:
                 raise ValueError("模拟账户未初始化")
+            if self.db.execute('SELECT 1 FROM withdrawal_cycles WHERE account_id=? AND stage=?', (account, a['current_stage'])).fetchone():
+                raise ValueError('本档已由管理员模拟提取闭环管理，不能创建旧式计划')
             old = self.db.execute("SELECT * FROM paper_withdrawals WHERE account_id=? AND stage=?", (account, a["current_stage"])).fetchone()
             if old:
                 self.db.commit()
@@ -83,6 +124,8 @@ class PaperLedger:
             w = self.db.execute("SELECT * FROM paper_withdrawals WHERE id=?", (withdrawal_id,)).fetchone()
             if not w:
                 raise ValueError("未知提取周期")
+            if self.db.execute('SELECT 1 FROM withdrawal_cycles WHERE account_id=? AND stage=?', (w['account_id'], w['stage'])).fetchone():
+                raise ValueError('本档已由管理员模拟提取闭环管理，旧测试入口不能记账')
             if old:
                 if old["id"] != digest(withdrawal_id + ":" + reference) or old["amount_cents"] != -amount_cents:
                     raise ValueError("凭证重复但内容不一致")

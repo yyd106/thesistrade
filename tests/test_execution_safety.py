@@ -269,8 +269,9 @@ class ExecutionSafetyTests(unittest.TestCase):
                    'event_fingerprint': digest(json.dumps([], ensure_ascii=False, sort_keys=True)),
                    'levels': {'buy_low_micros': 99_000_000, 'buy_high_micros': 101_000_000}}
         with self.store.db:
-            # Synthetic realized gains allow an entry larger than the CNY 5,000 fill cap.
-            self.store.db.execute('UPDATE paper_accounts SET cash_cents=20000000')
+            # Keep gains below the first withdrawal threshold while allowing an
+            # entry larger than the CNY 5,000 fill cap (5% of CNY 140,000).
+            self.store.db.execute('UPDATE paper_accounts SET cash_cents=14000000')
             self.store.db.execute('INSERT INTO global_plans VALUES(?,?,?,?,?,?,?)',
                                   ('global-plan', 'BTC', self.at, self.end, 'synthetic', 'ACTIVE', json.dumps(payload)))
         plan = dict(self.store.db.execute('SELECT * FROM global_plans').fetchone())

@@ -53,6 +53,8 @@ def submit(store,config,case,side,q,at,reason):
  at=normalize_time(at)
  if config['mode']!='paper':return {'status':'BLOCKED','reason':'当前为研究模式'}
  if side not in ('BUY','SELL'):raise ValueError('无效方向')
+ from .withdrawals import refresh as refresh_withdrawals,refresh_inside,pending
+ refresh_withdrawals(store,config,at)
  cid=case['id'];sym=case['symbol']
  # A BUY is a single intent for the entire case, even after it expires/fills.
  # SELL can retry after an unfilled order expires, using a new minute key.
@@ -65,6 +67,9 @@ def submit(store,config,case,side,q,at,reason):
  if side=='BUY' and halted(store):return {'status':'BLOCKED','reason':'ACCOUNT_DRAWDOWN_HALT'}
  store.db.execute('BEGIN IMMEDIATE')
  try:
+  refresh_inside(store,config,at)
+  if side=='BUY' and pending(store):
+   store.db.commit();return {'status':'BLOCKED','reason':'WITHDRAWAL_PENDING'}
   from .portfolio_risk import evaluate_inside
   risk=evaluate_inside(store,config,at)
   if side=='BUY' and risk['halted']:
@@ -89,7 +94,7 @@ def submit(store,config,case,side,q,at,reason):
    if p['qty'] or store.db.execute('SELECT 1 FROM dynamic_lots WHERE symbol=? AND qty>0',(sym,)).fetchone():raise ValueError('动态线路已持有该股票')
    low,high=plan.get('buy_low_cents',0),plan.get('buy_high_cents',0)
    if not low<=q['price_cents']<=high:raise ValueError('已超出事件入场区间')
-   if a['withdrawal_reserved_cents']:raise ValueError('共用底池有待处理提取')
+   if a['withdrawal_pending']:raise ValueError('共用底池有待处理提取')
    if not a['valuation_complete']:raise ValueError('共用底池持仓估值不完整')
    limit=min(high,(q['price_cents']*(10000+config['paper_slippage_bps'])+9999)//10000)
    own=a['positions'].get(sym,{}).get('qty',0)+a.get('dynamic_positions',{}).get(sym,{}).get('qty',0)
@@ -130,15 +135,18 @@ def settle(store,config,at):
  fence(store,config,at)
  from .paper import quote_ok,market_guard,fee
  at=normalize_time(at);fills=[]
+ from .withdrawals import refresh as refresh_withdrawals,refresh_inside,pending
+ refresh_withdrawals(store,config,at)
  from . import portfolio_strategy as ps
  from .paper import account_inside_transaction
  from .portfolio_risk import refresh,halted
  refresh(store,config,at)
  store.db.execute('BEGIN IMMEDIATE')
  try:
+  refresh_inside(store,config,at)
   for row in store.db.execute("SELECT * FROM dynamic_orders WHERE status IN ('OPEN','PARTIAL') ORDER BY created_at,id").fetchall():
    o=dict(row);terms=json.loads(o['terms_json']);terms={**config,**terms}
-   if o['side']=='BUY' and halted(store):
+   if o['side']=='BUY' and (pending(store) or halted(store)):
     store.db.execute("UPDATE dynamic_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
    case=dict(store.db.execute('SELECT * FROM dynamic_cases WHERE id=?',(o['case_id'],)).fetchone())
    if o['expires_at']<=at or (o['side']=='BUY' and (case['status'] not in ('READY','HOLDING') or case['expires_at']<=at)):

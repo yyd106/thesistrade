@@ -20,7 +20,8 @@ def pull(store,config):
         packet=request(config,'/api/sync/ledger',{'cursors':value(store,'ledger_cursors',{}),'protocol':2,
             'change_cursor':value(store,'ledger_change_cursor'),'support_since':value(store,'ledger_support_since'),
             'extras':{'quote_health':value(store,'quote_health_since'),
-                      'notices':{'since':value(store,'cloud_notices_since'),'known':notices_unresolved(store)}}})
+                      'notices':{'since':value(store,'cloud_notices_since'),'known':notices_unresolved(store)},
+                      'withdrawals':True}})
         ledger.import_ledger(store,config,packet)
         if not packet['more']:return packet
     raise RuntimeError('账本仍在分页同步，完成前不进行组合决策或复盘')
@@ -269,7 +270,7 @@ def receive_display(store,body):
 
 def handle(store,config,path,body,at):
     if path=='/api/sync/bootstrap':return ledger.import_bootstrap(store,config,body,at)
-    if path=='/api/sync/ledger':return ledger.export_ledger(store,body.get('cursors',{}),at,body=body)
+    if path=='/api/sync/ledger':return ledger.export_ledger(store,body.get('cursors',{}),at,body=body,config=config)
     if path=='/api/sync/strategy':return receive_strategy(store,config,body,at)
     if path=='/api/sync/activate':
         if body.get('local_execution_disabled') is not True:raise ValueError('必须先停用本地交易执行')

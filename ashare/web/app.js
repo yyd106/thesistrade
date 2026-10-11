@@ -45,7 +45,8 @@ class LocalApi {
       });
       if (response.ok) return data;
       if (response.status===403 && data.code==='SESSION_EXPIRED' && attempt===0) continue;
-      throw new ApiError(readableError(data.error) || '操作未完成，请稍后重试。','HTTP',response.status);
+      const error=new ApiError(readableError(data.error) || '操作未完成，请稍后重试。','HTTP',response.status);
+      error.payload=data;throw error;
     }
   }
 }
@@ -111,6 +112,116 @@ const decisionReason = value => String(value||'').replace(/\b[A-Z][A-Z_]{3,}\b/g
 }[code]||blockerNames[code]||names[code]||'其他交易条件待核实'));
 const brief = text => { const t=String(text||''); const sentence=t.match(/^.{12,180}?[。！？]/u);return sentence?sentence[0]:t.length>130?t.slice(0,130)+'…':t; };
 let state=null, editing=false, refreshing=false, connected=false;
+let withdrawalPreview=null,withdrawalBusy=false,withdrawalMessage='';
+let withdrawalUnknown=withdrawalPending();
+function withdrawalPending(value) {
+  try{
+    if(typeof sessionStorage==='undefined')return null;
+    if(arguments.length){if(value)sessionStorage.setItem('withdrawal-pending',value);else sessionStorage.removeItem('withdrawal-pending');return value;}
+    return sessionStorage.getItem('withdrawal-pending');
+  }catch{return null;}
+}
+function withdrawalAmount(value) {return Number.isSafeInteger(value)?money(value)+' 元':'待核对';}
+function withdrawalUpdate(result) {
+  if(state&&result?.withdrawal)state={...state,withdrawals:result.withdrawal};
+  renderWithdrawals(state);
+}
+function renderWithdrawals(s) {
+  const box=$('withdrawals');if(!box)return;box.replaceChildren();
+  box.append(el('p','这里只管理模拟账户资金，不会转出真实资金。利润提取单独记账，不计作交易亏损。','subtle'));
+  const data=s?.withdrawals;
+  if(!data){box.append(el('p','模拟提取状态尚未同步，请等待更新。','empty'));return;}
+  const names={IDLE:'等待达到本档阈值',READY:'可生成提取预览',WAITING:'等待满足提取条件',PAUSED_THRESHOLD:'等待重新超过本档阈值',COMPLETED:'本档已完成',CANCELLED:'未完成部分已取消',REVIEW_REQUIRED:'需要复核',NOT_SYNCED:'等待云端同步'};
+  box.append(el('p','第 '+(Number.isSafeInteger(data.current_stage)?data.current_stage:'待核对')+' 档 · '+(names[data.status]||'状态待核对')));
+  box.append(el('p','触发阈值 '+withdrawalAmount(data.threshold_cents)+'（严格超过才触发）；目标留存 '+withdrawalAmount(data.retain_cents)+'。'));
+  box.append(el('p','最新净资产 '+withdrawalAmount(data.equity_cents)+'；现金 '+withdrawalAmount(data.cash_cents)+'。'));
+  box.append(el('p','候选提取 '+withdrawalAmount(data.candidate_cents)+'；提取预留 '+withdrawalAmount(data.reserved_cents)+'。'));
+  for(const blocker of Array.isArray(data.blockers)?data.blockers:[])if(typeof blocker?.message==='string')box.append(proposalText('p',blocker.message,'caution'));
+  if(s?.deployment_role!=='cloud'){
+    box.append(el('p','本页仅显示云端同步结果。请到云端工作台，由管理员核对并确认模拟提取。','subtle'));return;
+  }
+  if(currentUser?.role!=='ADMIN'){box.append(el('p','模拟资金操作由管理员核对确认。','subtle'));return;}
+  if(withdrawalMessage)box.append(el('p',withdrawalMessage,'feedback'));
+  if(withdrawalUnknown){
+    box.append(el('p','上次操作结果尚未确认。请先核对，不要重复提取或取消预留。','caution'));
+    const check=el('button','核对上次操作结果');check.type='button';check.disabled=withdrawalBusy;
+    check.addEventListener('click',checkWithdrawalResult);box.append(check);return;
+  }
+  const actions=el('div',null,'notice-actions');
+  for(const [action,title,allowed] of [['TRANSFER','生成模拟提取预览',data.can_transfer],['CANCEL','预览取消未完成部分',data.can_cancel]]){
+    const button=el('button',title);button.type='button';button.disabled=withdrawalBusy||allowed!==true;
+    button.addEventListener('click',()=>requestWithdrawal(action));actions.append(button);
+  }
+  box.append(actions);
+  const r=withdrawalPreview;if(!r)return;
+  const p=r.snapshot||{},expired=!Number.isFinite(Date.parse(r.expires_at))||Date.parse(r.expires_at)<=Date.now();
+  const detail=el('section',null,'proposal-field');
+  detail.append(el('h3',p.action==='TRANSFER'?'请核对本次模拟提取':'请核对取消未完成部分'));
+  detail.append(el('p','第 '+p.stage+' 档 · 第 '+p.cycle_revision+' 版计划；有效期至 '+when(r.expires_at)+'。','subtle'));
+  detail.append(el('p','本次确认的净资产 '+withdrawalAmount(p.equity_cents)+'；现金 '+withdrawalAmount(p.cash_cents)+'。'));
+  detail.append(el('p',p.action==='TRANSFER'?'模拟提取 '+withdrawalAmount(p.amount_cents)+'；提取后留存 '+withdrawalAmount(p.post_equity_cents)+'。':
+    '取消未完成部分，释放预留 '+withdrawalAmount(p.release_cents)+'。已经提取的记录保留，档位不前进。'));
+  detail.append(el('p','有效期是最长期限；确认时会重新核对最新行情、资产和计划，有变化须重新预览。','subtle'));
+  if(expired)detail.append(el('p','这份预览已过期，请重新生成。','caution'));
+  const confirm=el('button',p.action==='TRANSFER'?'确认模拟提取 '+withdrawalAmount(p.amount_cents):'确认取消未完成部分','primary');
+  confirm.type='button';confirm.disabled=withdrawalBusy||expired;confirm.addEventListener('click',()=>confirmWithdrawal(r));
+  const dismiss=el('button','暂不操作');dismiss.type='button';dismiss.disabled=withdrawalBusy;
+  dismiss.addEventListener('click',()=>{withdrawalPreview=null;renderWithdrawals(state);});
+  detail.append(confirm,dismiss);box.append(detail);
+}
+async function requestWithdrawal(action) {
+  if(withdrawalBusy||withdrawalUnknown||currentUser?.role!=='ADMIN'||state?.deployment_role!=='cloud')return;
+  if(!['TRANSFER','CANCEL'].includes(action))return;
+  withdrawalBusy=true;withdrawalPreview=null;withdrawalMessage='正在生成本次预览…';renderWithdrawals(state);
+  try{
+    const result=await api.post('/api/withdrawals/request',{action});
+    withdrawalPreview=result.status==='PREVIEW_READY'?result.approval:null;
+    withdrawalMessage=withdrawalPreview?'请核对下面的具体金额和计划后再确认。':'当前无法生成预览，请查看阻塞原因。';
+    withdrawalUpdate(result);
+  }catch(error){withdrawalMessage=error.message;withdrawalUpdate(error.payload);}
+  finally{withdrawalBusy=false;renderWithdrawals(state);}
+}
+async function confirmWithdrawal(request) {
+  if(withdrawalBusy||withdrawalUnknown||currentUser?.role!=='ADMIN'||state?.deployment_role!=='cloud'||withdrawalPreview?.id!==request?.id)return;
+  if(!Number.isFinite(Date.parse(request.expires_at))||Date.parse(request.expires_at)<=Date.now()){
+    withdrawalMessage='这份预览已过期，请重新生成。';withdrawalPreview=null;renderWithdrawals(state);return;
+  }
+  withdrawalBusy=true;withdrawalMessage='正在核对并处理本次模拟资金操作…';
+  withdrawalUnknown=request.id;withdrawalPending(request.id);renderWithdrawals(state);
+  try{
+    const result=await api.post('/api/withdrawals/execute',{approval_id:request.id,expected_hash:request.hash});
+    if(result?.request_id!==request.id||!['COMPLETED','CANCELLED'].includes(result.status))throw new ApiError('尚未取得可核对的操作结果。','RESPONSE');
+    withdrawalUnknown=null;withdrawalPending(null);withdrawalPreview=null;
+    withdrawalMessage=result.status==='COMPLETED'?'本次模拟提取已完成并对账。':result.status==='CANCELLED'?'未完成部分已取消，已发生记录保留。':'本次操作需要复核，请查看最新状态。';
+    withdrawalUpdate(result);
+  }catch(error){
+    if(error.kind==='HTTP'&&error.status>=400&&error.status<500||error.kind==='AUTH'){
+      withdrawalUnknown=null;withdrawalPending(null);withdrawalPreview=null;
+      withdrawalMessage=error.message;withdrawalUpdate(error.payload);
+    }else withdrawalMessage='暂未确认本次操作结果。请先核对上次操作，不要重复提交。';
+  }finally{withdrawalBusy=false;renderWithdrawals(state);}
+}
+async function checkWithdrawalResult() {
+  if(withdrawalBusy||!withdrawalUnknown||currentUser?.role!=='ADMIN'||state?.deployment_role!=='cloud')return;
+  withdrawalBusy=true;withdrawalMessage='正在核对上次操作结果…';renderWithdrawals(state);
+  try{
+    const value=await api.get('/api/withdrawals/result?approval_id='+encodeURIComponent(withdrawalUnknown));
+    if(value.status==='CONSUMED'&&value.request_id===withdrawalUnknown&&value.result?.request_id===withdrawalUnknown){
+      withdrawalUnknown=null;withdrawalPending(null);withdrawalPreview=null;
+      withdrawalMessage=value.result.status==='COMPLETED'?'已核对：本次模拟提取已完成，没有重复提取。':value.result.status==='CANCELLED'?'已核对：未完成部分已取消。':'已有处理记录，请查看最新状态。';
+      withdrawalUpdate(value.result);
+    }else if(['PENDING','APPROVED'].includes(value.status)&&value.approval?.id===withdrawalUnknown&&value.approval.kind==='WITHDRAWAL'){
+      withdrawalUnknown=null;withdrawalPending(null);
+      const expiry=Date.parse(value.approval.expires_at);
+      withdrawalPreview=Number.isFinite(expiry)&&expiry>Date.now()?value.approval:null;
+      withdrawalMessage=withdrawalPreview?'未查到完成记录。请核对原计划后再次明确确认；系统会核对是否已经处理，避免重复提取。':'未查到完成记录，原预览已过期。请重新生成预览，重新核对当前金额。';
+    }else if(['EXPIRED','REJECTED'].includes(value.status)&&value.request_id===withdrawalUnknown){
+      withdrawalUnknown=null;withdrawalPending(null);withdrawalPreview=null;
+      withdrawalMessage='未查到完成记录，原预览已失效。请重新生成预览，重新核对当前金额。';
+    }else withdrawalMessage='尚无已完成的对账记录。暂不重复提交，请稍后继续核对。';
+  }catch{withdrawalMessage='暂时无法核对结果。请稍后继续核对，不要重复提交。';}
+  finally{withdrawalBusy=false;renderWithdrawals(state);}
+}
 const renderingCache=new Map(), watchedJobs=new Map(), submitting=new Set();
 
 function feedback(id,text,type='') {const box=$(id);box.textContent=readableError(text);box.hidden=!text;box.className='feedback'+(type?' '+type:'');}
@@ -895,7 +1006,7 @@ function render(s) {
   const risk=$('portfolio-risk');if(risk){risk.hidden=!s.account.investment_policy;risk.textContent='无杠杆模拟 · 持有周期按天 · 每小时复核'+(s.account.risk?.drawdown_bps!=null?' · 当前回撤 '+(s.account.risk.drawdown_bps/100).toFixed(2)+'%':'')+' / 风控阈值25%';}
   if(s.research_lease){const r=s.research_lease;attention.append(el('p',r.active?'组合研究已同步 · 最近完成 '+when(r.completed_at):'本地组合研究已过期或尚未就绪：暂停新买入，继续持仓风险检查。',r.active?'subtle':'caution'));}
   attention.hidden=!attention.textContent;
-  renderWatchlist(s);renderAccount(s);renderActivity(s);renderFollowups(s);renderDynamic(s);renderPortfolioStrategy(s);
+  renderWatchlist(s);renderAccount(s);renderWithdrawals(s);renderActivity(s);renderFollowups(s);renderDynamic(s);renderPortfolioStrategy(s);
   if(!editing)$('watchlist').value=fixedWatchlist(s).map(w=>w.symbol+' '+w.name).join('\n');
   $('settings-summary').textContent=fixedWatchlist(s).length+' 只固定关注股票 · '+(s.scheduler_enabled?'自动运行已开启':'已暂停');
   $('schedule').textContent=scheduleSummary(s.schedule);
@@ -1092,7 +1203,7 @@ function rememberWatchlist(){if(typeof location!=='undefined'&&location.pathname
 function stockPath(symbol){return '/stocks/'+encodeURIComponent(symbol)+'?return='+encodeURIComponent(watchlistHash());}
 function parseWorkspaceHash(hash){
   const [raw,query='']=hash.replace(/^#/,'').split('?'),params=new URLSearchParams(query);
-  const board=['fill-history','score-diagnostics-section','proposal-section','supervision-section'].includes(raw)?'activity':raw==='portfolio-section'||raw==='watchlist-performance'?'holdings':raw.replace(/-section$/,'');
+  const board=['fill-history','score-diagnostics-section','proposal-section','supervision-section'].includes(raw)?'activity':['portfolio-section','watchlist-performance','withdrawal-section'].includes(raw)?'holdings':raw.replace(/-section$/,'');
   return {board:boards.includes(board)?board:'watchlist',list:['CORE','DYNAMIC','FIXED','ALL'].includes(params.get('list'))?params.get('list'):'CORE',status:['ALL',...Object.keys(researchStates)].includes(params.get('status'))?params.get('status'):'ALL',market:observationCategories[params.get('market')]?params.get('market'):'CN',query:(params.get('q')||'').slice(0,80)};
 }
 function selectBoard(board,{focus=false,remember=false}={}) {
