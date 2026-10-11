@@ -19,6 +19,7 @@ import csv
 import json
 import math
 import statistics
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,8 @@ MA_VARIANTS = {
     'hold_20d': {'band_bps': 200, 'stop_bps': 600, 'target_bps': 1000, 'trend_exit': False, 'max_hold': 20},
 }
 GLOBAL_VARIANTS = {'hold_5d': {'max_hold': 5}, 'hold_10d': {'max_hold': 10}, 'hold_20d': {'max_hold': 20}}
+MA_METHOD = 'ma-open-first-v1'
+GLOBAL_METHOD = 'global-open-first-v3'
 
 
 def data_dir(root):
@@ -125,14 +128,14 @@ def simulate_ma(bars, variant, start='0000', end='9999'):
             price, why = None, None
             if o <= stop:
                 price, why = o, 'STOP'
-            elif l <= stop:
-                price, why = stop, 'STOP'
             elif o >= target:
                 price, why = o, 'TARGET'
-            elif h >= target:
-                price, why = target, 'TARGET'
             elif variant.get('trend_exit') and not trend:
                 price, why = o, 'TREND_EXIT'
+            elif l <= stop:
+                price, why = stop, 'STOP'
+            elif h >= target:
+                price, why = target, 'TARGET'
             elif variant.get('max_hold') and held >= variant['max_hold']:
                 price, why = c, 'MAX_HOLD'
             if price:
@@ -168,10 +171,10 @@ def simulate_global(bars, variant, start='0000', end='9999'):
             price, why = None, None
             if o <= stop:
                 price, why = o, 'STOP'
-            elif l <= stop:
-                price, why = stop, 'STOP'
             elif o >= target:
                 price, why = o, 'TARGET'
+            elif l <= stop:
+                price, why = stop, 'STOP'
             elif h >= target:
                 price, why = target, 'TARGET'
             elif held >= variant['max_hold']:
@@ -241,7 +244,7 @@ def run_ma(root, config, universe, start, end, variants=None):
             for t in simulate_ma(payload['bars'], MA_VARIANTS[name], window_start, window_end):
                 trades.append({**t, 'symbol': member['symbol']})
         results[name] = evaluate(trades, cost, bench)
-    return {'kind': 'ma', 'start': start, 'end': end, 'cost_bps': round(cost, 1), 'universe_size': len(universe),
+    return {'kind': 'ma', 'method': MA_METHOD, 'start': start, 'end': end, 'cost_bps': round(cost, 1), 'universe_size': len(universe),
             'missing_data': sorted(set(missing)), 'benchmark': bool(bench), 'variants': results}
 
 
@@ -256,7 +259,7 @@ def run_global(root, config, start, end, variants=None):
                 trades += [{**t, 'symbol': asset} for t in simulate_global(payload['bars'], GLOBAL_VARIANTS[name], start, end)]
         results[name] = evaluate(trades, cost)
     return {'kind': 'global', 'start': start, 'end': end, 'cost_bps': round(cost, 1), 'variants': results,
-            'method': 'global-trend-v2', 'limitations': [
+            'method': GLOBAL_METHOD, 'limitations': [
                 '趋势输入与生产共用公式；金银历史使用期货代理，不能视为现货模拟账户收益。',
                 '美元计价，未计人民币汇率、最低佣金及盘中流动性；费用按固定基点近似。',
                 '离线持有期按日观测数量，生产按自然时间；不重放模型与组合授权。']}
@@ -268,6 +271,7 @@ def _pct(v):
 
 def markdown(result):
     lines = [f"# 机械规则离线回测（{result['kind']}，{result['start']} 至 {result['end']}）", '',
+             '计算方法：' + result.get('method', 'legacy') + '；先处理开盘已知触发，再对盘中路径采用止损优先。', '',
              f"往返成本按 {result['cost_bps'] / 100:.2f}% 计入。每笔交易收益为扣费后收益；超额收益相对沪深300同区间。", '']
     if result['kind'] == 'ma':
         lines += [f"股票池 {result['universe_size']} 个区间；缺数据 {len(result['missing_data'])} 只。{UNIVERSE_HELP}", '']
@@ -287,8 +291,8 @@ def markdown(result):
 
 def save(root, result):
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    folder = Path(root) / 'backtest' / 'results' / f"{stamp}-{result['kind']}"
-    folder.mkdir(parents=True, exist_ok=True)
+    folder = Path(root) / 'backtest' / 'results' / f"{stamp}-{result.get('method', result['kind'])}-{uuid.uuid4().hex[:8]}"
+    folder.mkdir(parents=True, exist_ok=False)
     (folder / 'summary.json').write_text(json.dumps({**result, 'variants': {k: {kk: vv for kk, vv in v.items() if kk != 'trades'}
                                                                              for k, v in result['variants'].items()}}, ensure_ascii=False, indent=2))
     (folder / 'report.md').write_text(markdown(result), encoding='utf-8')
