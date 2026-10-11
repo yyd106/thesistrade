@@ -10,6 +10,7 @@ import math
 import re
 
 VERSION = 'proposal-evidence-v1'
+LINK_VERSION = 'selfcheck-evidence-link-v2'
 MAX_COHORTS = 8
 MAX_REFERENCES = 20
 ROUTES = ('watchlist', 'portfolio', 'dynamic', 'global')
@@ -30,12 +31,53 @@ def _hash(value):
     return hashlib.sha256(_encode(value).encode()).hexdigest()
 
 
+def evidence_identity(report, proof, scope):
+    """Bind new links and novelty to their statistical interpretation.
+
+    Keep the original algorithm for frozen v1 links. In v2 the entire selected
+    snapshot is the novelty unit: shared date cohorts can shrink a subgroup even
+    when none of its judgments or scores is new. Run IDs and creation times are
+    excluded so consecutive identical snapshots in different reports dedupe.
+    """
+    if report.get('method') == 'selfcheck-v1':
+        return _hash(proof), sorted(_hash(e) for e in proof)
+    from .evaluation import SAMPLING_METHOD
+    if (report.get('method') != 'selfcheck-v2' or report.get('sampling_method') != SAMPLING_METHOD
+            or report.get('history_scope') != 'ALL_AS_OF_CUTOFF'):
+        raise ValueError('冻结报告哈希或方法不一致')
+    method = {k: report[k] for k in ('method', 'sampling_method', 'history_scope')}
+    ids = _ids([e['id'] for e in proof], allow_empty=True)
+    selected, found, cohorts = set(ids), set(), []
+    for cohort in report['cohorts']:
+        if cohort.get('provenance') != 'LIVE' or any(cohort.get(k) != v for k, v in scope.items()):
+            continue
+        group_ids = set(_ids(cohort['evidence_ids']))
+        if not group_ids <= selected:
+            raise ValueError('证据编号与完整分组不匹配')
+        cohorts.append({**cohort, 'evidence_ids': sorted(group_ids)})
+        found.update(group_ids)
+    if found != selected:
+        raise ValueError('引用的证据未出现在冻结分组中')
+    fingerprint = _hash({**method, 'scope': scope, 'ids': ids, 'cohorts': sorted(cohorts, key=_encode),
+                         'evidence': sorted(proof, key=_encode)})
+    # The stored signatures field remains compatible; v2 has one whole-snapshot
+    # signature, never a union of per-judgment signatures across old reports.
+    return fingerprint, [fingerprint]
+
+
+def evidence_link(proposal_id, run_id, at, ids, snapshot_hash, signatures, previous_hash):
+    """A v2 append has its own identity; repeated content may recur later."""
+    payload = {'version': LINK_VERSION, 'ids': _ids(ids, allow_empty=True),
+               'signatures': signatures, 'snapshot_hash': snapshot_hash, 'previous_hash': previous_hash}
+    return _hash({'proposal_id': proposal_id, 'run_id': run_id, 'created_at': at, **payload}), payload
+
+
 def _identifier(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9:_.-]{0,199}', value))
 
 
-def _ids(value):
-    if not isinstance(value, list) or not value or any(not _identifier(x) for x in value) or len(set(value)) != len(value):
+def _ids(value, *, allow_empty=False):
+    if not isinstance(value, list) or (not value and not allow_empty) or any(not _identifier(x) for x in value) or len(set(value)) != len(value):
         raise ValueError('证据编号清单为空或格式无效')
     return sorted(value)
 
@@ -80,7 +122,7 @@ def _scope(proposal, payload):
     return dict(scope)
 
 
-def _resolve(store, run_id, ids, scope):
+def _resolve(store, run_id, ids, scope, *, allow_empty=False):
     if not isinstance(run_id, str) or not re.fullmatch(r'SC-[0-9a-f]{20}', run_id):
         raise ValueError('自检报告编号无效')
     row = store.db.execute('SELECT id,created_at,evidence_hash,payload_json FROM selfcheck_runs WHERE id=?', (run_id,)).fetchone()
@@ -90,8 +132,13 @@ def _resolve(store, run_id, ids, scope):
     if not isinstance(report, dict) or report.get('id') != row['id'] or report.get('created_at') != row['created_at']:
         raise ValueError('冻结报告元数据不一致')
     content = {k: v for k, v in report.items() if k not in ('id', 'created_at')}
-    if _hash(content) != row['evidence_hash'] or run_id != 'SC-' + row['evidence_hash'][:20] or report.get('method') != 'selfcheck-v1':
+    from .evaluation import SAMPLING_METHOD
+    method = report.get('method')
+    supported = method == 'selfcheck-v1' or (method == 'selfcheck-v2' and
+        report.get('sampling_method') == SAMPLING_METHOD and report.get('history_scope') == 'ALL_AS_OF_CUTOFF')
+    if _hash(content) != row['evidence_hash'] or run_id != 'SC-' + row['evidence_hash'][:20] or not supported:
         raise ValueError('冻结报告哈希或方法不一致')
+    ids = _ids(ids, allow_empty=allow_empty and method == 'selfcheck-v2')
     selected = set(ids)
     found, cohorts = set(), []
     if not isinstance(report.get('cohorts'), list):
@@ -126,7 +173,11 @@ def _resolve(store, run_id, ids, scope):
     cohorts.sort(key=_encode)
     snapshot = {'run_id': run_id, 'created_at': row['created_at'], 'report_hash': row['evidence_hash'],
                 'reference_count': len(ids), 'reference_hash': _hash(ids), 'cohorts': cohorts}
-    return snapshot, _hash(proof), sorted(_hash(e) for e in proof)
+    if method == 'selfcheck-v2':
+        snapshot.update(report_method=method, sampling_method=report['sampling_method'], history_scope=report['history_scope'],
+                        scope_status='OBSERVED' if cohorts else 'EMPTY_SCOPE')
+    fingerprint, signatures = evidence_identity(report, proof, scope)
+    return snapshot, fingerprint, signatures
 
 
 def _failure(source, status, reason, additional_count=0):
@@ -147,7 +198,7 @@ def summary(store, proposal, payload):
         return _failure('UNKNOWN', 'INVALID', '提案内容格式无效')
     evidence = payload.get('evidence')
     source = 'TEXT' if isinstance(evidence, str) else 'SELFCHECK'
-    links = store.db.execute('SELECT evidence_hash,run_id,created_at,payload_json FROM selfcheck_evidence WHERE proposal_id=? ORDER BY created_at,rowid', (proposal.get('id'),)).fetchall()
+    links = store.db.execute('SELECT rowid,evidence_hash,run_id,created_at,payload_json FROM selfcheck_evidence WHERE proposal_id=? ORDER BY rowid', (proposal.get('id'),)).fetchall()
     additional_count = len(links)
     if isinstance(evidence, str) and evidence.strip() and not links:
         return {'version': VERSION, 'source': 'TEXT', 'status': 'RECORDED', 'text': evidence,
@@ -160,27 +211,56 @@ def summary(store, proposal, payload):
         ids = _ids(evidence['ids'])
         original, original_hash, original_signatures = _resolve(store, evidence['run_id'], ids, scope)
         original.update(kind='ORIGINAL', link_hash=original_hash)
+        parsed_links = [json.loads(link['payload_json']) for link in links]
+        if not all(isinstance(p, dict) for p in parsed_links):
+            raise ValueError('追加证据结构无效')
+        chained = any(p.get('version') == LINK_VERSION for p in parsed_links)
+        if not chained:
+            # Preserve the ordering and material identity of released v1 links.
+            links = sorted(links, key=lambda link: (link['created_at'], link['rowid']))
+        if original.get('report_method') == 'selfcheck-v2' and not links:
+            raise ValueError('追加证据链缺失')
         all_snapshots = [original]
         references = {evidence['run_id'], *ids}
         additional_count = 0
-        for link in links:
+        previous_hash = None
+        for index, link in enumerate(links):
             p = json.loads(link['payload_json'])
-            if not isinstance(p, dict) or set(p) != {'ids', 'signatures'}:
+            versioned = p.get('version') == LINK_VERSION
+            required = {'ids', 'signatures', 'version', 'snapshot_hash', 'previous_hash'} if versioned else {'ids', 'signatures'}
+            if set(p) != required:
                 raise ValueError('追加证据结构无效')
-            linked_ids = _ids(p['ids'])
-            frozen, fingerprint, signatures = _resolve(store, link['run_id'], linked_ids, scope)
-            if link['evidence_hash'] != fingerprint or p['signatures'] != signatures:
+            linked_ids = _ids(p['ids'], allow_empty=versioned)
+            frozen, fingerprint, signatures = _resolve(store, link['run_id'], linked_ids, scope, allow_empty=versioned)
+            if versioned:
+                expected_hash, expected_payload = evidence_link(proposal['id'], link['run_id'], link['created_at'],
+                    linked_ids, fingerprint, signatures, previous_hash)
+                valid = frozen.get('report_method') == 'selfcheck-v2' and p == expected_payload and link['evidence_hash'] == expected_hash
+            else:
+                valid = frozen.get('report_method') != 'selfcheck-v2' and link['evidence_hash'] == fingerprint and p['signatures'] == signatures
+            if not valid:
                 raise ValueError('追加证据指纹与冻结报告不一致')
+            previous_hash = link['evidence_hash']
             references.update([link['run_id'], *linked_ids])
-            # selfcheck records the original snapshot in the link table too.
-            if link['run_id'] == original['run_id'] and fingerprint == original_hash and signatures == original_signatures:
+            # Only the first link mirrors the original. A later A in A→B→A
+            # remains an append even when it refers to that original report.
+            mirror = link['run_id'] == original['run_id'] and fingerprint == original_hash and signatures == original_signatures
+            if original.get('report_method') == 'selfcheck-v2' and index == 0 and not mirror:
+                raise ValueError('追加证据链缺少原始快照')
+            if mirror and (index == 0 or not chained):
+                if versioned:
+                    original.update(link_hash=link['evidence_hash'], snapshot_hash=fingerprint)
                 continue
-            frozen.update(kind='ADDITIONAL', link_hash=fingerprint, linked_at=link['created_at'])
+            frozen.update(kind='ADDITIONAL', link_hash=link['evidence_hash'], linked_at=link['created_at'])
+            if versioned:
+                frozen.update(snapshot_hash=fingerprint, previous_hash=p['previous_hash'])
             all_snapshots.append(frozen)
             additional_count += 1
         latest = all_snapshots[-1]
         cohorts = latest['cohorts'][:MAX_COHORTS]
         limitations = list(BASE_LIMITATIONS)
+        if latest.get('scope_status') == 'EMPTY_SCOPE':
+            limitations.append('当前冻结报告中，此提案适用范围没有保留的可评分样本；历史统计不代表当前证据。')
         if any(c['excess'].get('time_clusters', 0) < 30 for c in latest['cohorts']):
             limitations.append('至少一个适用分组不足30个时间簇；簇之间也不保证独立，当前不能判断策略有效性。')
         limitations.append('LIVE表示判断当时已冻结，不等于已经完成基线与候选的前向对照实验。')
@@ -192,6 +272,8 @@ def summary(store, proposal, payload):
         displayed_snapshots = [all_snapshots[0]] if len(all_snapshots) == 1 else [all_snapshots[0], all_snapshots[-1]]
         snapshots = [{k: v for k, v in item.items() if k != 'cohorts'} | {'cohort_count': len(item['cohorts'])} for item in displayed_snapshots]
         text = '证据不足：以下为冻结价格诊断，实验进度与结果另见冻结运行摘要。'
+        if latest.get('scope_status') == 'EMPTY_SCOPE':
+            text += '\n当前适用范围样本为0；历史分组保留，但不继续作为当前统计展示。'
         for c in cohorts:
             stats = c['excess']
             horizon_unit = '根观测日线' if c['benchmark'] == 'CASH_USD' else '个交易日'
@@ -203,6 +285,8 @@ def summary(store, proposal, payload):
         text += (f"\n适用环境 {scope['environment']}。原始报告 {original['run_id']} 引用{original['reference_count']}个判断；"
                  f"追加{additional_count}个证据版本。最新报告 {latest['run_id']} 引用{latest['reference_count']}个判断、"
                  f"{len(latest['cohorts'])}个分组。各版本与重叠期限不得累计样本。")
+        if latest.get('report_method') == 'selfcheck-v2':
+            text += f"\n最新报告采用 {latest['sampling_method']}：截至报告时点的全部可用历史，按入场日期批次采样；不是前向预注册。"
         return {'version': VERSION, 'source': 'SELFCHECK', 'status': 'INSUFFICIENT', 'text': text,
                 'cohorts': cohorts, 'cohort_count': len(latest['cohorts']), 'references': sorted(references)[:MAX_REFERENCES],
                 'references_count': len(references), 'additional_count': additional_count, 'snapshots': snapshots,

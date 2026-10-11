@@ -9,9 +9,11 @@ from datetime import datetime, timedelta
 from .storage import now, normalize_time, digest, json_write
 from .calendar import local
 from .judgments import encode, backfill
-from .evaluation import SCORE_METHOD, daily_samples, non_overlapping, time_clusters, describe
+from .evaluation import SCORE_METHOD, SAMPLING_METHOD, sample_horizon, daily_samples, non_overlapping, time_clusters, describe
 
-METHOD = 'selfcheck-v1'
+METHOD = 'selfcheck-v2'
+# A diagnostic method upgrade must not recreate a rejected or existing candidate.
+CANDIDATE_NAMESPACE = 'selfcheck-v1'
 WEEKLY_BUDGET = 3
 LIMITATIONS = [
     '所有收益分组均为观察性诊断，不能证明因果、策略优劣或未来盈利。',
@@ -23,9 +25,8 @@ LIMITATIONS = [
 
 def outcomes(store, at):
     """Join frozen predictions to only outcomes known at this check's cutoff."""
-    rows = []
-    since = normalize_time((datetime.fromisoformat(at) - timedelta(days=180)).isoformat())
-    for r in store.db.execute('SELECT * FROM judgment_contracts WHERE created_at>=? AND created_at<=? AND frozen_at<=? ORDER BY created_at,id', (since, at, at)):
+    rows = []; at = normalize_time(at)
+    for r in store.db.execute('SELECT * FROM judgment_contracts WHERE created_at<=? AND frozen_at<=? ORDER BY created_at,id', (at, at)):
         c = dict(r); p = json.loads(c.pop('payload_json'))
         score, status = {}, 'AWAITING_SCORE'
         if c['route'] == 'dynamic':
@@ -50,8 +51,11 @@ def cohorts(rows):
     # of different overlapping observations for each favorable subgroup.
     eligible = [r for r in rows if r['status'] == 'SCORED' and r['provenance'] != 'RETROSPECTIVE']
     groups = defaultdict(list)
-    for route in ('watchlist', 'portfolio', 'dynamic', 'global'):
-        chosen = time_clusters(non_overlapping(daily_samples([r for r in eligible if r['route'] == route]), 0))
+    partitions = defaultdict(list)
+    for r in daily_samples(eligible):
+        partitions[(r['route'], sample_horizon(r))].append(r)
+    for (route, horizon), samples in sorted(partitions.items()):
+        chosen = time_clusters(non_overlapping(samples, horizon))
         for r in chosen:
             c = r['contract']
             # A legacy replay is never counted as prospective validation.
@@ -96,7 +100,8 @@ def analyze(store, at):
         if r['build_id'] == 'UNKNOWN':gaps['unknown_build'] += 1
     frozen_evidence = [{'id': r['id'], 'contract_hash': digest(encode(r['contract'])),
                         'status': r['status'], 'score': r['score']} for r in rows]
-    return {'method': METHOD, 'counts': dict(Counter(r['route'] + ':' + r['status'] for r in rows)),
+    return {'method': METHOD, 'sampling_method': SAMPLING_METHOD,
+        'counts': dict(Counter(r['route'] + ':' + r['status'] for r in rows)),
         'provenance': dict(Counter(r['provenance'] for r in rows)), 'gaps': dict(gaps),
         'cohorts': cs, 'execution': execution_summary(store, at),
         'layers': {'data': '见缺失、不可评分和历史补登记统计',
@@ -104,8 +109,10 @@ def analyze(store, at):
                    'price_prediction': '按路线、版本、环境、期限、基准和行动分组；观望不解释为预测下跌',
                    'portfolio': '分组描述组合选择后价格表现，尚不足以归因仓位效果',
                    'execution': '沿用复盘原始程序检查'},
-        'evidence': frozen_evidence, 'lookback_days': 180,
-        'limitations': LIMITATIONS + ['诊断读取最近180天判断；更早合同、提案、失败实验和报告保留，不删除。']}, rows
+        'evidence': frozen_evidence, 'lookback_days': None, 'history_scope': 'ALL_AS_OF_CUTOFF',
+        'limitations': LIMITATIONS + ['长期统计读取截至检查时点已冻结、已知结果的全部历史；近期运行健康另看执行核验。',
+            '先按路线和期限选不重叠入场日期批次，同日全部标的保留，再按版本、环境和行动分组；30个时间簇仍不保证独立。',
+            '日期批次为截至检查时点可用评分的观察性采样，不是前向预注册；补到的历史评分可改变新报告，旧冻结报告不改写。']}, rows
 
 
 def candidate_specs(report, rows):
@@ -115,23 +122,33 @@ def candidate_specs(report, rows):
         if c['provenance'] != 'LIVE' or c['build_id'] == 'UNKNOWN':
             continue
         selected = [r for r in rows if r['id'] in set(c['evidence_ids'])]
-        if c['route'] != 'portfolio' and any(r['contract']['business_test']['status'] == 'UNSTRUCTURED' for r in selected):
-            candidates.append((c, 'EXPLICIT_INVALIDATION', '补充可核验的反证条件',
+        if c['route'] != 'portfolio':
+            candidates.append((any(r['contract']['business_test']['status'] == 'UNSTRUCTURED' for r in selected),
+                c, 'EXPLICIT_INVALIDATION', '补充可核验的反证条件',
                 '在研究输出中增加单一结构字段 hypothesis_test：claim、metric、operator、threshold、deadline、source_ids、invalidation；'
                 '无法量化时明确 UNKNOWN，不虚构数值。候选仅在实验区使用，生产决策保持现行版本。',
                 '增加明确验证条件可能提高研究的可检验性；当前缺失本身不能证明盈利受损。',
                 'verifiable_prediction_rate'))
         active = c['stance'] in ('PAPER_TRADE', 'LONG', 'BULLISH', 'ALLOW')
-        if active and c['excess'].get('n', 0) >= 5 and c['excess'].get('mean_bps', 0) < 0:
-            candidates.append((c, 'COUNTEREVIDENCE_CHECK', '增加一次反向证据核对',
+        candidates.append((active and c['excess'].get('n', 0) >= 5 and c['excess'].get('mean_bps', 0) < 0,
+                c, 'COUNTEREVIDENCE_CHECK', '增加一次反向证据核对',
                 '在最终结论前增加一个固定反向证据检查字段：引用一项可能推翻当前判断的已提供证据及影响；'
                 '无反证则写未发现，不得检索未来资料或更改仓位、入场及风控规则。',
                 '该组已到期价格反应偏弱；反证检查是待验证解释，大盘、暴露及样本选择也可能解释差异。',
                 'paired_net_excess_bps'))
+    def identity(candidate):
+        _, c, change, _, text, _, _ = candidate
+        return digest(encode([CANDIDATE_NAMESPACE, c['route'], c['build_id'], c['environment'], change, text]))
+
+    # A generation trigger selects a hypothesis, not the later evidence shown
+    # for it. Include its complete current scope from the first v2 snapshot, so
+    # crossing back over a trigger cannot hide newer, less supportive results.
+    wanted = {identity(c) for c in candidates if c[0]}
+    candidates = [c for c in candidates if (c[0] if report.get('method') == 'selfcheck-v1' else identity(c) in wanted)]
     # Multiple stances/horizons are evidence for the same proposed change, not new trials.
     merged = {}
-    for c, change, title, text, hypothesis, metric in candidates:
-        key = digest(encode([METHOD, c['route'], c['build_id'], c['environment'], change, text]))
+    for _, c, change, title, text, hypothesis, metric in candidates:
+        key = digest(encode([CANDIDATE_NAMESPACE, c['route'], c['build_id'], c['environment'], change, text]))
         if key not in merged:
             merged[key] = {'key': key, 'cohort': c, 'change_id': change, 'title': title,
                            'change': text, 'hypothesis': hypothesis, 'metric': metric, 'evidence_ids': []}
@@ -165,6 +182,7 @@ def design(candidate, at):
 def propose(store, report, rows, at):
     from .governance import draft_proposal
     from .experiments import register
+    from .proposal_evidence import LINK_VERSION, evidence_identity, evidence_link
     current = local(at)
     week = f'{current.isocalendar()[0]}-W{current.isocalendar()[1]:02d}'
     results = []
@@ -172,16 +190,39 @@ def propose(store, report, rows, at):
     store.db.execute('BEGIN IMMEDIATE')
     try:
         used = store.db.execute("SELECT count(*) FROM strategy_proposals WHERE source='selfcheck' AND json_extract(payload_json,'$.generation_week')=?", (week,)).fetchone()[0]
-        for candidate in candidate_specs(report, rows):
+        existing = {r['dedupe_key']: dict(r) for r in store.db.execute(
+            "SELECT * FROM strategy_proposals WHERE source='selfcheck' AND dedupe_key LIKE 'selfcheck:%'")}
+        candidates = {c['key']: c for c in candidate_specs(report, rows)}
+        if report.get('method') == 'selfcheck-v2':
+            # Refresh existing hypotheses independently of generation triggers,
+            # including a scope that sampling has removed entirely this time.
+            for key, row in existing.items():
+                scope = json.loads(row['payload_json']).get('applicability')
+                if not isinstance(scope, dict) or set(scope) != {'route', 'build_id', 'environment'}:
+                    continue
+                ids = sorted({identity for c in report['cohorts'] if c['provenance'] == 'LIVE'
+                              and all(c.get(k) == v for k, v in scope.items()) for identity in c['evidence_ids']})
+                candidate_key = key.removeprefix('selfcheck:')
+                candidates[candidate_key] = {'key': candidate_key, 'cohort': scope, 'evidence_ids': ids}
+        for candidate in sorted(candidates.values(), key=lambda c: c['key']):
             key = 'selfcheck:' + candidate['key']
-            row = store.db.execute('SELECT id,status FROM strategy_proposals WHERE dedupe_key=?', (key,)).fetchone()
+            row = existing.get(key)
             proof = [e for e in report['evidence'] if e['id'] in set(candidate['evidence_ids'])]
-            fingerprint = digest(encode(proof))
-            signatures = sorted(digest(encode(e)) for e in proof)
+            scope = {k: candidate['cohort'][k] for k in ('route', 'build_id', 'environment')}
+            fingerprint, signatures = evidence_identity(report, proof, scope)
+            previous = None
             if row:
-                seen = {s for e in store.db.execute('SELECT payload_json FROM selfcheck_evidence WHERE proposal_id=?', (row['id'],))
-                        for s in json.loads(e[0]).get('signatures', [])}
-                if set(signatures) <= seen:continue
+                previous = store.db.execute('SELECT * FROM selfcheck_evidence WHERE proposal_id=? ORDER BY rowid DESC LIMIT 1',
+                                            (row['id'],)).fetchone()
+                if report.get('method') == 'selfcheck-v1':
+                    # Preserve the released v1 per-score novelty rule.
+                    seen = {s for e in store.db.execute('SELECT payload_json FROM selfcheck_evidence WHERE proposal_id=?', (row['id'],))
+                            for s in json.loads(e[0]).get('signatures', [])}
+                    if set(signatures) <= seen:continue
+                elif previous:
+                    latest = json.loads(previous['payload_json'])
+                    if latest.get('version') == LINK_VERSION and latest.get('snapshot_hash') == fingerprint:
+                        continue
             if row:
                 pid = row['id']
             else:
@@ -203,8 +244,12 @@ def propose(store, report, rows, at):
                 register(store, pid, spec, at)
                 used += 1
             # Lifecycle decisions and frozen proposal contents remain untouched.
+            link_hash, link_payload = fingerprint, {'ids': candidate['evidence_ids'], 'signatures': signatures}
+            if report.get('method') == 'selfcheck-v2':
+                link_hash, link_payload = evidence_link(pid, report['id'], at, candidate['evidence_ids'], fingerprint,
+                                                       signatures, previous['evidence_hash'] if previous else None)
             store.db.execute('INSERT INTO selfcheck_evidence VALUES(?,?,?,?,?)',
-                             (pid, fingerprint, report['id'], at, encode({'ids': candidate['evidence_ids'], 'signatures': signatures})))
+                             (pid, link_hash, report['id'], at, encode(link_payload)))
             results.append({'proposal_id': pid, 'action': 'EVIDENCE_APPENDED' if row else 'CREATED',
                             'status': row['status'] if row else 'DRAFT'})
         store.db.commit()
@@ -221,6 +266,8 @@ def markdown(report):
         '来源性质：' + encode(report['provenance']), '可检验性缺口：' + encode(report['gaps']),
         '', '## 到期表现分组', '', '| 路线 | 版本 | 环境 | 期限 | 行动 | 来源 | 样本/时间簇 | 平均超额 bps |',
         '|---|---|---|---|---|---|---|---|']
+    if report.get('method') == 'selfcheck-v2':
+        lines[4:4] = [f"统计方法：{report['method']} / {report['sampling_method']}。读取截至报告时点的全部可用历史，按入场日期批次采样；不是前向预注册或独立样本。", '']
     for c in report['cohorts']:
         s = c['excess']
         lines.append(f"| {c['route']} | {c['build_id']} | {c['environment']} | {c['horizon_days']} | {c['stance']} | {c['provenance']} | {s.get('n', 0)}/{s.get('time_clusters', 0)} | {s.get('mean_bps', '—')} |")

@@ -4,13 +4,21 @@ from .storage import digest, normalize_time, now
 from .judgments import encode
 
 VERSION = 'forward-design-v1'
+BEHAVIOR_VERSION = 'forward-design-v2'
 
 
 def validate(spec, at):
     required = {'version', 'baseline_build', 'route', 'environment', 'change', 'enrollment',
                 'primary_metric', 'failure_criteria', 'rollback', 'budget', 'controls'}
-    if not isinstance(spec, dict) or set(spec) != required or spec['version'] != VERSION:
+    version = spec.get('version') if isinstance(spec, dict) else None
+    if version == BEHAVIOR_VERSION:
+        required.add('behavior_identity')
+    if not isinstance(spec, dict) or set(spec) != required or version not in (VERSION, BEHAVIOR_VERSION):
         raise ValueError('实验设计字段或版本无效')
+    if version == BEHAVIOR_VERSION:
+        from .build import valid_behavior_identity
+        if not valid_behavior_identity(spec['behavior_identity']):
+            raise ValueError('实验行为身份字段或指纹无效')
     if spec['route'] not in ('watchlist', 'dynamic', 'global', 'portfolio'):
         raise ValueError('实验路线无效')
     for key in ('baseline_build', 'environment', 'primary_metric', 'failure_criteria', 'rollback'):

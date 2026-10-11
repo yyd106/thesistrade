@@ -5,6 +5,11 @@ change a trading or research judgment changes, so results can always be attribut
 """
 import hashlib
 import json
+import ast
+import re
+import sys
+import sqlite3
+from importlib import metadata
 from functools import lru_cache
 from pathlib import Path
 
@@ -81,3 +86,149 @@ def record(store, config, at):
     parts = info(config, store)
     store.db.execute('INSERT OR IGNORE INTO builds VALUES(?,?,?)', (parts['build_id'], at, json.dumps(parts, ensure_ascii=False, sort_keys=True)))
     return parts
+
+
+# Separate from build_id: deployment attribution and legacy records retain the
+# complete source hash above. This scope is deliberately a denylist, so new code
+# and new configuration keys are included without having to update an allowlist.
+BEHAVIOR_VERSION = 'research-behavior-v1'
+DISPLAY_ONLY_MODULES = {
+    # Copies current industry state for dashboard display; never grants permits.
+    'industry_presentation.py',
+    # Read-only review/accounting projections. Its age helper only feeds proposal
+    # display; adopted guidance is independently frozen below.
+    'review_presentation.py',
+    # Dashboard-only stock detail/history projections.
+    'stock_detail.py',
+}
+LOCATION_OR_TRANSIENT_KEYS = {
+    'data_dir',     # Storage location, not the stored inputs (frozen per pair).
+    'config_path',  # Location of the already-loaded settings.
+    '_deadline',    # Per-cycle monotonic deadline; policy budget/code are included.
+}
+
+
+def _package_source(raw):
+    """Ignore only a literal release label, retaining any other package logic."""
+    tree = ast.parse(raw)
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and
+                isinstance(node.targets[0], ast.Name) and node.targets[0].id == '__version__' and
+                isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+            node.value.value = '<release-version>'
+    return ast.dump(tree, include_attributes=False).encode()
+
+
+def _project_source(raw):
+    """Keep dependency/runtime metadata; only the project release label varies."""
+    lines, section = [], None
+    for line in raw.decode().splitlines():
+        match = re.fullmatch(r'\s*\[([^\[\]]+)\]\s*(?:#.*)?', line)
+        if match:
+            section = match.group(1)
+        elif line.lstrip().startswith('['):
+            section = None  # Array/unknown tables must not inherit [project].
+        if section == 'project' and re.fullmatch(r'''\s*version\s*=\s*["'][^"']*["']\s*(?:#.*)?''', line):
+            line = 'version = "<release-version>"'
+        lines.append(line)
+    return '\n'.join(lines).encode()
+
+
+def behavior_code_fingerprint(root=None):
+    """All application Python/static data and dependency declarations by default.
+
+    Deliberately not process-cached: a long-lived worker must see added/changed
+    dependencies too. Presentation.py and reports.py are mixed-purpose modules
+    and MUST remain included (prompt vocabulary and report import/sync).
+    """
+    root = Path(root) if root is not None else Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    paths = sorted(list(root.rglob('*.py')) + list((root / 'data').rglob('*.json')))
+    for path in paths:
+        name = path.relative_to(root).as_posix()
+        if '__pycache__' in path.parts or name in DISPLAY_ONLY_MODULES:
+            continue
+        raw = path.read_bytes()
+        if name == '__init__.py':
+            raw = _package_source(raw)
+        h.update(name.encode() + b'\0' + raw + b'\0')
+    for name in ('requirements.lock', 'pyproject.toml'):
+        path = root.parent / name
+        raw = path.read_bytes() if path.exists() else b'<missing>'
+        if name == 'pyproject.toml':
+            raw = _project_source(raw)
+        h.update(name.encode() + b'\0' + raw + b'\0')
+    return h.hexdigest()
+
+
+@lru_cache(maxsize=8)
+def _executable_hash(path, inode, size, mtime_ns, ctime_ns):
+    """Cache bytes by file identity/stat, not merely by the executable's path."""
+    h = hashlib.sha256()
+    with Path(path).open('rb') as executable:
+        for block in iter(lambda: executable.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def model_executable_fingerprint():
+    """Hash the same executable run_json selects, without executing it.
+
+    Do not inspect CLI user settings, credential files or model material. Moving
+    identical bytes is compatible; replacing an installed executable is not.
+    The service-side implementation behind a pinned model name is not observable
+    here and cannot be frozen by this local identity.
+    """
+    from .model import codex_executable
+    try:
+        path = Path(codex_executable()).resolve()
+        stat = path.stat()
+        return _executable_hash(str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    except (RuntimeError, FileNotFoundError):
+        return '<missing>'
+    except OSError as exc:
+        return '<unreadable:' + type(exc).__name__ + '>'
+
+
+def behavior_runtime_fingerprint():
+    # Runtime/library upgrades can change parsing or queries even when the source
+    # tree is identical. No credential/config files or model calls are read here.
+    packages = {}
+    for name in ('pypdf', 'cryptography'):
+        try:
+            packages[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            packages[name] = '<missing>'
+    return _sha({'python': list(sys.version_info[:3]), 'implementation': sys.implementation.name,
+                 'sqlite': sqlite3.sqlite_version, 'packages': packages,
+                 'model_executable': model_executable_fingerprint()})
+
+
+def behavior_info(config, store):
+    """Freeze input, sampling, model, measurement and research behavior, not data.
+
+    Keep only hashes in records, never a copy of configuration. Unknown keys are
+    included; non-JSON values fail closed instead of silently disappearing.
+    Future market inputs are intentionally variable and frozen at enrollment.
+    """
+    rows = [tuple(r) for r in store.db.execute(
+        "SELECT id,route,scope,text FROM strategy_guidance WHERE status='ADOPTED' ORDER BY id")]
+    selected = {k: v for k, v in config.items() if k not in LOCATION_OR_TRANSIENT_KEYS}
+    config_raw = json.dumps(selected, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()
+    parts = {'version': BEHAVIOR_VERSION, 'code_hash': behavior_code_fingerprint(),
+             'config_hash': _sha(config_raw), 'guidance_hash': _sha(rows),
+             'runtime_hash': behavior_runtime_fingerprint()}
+    parts['identity_hash'] = _sha(parts)
+    return parts
+
+
+def valid_behavior_identity(value):
+    fields = {'version', 'code_hash', 'config_hash', 'guidance_hash', 'runtime_hash', 'identity_hash'}
+    return (isinstance(value, dict) and set(value) == fields and value['version'] == BEHAVIOR_VERSION and
+            all(isinstance(value[k], str) and re.fullmatch('[0-9a-f]{64}', value[k])
+                for k in fields - {'version'}) and
+            value['identity_hash'] == _sha({k: v for k, v in value.items() if k != 'identity_hash'}))
+
+
+def behavior_matches(frozen, config, store):
+    return bool(valid_behavior_identity(frozen) and frozen == behavior_info(config, store))

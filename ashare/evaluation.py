@@ -8,6 +8,7 @@ same dates. Samples are de-duplicated to one per symbol per entry day before any
 import json
 import math
 import statistics
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from .storage import now, normalize_time
 from .calendar import last_completed_day, completed_bar_cutoff, trading_day, local
@@ -16,6 +17,7 @@ BENCHMARK = 'sh000300'
 SCORE_METHOD = 'decision-time-v2'
 QUICK_SCORE_METHOD = 'decision-time-v2-q5'
 QUICK_HORIZON_DAYS = 5
+SAMPLING_METHOD = 'entry-date-cohort-v1'
 # Blockers that come from the model's judgment, as opposed to data completeness or price rules.
 RESEARCH_BLOCKERS = ('RESEARCH_VETO', 'MODEL_NOT_READY')
 
@@ -262,25 +264,43 @@ def _score(store, at, *, method, days=None):
 
 # ---------------------------------------------------------------- statistics
 
+def sample_horizon(sample, default=0):
+    """Use the scored horizon; q5 never inherits the original registry horizon."""
+    score = sample.get('score') or {}
+    if score.get('method') == QUICK_SCORE_METHOD:
+        return QUICK_HORIZON_DAYS
+    value = score.get('horizon_days', sample.get('horizon_days', default))
+    return value if type(value) is int and value > 0 else default
+
+
 def daily_samples(rows):
-    """One sample per route/symbol/eligible entry: last available judgment wins."""
+    """One sample per route/horizon/symbol/entry; latest judgment wins before splits."""
     latest = {}
     for r in rows:
-        key = (r['route'], r['symbol'], r['score']['entry_date'])
-        if key not in latest or r['created_at'] > latest[key]['created_at']:
+        key = (r['route'], sample_horizon(r), r['symbol'], r['score']['entry_date'])
+        if key not in latest or (r['created_at'], r.get('id', '')) > (latest[key]['created_at'], latest[key].get('id', '')):
             latest[key] = r
     return list(latest.values())
 
 
 def non_overlapping(samples, days):
-    """Per symbol, keep samples whose holding windows do not overlap (every `days` trading days)."""
+    """Select whole entry-date cohorts per route/horizon, before any outcome split.
+
+    Each chosen date retains every symbol. The next chosen date must be after
+    the maximum exit of that batch, so staggered symbols cannot bridge batches
+    forever. Dates and horizons determine selection, never returns or labels.
+    Callers supply daily-deduplicated rows; `days` only supplies a missing horizon.
+    """
     kept = []
-    by_symbol = {}
-    for s in sorted(samples, key=lambda s: (s['symbol'], s['score']['entry_date'])):
-        last = by_symbol.get(s['symbol'])
-        if last is None or s['score']['entry_date'] > last['score']['exit_date']:
-            kept.append(s)
-            by_symbol[s['symbol']] = s
+    partitions = defaultdict(lambda: defaultdict(list))
+    for sample in samples:
+        partitions[(sample.get('route', ''), sample_horizon(sample, days))][sample['score']['entry_date']].append(sample)
+    for key in sorted(partitions):
+        end = ''
+        for entry, batch in sorted(partitions[key].items()):
+            if entry > end:
+                kept.extend(sorted(batch, key=lambda s: (s['symbol'], s.get('id', ''))))
+                end = max(s['score']['exit_date'] for s in batch)
     return kept
 
 
@@ -360,7 +380,8 @@ def quick_comparisons(store, config, since=None, *, at=None):
             'notice': 'LIVE 为判断产生时冻结的记录，仍不等于前向实验；LEGACY 为历史补登记；UNCLASSIFIED 为没有可识别冻结来源的记录。'},
         notice='固定5日辅助价格诊断，与原评分分开保存和展示，不参与自动候选或批准，不确认实际收益、经营事实或前向实验效果。'
                'A股为可用判断后的首次交易开盘至含入场日的第5个交易日收盘；全球沿用原收盘代理，为6个已完成收盘点之间的5期变化，未计费用和汇率，不能与A股直接比较。'
-               '日样本去重、重叠窗口选择和跨标的时间聚类均在分组及分版本前完成；不足30个时间簇不显示区间。区间为聚类近似，不证明因果或未来盈利。')
+               '先按路线和期限选择不重叠入场日期批次，同日标的全部保留，再聚类和分组；每日滚动样本另保留全部重叠。'
+               '不足30个时间簇不显示区间；这是截至检查时点的观察性采样，不是前向预注册，区间为聚类近似，不证明独立、因果或未来盈利。')
     return result
 
 
@@ -369,13 +390,18 @@ def _comparisons(store, since, *, method, days, at=None):
 
     cohorts = {route: time_clusters(daily_samples(load(store, route, since, method=method, at=at)))
                for route in ('watchlist', 'portfolio', 'global')}
-    kept_ids = {s['id'] for samples in cohorts.values() for s in non_overlapping(samples, days)}
+    # Daily windows retain their original conservative clusters. Recluster the
+    # selected windows rather than inheriting a chain formed by discarded rows.
+    # Pooled horizons are reclustered together so overlapping horizons cannot
+    # masquerade as additional independent replications.
+    kept = {s['id']: s for samples in cohorts.values()
+            for s in time_clusters(non_overlapping(samples, days))}
 
     def group(name, samples, split, labels):
         result = {}
         for label in labels:
             chosen = [s for s in samples if split(s) == label]
-            result[label] = {'daily': describe(chosen), 'non_overlapping': describe([s for s in chosen if s['id'] in kept_ids])}
+            result[label] = {'daily': describe(chosen), 'non_overlapping': describe([kept[s['id']] for s in chosen if s['id'] in kept])}
         out[name] = result
 
     def groups(build=None):
@@ -392,9 +418,12 @@ def _comparisons(store, since, *, method, days, at=None):
         return dict(out)
     pooled = groups()
     builds = sorted({s.get('build_id') or 'UNKNOWN' for ss in cohorts.values() for s in ss})
-    return {'method': method, 'horizon_days': days, 'groups': pooled,
+    return {'method': method, 'sampling_method': SAMPLING_METHOD, 'horizon_days': days, 'groups': pooled,
             'by_build': {b: groups(b) for b in builds}, 'mixed_builds': len(builds) > 1,
-            'notice': '汇总仅作描述；采样在分组和分版本前完成。同标的持有期不重叠仍不等于独立，跨标的重叠窗口归为同一时间簇；不足30簇不显示区间。区间为聚类近似，未证明因果或未来盈利。全球组持有期不同且不含费用汇率，不作直接优劣结论。'}
+            'notice': '汇总仅作描述；按路线和期限先选不重叠入场日期批次，同日全部标的保留，以该批最晚退出日为下批边界，再聚类和分组。'
+                      '每日滚动样本另保留全部重叠；跨期限汇总仍合并重叠时间簇。少于30簇不显示区间。'
+                      '这是截至检查时点可用评分的观察性采样，不是前向预注册；补到的历史评分可能改变新报告的批次，旧冻结报告不改写。'
+                      '时间簇不保证独立，区间为聚类近似，未证明因果或未来盈利。全球组持有期不同且不含费用汇率，不作直接优劣结论。'}
 
 
 def registry_counts(store, *, method=SCORE_METHOD, at=None):

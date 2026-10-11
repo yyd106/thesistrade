@@ -424,14 +424,14 @@ def model_record(folder):
 
 
 def record_build(store,config,stamp):
-    from .build import record
-    with store.db:return record(store,config,stamp)
+    from .build import record, behavior_info
+    with store.db:return {**record(store,config,stamp),'behavior_identity':behavior_info(config,store)}
 
 
 def reusable(store,config,packet):
     """A successful study can be renewed without a model call when nothing it depends on changed:
     same completed daily bar and moving averages, no new or revised evidence, same event checks,
-    company dossier, adopted guidance and build. The original analysis must be recent enough."""
+    company dossier, adopted guidance and behavior. The original analysis must be recent enough."""
     hours=config.get('research_reuse_hours',0)
     learning=packet.get('learning') or {}
     if not hours or not config.get('model_enabled') or learning.get('mode')!='DELTA':return None
@@ -445,8 +445,11 @@ def reusable(store,config,packet):
     snap=store.db.execute('SELECT packet_json FROM snapshots WHERE id=?',(row['snapshot_id'],)).fetchone()
     if not plan or not snap:return None
     old=json.loads(plan['payload_json'])
-    from .build import info
-    if (old.get('build') or {}).get('build_id')!=info(config,store)['build_id']:return None
+    from .build import info, behavior_matches
+    prior_build=old.get('build') or {}
+    if 'behavior_identity' in prior_build:
+        if not behavior_matches(prior_build['behavior_identity'],config,store):return None
+    elif prior_build.get('build_id')!=info(config,store)['build_id']:return None
     def inputs(p):
         s=(p.get('stocks') or [{}])[0];u=(s.get('features') or {}).get('unadjusted') or {}
         return encode({'bar':u.get('last_complete_date'),'basis':u.get('basis'),
