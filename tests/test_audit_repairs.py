@@ -90,6 +90,8 @@ class ShadowAuditTests(fx.Fixture):
         with self.store.db:
             self.store.db.execute('UPDATE plans SET activated_at=?,valid_until=?,payload_json=? WHERE id=?',
                 (n(self.entry+'T'+hour+':00+08:00'),n(self.last+'T20:00:00+08:00'),json.dumps(payload),r['plan_id']))
+            self.store.db.execute('UPDATE plan_events SET at=? WHERE plan_id=?',
+                (n(self.entry+'T'+hour+':00+08:00'),r['plan_id']))
         return r['plan_id']
 
     def test_midmorning_plan_cannot_fill_at_open(self):

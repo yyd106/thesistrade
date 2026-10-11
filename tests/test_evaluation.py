@@ -3,8 +3,9 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 from ashare.storage import Store, normalize_time
-from ashare import evaluation, shadow, weekly
+from ashare import evaluation, portfolio_history, portfolio_strategy, shadow, weekly
 from ashare.calendar import trading_day
 from ashare.demo import seed, research_model, SYMBOL
 from ashare.research import study
@@ -116,9 +117,22 @@ class ShadowBookTests(Fixture):
         with self.store.db:
             self.store.db.execute('UPDATE plans SET activated_at=?,valid_until=?,payload_json=? WHERE id=?',
                                   (normalize_time(self.entry_day + 'T08:00:00+08:00'), normalize_time(self.exit_day + 'T20:00:00+08:00'), json.dumps(payload), done['plan_id']))
+            self.store.db.execute('UPDATE plan_events SET at=? WHERE plan_id=?',
+                                  (normalize_time(self.entry_day + 'T08:00:00+08:00'), done['plan_id']))
+            source = portfolio_strategy.source(self.store, 'watchlist', SYMBOL)
+            decision = {'key': 'watchlist:' + SYMBOL, 'route': 'watchlist', 'identity': SYMBOL,
+                        'symbol': SYMBOL, 'source_id': source['id'], 'source_token': portfolio_strategy.row_token(source),
+                        'reference_id': 'research:' + source['id'], 'related_keys': [],
+                        'evidence_ids': ['research:' + source['id']], 'membership_token': 'legacy',
+                        'action': 'ALLOW', 'target_bps': 1500}
             self.store.db.execute('INSERT INTO portfolio_decisions VALUES(?,?,?,?,?,?)', ('pd1', normalize_time(self.entry_day + 'T09:00:00+08:00'),
                                   normalize_time(self.exit_day + 'T20:00:00+08:00'), 'ACTIVE', 'cross_research_v1',
-                                  json.dumps({'decisions': [{'key': 'watchlist:' + SYMBOL, 'action': 'ALLOW', 'target_bps': 1500}]})))
+                                  json.dumps({'decisions': [decision], 'risk_groups': []})))
+            with patch.object(portfolio_history, '_clock', return_value=normalize_time(self.entry_day + 'T09:00:00+08:00')):
+                portfolio_history.ensure(self.store)
+                portfolio_history.freeze(self.store, [decision], 'pd1')
+        with patch.object(portfolio_history, '_clock', return_value=normalize_time(self.entry_day + 'T09:01:00+08:00')):
+            portfolio_history.observe(self.store)
         shadow.run(self.store, self.cfg, normalize_time(self.exit_day + 'T20:00:00+08:00'))
         buys = {r['book']: r for r in self.store.db.execute("SELECT * FROM shadow_trades_v2 WHERE side='BUY'")}
         self.assertTrue({'A-lot', 'B-lot', 'C-lot', 'D-lot'} <= set(buys))
