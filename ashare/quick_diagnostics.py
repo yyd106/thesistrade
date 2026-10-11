@@ -77,7 +77,7 @@ def _groups(value):
 
 
 def _comparison(value, *, quick=False):
-    from .evaluation import SCORE_METHOD, QUICK_SCORE_METHOD
+    from .evaluation import SCORE_METHOD, QUICK_SCORE_METHOD, SAMPLING_METHOD
     value = value if isinstance(value, dict) else {}
     counts = value.get('counts') if isinstance(value.get('counts'), dict) else {}
     builds = value.get('by_build') if isinstance(value.get('by_build'), dict) else {}
@@ -88,7 +88,11 @@ def _comparison(value, *, quick=False):
     # order for old summaries; never label that legacy order as newest-first.
     ids.sort(key=lambda k: timing[k]['last_judgment_at'] or '', reverse=True)
     shown = ids[:MAX_BUILDS]
+    sampling = value.get('sampling_method', 'legacy-unversioned')
+    if sampling not in (SAMPLING_METHOD, 'legacy-unversioned'):
+        sampling = 'unknown'
     result = {'method': QUICK_SCORE_METHOD if quick else SCORE_METHOD,
+              'sampling_method': sampling,
               'horizon_days': 5 if quick else _count(value.get('horizon_days')),
               'counts': {k: _count(v) for k, v in counts.items()
                          if isinstance(k, str) and re.fullmatch(r'(watchlist|portfolio|global):(OPEN|SCORED|UNSCORABLE)', k)},

@@ -731,7 +731,7 @@ function diagnosticHasSamples(groups) {
   return Object.values(groups&&typeof groups==='object'?groups:{}).some(rows=>rows&&typeof rows==='object'&&
     Object.values(rows).some(stats=>Number.isInteger(stats?.daily?.n)&&stats.daily.n>0));
 }
-function drawDiagnosticGroups(box,groups) {
+function drawDiagnosticGroups(box,groups,sampling) {
   if(!diagnosticHasSamples(groups)){box.append(el('p','尚无到期可评分样本；等待观察期结束并取得所需行情。','empty'));return;}
   const titles={trend_filter:'自选股 · 趋势条件',research_veto:'自选股 · 研究判断',portfolio_allow:'组合 · 增持判断',global_stance:'全球资产 · 方向判断'};
   const labels={trend_ok:'符合趋势条件',trend_fail:'未符合趋势条件',WATCH:'继续观察',NOT_WATCH:'非观察判断',ALLOW:'允许增持',NOT_ALLOW:'未允许增持',LONG:'看多',WAIT:'等待'};
@@ -744,7 +744,8 @@ function drawDiagnosticGroups(box,groups) {
       const row=el('div',null,'diagnostic-row'),daily=stats.daily||{},non=stats.non_overlapping||{};
       row.append(proposalText('h5',labels[label]||label));
       row.append(proposalText('p','逐日去重：'+diagnosticCount(daily.n)+' 份观察'+(daily.n>0?'；平均超额 '+diagnosticBps(daily.mean_bps):''),'subtle'));
-      row.append(proposalText('p','持有期不重叠：'+diagnosticCount(non.n)+' 份观察；'+diagnosticCount(non.time_clusters??(non.n===0?0:null))+' 个时间簇。'));
+      const sampleLabel=sampling==='entry-date-cohort-v1'?'入场日期批次采样':!sampling||sampling==='legacy-unversioned'?'旧口径持有期采样':'口径待核对的采样';
+      row.append(proposalText('p',sampleLabel+'：'+diagnosticCount(non.n)+' 份观察；'+diagnosticCount(non.time_clusters??(non.n===0?0:null))+' 个时间簇。'));
       if(non.n>0){
         row.append(proposalText('p','平均超额 '+diagnosticBps(non.mean_bps)+(Number.isFinite(non.hit_rate)&&non.hit_rate>=0&&non.hit_rate<=1?'；超额为正占比 '+(non.hit_rate*100).toFixed(1)+'%':'')));
         const ci=non.ci95_bps,clusters=non.time_clusters;
@@ -781,6 +782,11 @@ function drawDiagnosticTrack(box,data,auxiliary) {
   }
   section.append(proposalText('p',auxiliary?'在 5 个交易日／观测日线窗口查看短期价格变化；不含交易费用与汇率影响，不代表策略有效。':'股票采用原定 '+diagnosticCount(data.horizon_days)+' 个交易日口径；全球资产保留各自的原观察期限。','diagnostic-scope'));
   drawDiagnosticCoverage(section,data.coverage);
+  const sampling=data.sampling_method;
+  section.append(el('p',sampling==='entry-date-cohort-v1'?
+    '按路线和期限选取入场日期批次，同日标的一起保留，下一批在上批最晚退出日之后开始，再按版本和判断分组。跨期限汇总仍可能重叠；时间簇不保证独立，也不是前向预注册。':
+    !sampling||sampling==='legacy-unversioned'?'旧摘要未标注采样版本，仅供历史追溯；不能视为当前日期批次口径。':
+    '采样版本待核对；不能确认与当前日期批次口径可比。','diagnostic-notice'));
   if(typeof data.notice==='string'&&data.notice)section.append(proposalText('p',data.notice,'diagnostic-notice'));
   const routes={watchlist:'自选股',portfolio:'组合',global:'全球资产',dynamic:'动态研究'},states={OPEN:'待成熟或补齐行情',SCORED:'已评分',UNSCORABLE:'暂不可评分',EXCLUDED:'已排除'};
   const counts=el('div',null,'diagnostic-counts');
@@ -799,8 +805,8 @@ function drawDiagnosticTrack(box,data,auxiliary) {
   if(data.mixed_builds)section.append(el('p','汇总包含多个程序版本，不用于直接判断改动效果。请展开下方版本分组分别查看。','diagnostic-caution'));
   if(diagnosticHasSamples(data.groups)){
     const groupDetails=details('查看分组统计','diagnostics:'+(auxiliary?'quick':'primary')+':groups');
-    drawDiagnosticGroups(groupDetails,data.groups);section.append(groupDetails);
-  }else drawDiagnosticGroups(section,data.groups);
+    drawDiagnosticGroups(groupDetails,data.groups,sampling);section.append(groupDetails);
+  }else drawDiagnosticGroups(section,data.groups,sampling);
   const builds=Object.entries(data.by_build&&typeof data.by_build==='object'?data.by_build:{});
   const buildTime=build=>{const time=Date.parse(data.build_times?.[build]?.last_judgment_at);return Number.isFinite(time)?time:0;};
   builds.sort(([left],[right])=>buildTime(right)-buildTime(left));
@@ -812,14 +818,14 @@ function drawDiagnosticTrack(box,data,auxiliary) {
       const version=el('section',null,'diagnostic-build');version.append(proposalText('h4','程序版本：'+build));
       const timing=data.build_times?.[build];
       if(timing)version.append(el('p','已评分判断覆盖：'+diagnosticTimeRange(timing.first_judgment_at,timing.last_judgment_at)+'。','subtle'));
-      drawDiagnosticGroups(version,groups);versionDetails.append(version);
+      drawDiagnosticGroups(version,groups,sampling);versionDetails.append(version);
     }
     section.append(versionDetails);
   }
   box.append(section);
 }
 function drawScoreDiagnostics(box,data) {
-  box.append(el('p','原评分与 5 日诊断独立展示，样本不能相加。辅助诊断不参与自动批准，也不会改变研究或交易规则。','diagnostic-boundary'));
+  box.append(el('p','原评分与 5 日诊断独立展示，样本不能相加；不同生成时点的摘要也不能累计样本。辅助诊断不参与自动批准，也不会改变研究或交易规则。','diagnostic-boundary'));
   if(!data){box.append(el('p','评分诊断尚未同步。服务完成评估并同步后会在这里显示。','empty'));return;}
   if(data.status==='ERROR'){box.append(el('p','评分诊断暂未生成成功；原评分记录保留，等待后续评估与同步。','caution'));return;}
   if(data.status==='NOT_RUN'){box.append(el('p','尚未运行本轮评分诊断，等待下一次评估；暂无辅助诊断结果。','empty'));return;}

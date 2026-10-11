@@ -14,6 +14,7 @@ from .storage import digest, normalize_time, now
 from .calendar import local
 
 VERSION = 'forward-runner-v1'
+BEHAVIOR_VERSION = 'forward-runner-v2'
 CHANGE_ID = 'EXPLICIT_INVALIDATION'
 METRIC = 'verifiable_prediction_rate'
 ACTIVE = 'RUNNING'
@@ -61,7 +62,8 @@ def prepare(store, config, at=None):
     from .governance import draft_proposal
     at = normalize_time(at or now())
     current = build.info(config, store)
-    key = 'forward-pilot:' + VERSION + ':' + current['build_id']
+    behavior = build.behavior_info(config, store)
+    key = 'forward-pilot:' + BEHAVIOR_VERSION + ':' + behavior['identity_hash']
     with atomic(store):
         prior = store.db.execute('SELECT id FROM strategy_proposals WHERE dedupe_key=?', (key,)).fetchone()
         if prior:
@@ -69,7 +71,8 @@ def prepare(store, config, at=None):
             if row:
                 return {'proposal_id': prior['id'], 'id': row['id'], 'status': _status(store, row['id'])}
             raise ValueError('候选登记不完整，需核对原记录')
-        spec = {'version': experiments.VERSION, 'baseline_build': current['build_id'], 'route': 'watchlist',
+        spec = {'version': experiments.BEHAVIOR_VERSION, 'baseline_build': current['build_id'],
+            'behavior_identity': behavior, 'route': 'watchlist',
             'environment': 'ALL', 'change': {'id': CHANGE_ID, 'text': CANDIDATE_INSTRUCTION},
             'enrollment': {'start_after': at, 'window_days': 50, 'embargo_days': 40, 'windows': 2, 'minimum_pairs': 30},
             'primary_metric': METRIC,
@@ -126,7 +129,10 @@ def start(store, config, identity, note, at=None):
         if at < normalize_time(spec['enrollment']['start_after']):
             raise ValueError('尚未到设计规定的最早启动时间')
         current = build.record(store, config, at)
-        if current['build_id'] != spec['baseline_build']:
+        behavior_design = spec['version'] == experiments.BEHAVIOR_VERSION
+        compatible = (build.behavior_matches(spec['behavior_identity'], config, store) if behavior_design
+                      else current['build_id'] == spec['baseline_build'])
+        if not compatible:
             raise ValueError('原设计基线版本已变化；须登记当前实现的新设计，不冒充旧基线')
         proposal = store.db.execute('SELECT status FROM strategy_proposals WHERE id=?', (row['proposal_id'],)).fetchone()
         if not proposal or proposal[0] not in ('DRAFT', 'READY'):
@@ -140,8 +146,9 @@ def start(store, config, identity, note, at=None):
         symbols = sorted(item['symbol'] for item in config.get('watchlist', []))
         if not symbols:
             raise ValueError('没有现有自选股可供前向观察')
-        manifest = {'version': VERSION, 'experiment_id': identity, 'proposal_id': row['proposal_id'],
-            'design_hash': row['spec_hash'], 'baseline_build': current['build_id'], 'build': current,
+        manifest = {'version': BEHAVIOR_VERSION if behavior_design else VERSION,
+            'experiment_id': identity, 'proposal_id': row['proposal_id'],
+            'design_hash': row['spec_hash'], 'baseline_build': spec['baseline_build'], 'build': current,
             'model_name': config['model_name'], 'model_effort': config.get('model_reasoning_effort'),
             'schema_hash': digest(encode(measurement.SCHEMA)), 'measurement_version': measurement.VERSION,
             'common_instruction': measurement.COMMON_INSTRUCTION, 'candidate_instruction': measurement.CANDIDATE_INSTRUCTION,
@@ -153,6 +160,8 @@ def start(store, config, identity, note, at=None):
             'minimum_day_clusters': 30, 'confirmation_rule': 'POSITIVE_STRUCTURE_DELTA_AND_NONDECREASING_EXACT_CITATION_RATE',
             'missing_policy': 'ALL_ENROLLED_IN_DENOMINATOR', 'cost_basis': 'NOT_APPLICABLE_NO_TRADES',
             'production_changes': False, 'profit_evidence': False}
+        if behavior_design:
+            manifest['behavior_identity'] = spec['behavior_identity']
         store.db.execute('INSERT INTO experiment_runs VALUES(?,?,?,?)', (identity, at, digest(encode(manifest)), encode(manifest)))
         store.db.execute('INSERT INTO experiment_events(experiment_id,at,status,note) VALUES(?,?,?,?)',
             (identity, at, ACTIVE, note.strip()[:1000]))
@@ -165,7 +174,15 @@ def _running(store):
 
 def _compatible(store, config, manifest):
     from . import experiment_measurement as measurement
-    return (manifest['baseline_build'] == build.info(config, store)['build_id'] and
+    if manifest.get('version') == BEHAVIOR_VERSION:
+        compatible = build.behavior_matches(manifest.get('behavior_identity'), config, store)
+    elif manifest.get('version') == VERSION and 'behavior_identity' not in manifest:
+        # Frozen legacy contracts keep their full-build boundary forever. Never
+        # infer/migrate an identity or join their samples to a new trial.
+        compatible = manifest['baseline_build'] == build.info(config, store)['build_id']
+    else:
+        compatible = False
+    return (compatible and
             manifest['schema_hash'] == digest(encode(measurement.SCHEMA)) and
             manifest['measurement_version'] == measurement.VERSION)
 
@@ -505,6 +522,8 @@ def _summary(store, identity, stop_reason=None):
                       and a is not None and b is not None and b >= a else 'NOT_SUPPORTED')
     fields = ('enrolled', 'complete', 'failed', 'pending', 'baseline_rate', 'candidate_rate', 'paired_delta',
               'day_clusters', 'baseline_citation_rate', 'candidate_citation_rate')
+    # Public summary schema is unchanged; manifest/design versions independently
+    # identify the compatibility contract in the immutable stored records.
     return {'version': VERSION, 'manifest_hash': digest(encode(manifest)), 'baseline_build': manifest['baseline_build'],
         'started_at': manifest['started_at'], 'ends_at': manifest['ends_at'], 'status': status,
         'windows': manifest['windows'], 'primary_metric': METRIC, 'metric_label': '可检验结构比例',
