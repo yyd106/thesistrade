@@ -38,10 +38,12 @@ def bootstrap(target,path,attempts=3):
 
 def manage(config,action):
     if sys.platform!='darwin':raise RuntimeError('此服务命令仅支持macOS；其他系统使用 ./agent serve')
-    root=Path(config['data_dir']);logs=root/'logs';logs.mkdir(parents=True,exist_ok=True)
     project=Path(__file__).resolve().parents[1]
     target='gui/'+str(os.getuid());service=target+'/'+LABEL;path=plist_path()
     if action=='install':
+        # launchd opens these before starting Python. Keep them outside a data
+        # directory that may sit in macOS-protected Documents or Desktop.
+        logs=Path.home()/'Library'/'Logs'/'ThesisTrade'
         content={'Label':LABEL,'ProgramArguments':[sys.executable,'-m','ashare.cli','--config',config['config_path'],'serve'],
             'WorkingDirectory':str(project),'RunAtLoad':True,'KeepAlive':True,'ThrottleInterval':30,
             'StandardOutPath':str(logs/'service.log'),'StandardErrorPath':str(logs/'service-error.log'),
@@ -51,6 +53,7 @@ def manage(config,action):
         if path.exists():
             existing=plistlib.loads(path.read_bytes())
             if existing.get('WorkingDirectory')!=str(project):raise RuntimeError('同名服务属于其他目录，未覆盖')
+        logs.mkdir(parents=True,exist_ok=True)
         if loaded(service):subprocess.run(['/bin/launchctl','bootout',service],capture_output=True,text=True)
         if not wait_unloaded(service):raise RuntimeError('旧服务30秒内未退出，未加载新服务；请稍后重试 ./agent service install')
         atomic_write(path,plistlib.dumps(content));path.chmod(0o600)

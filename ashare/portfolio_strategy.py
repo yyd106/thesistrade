@@ -223,6 +223,8 @@ def run(store, config, at=None, model_fn=None, clock=now):
         completed = normalize_time(clock()); expires = normalize_time((datetime.fromisoformat(completed)+timedelta(hours=config.get("portfolio_authorization_hours",1))).isoformat())
         # No model call or network operation in the publication transaction.
         store.db.execute('BEGIN IMMEDIATE')
+        from . import portfolio_history
+        portfolio_history.ensure(store)
         fresh = snapshot(store,config,completed)
         if fresh['guard'] != packet['guard']:
             raise ValueError('分析期间研究、持仓或挂单变化，等待重新判断')
@@ -240,6 +242,7 @@ def run(store, config, at=None, model_fn=None, clock=now):
         candidates = current_items
         payload = {**result,'as_of':at,'input_guard':packet['guard'], 'account':packet['account'],
                    'decisions':[{**candidates[d['key']],**d} for d in result['decisions']],**identity}
+        portfolio_history.freeze(store,payload['decisions'],rid)
         from .cloud_runtime import value
         payload['remote_ledger_version']=value(store,'remote_ledger_version')
         store.db.execute("UPDATE portfolio_decisions SET status='SUPERSEDED' WHERE status='ACTIVE'")
@@ -250,6 +253,13 @@ def run(store, config, at=None, model_fn=None, clock=now):
         store.db.execute("UPDATE portfolio_runs SET finished_at=?,status='SUCCEEDED',payload_json=? WHERE id=?",(completed,encoded({'cancelled_orders':cancelled}),rid))
         store.db.execute("DELETE FROM service_state WHERE key='portfolio_dirty'")
         store.db.commit()
+        try:
+            portfolio_history.observe(store)
+        except Exception:
+            # Publication already committed. A missing visibility receipt makes
+            # historical evaluation insufficient; it must not relabel production.
+            import logging
+            logging.getLogger(__name__).exception('组合来源历史可见性标记未保存，评估将明确列为证据不足')
         json_write(folder/'validated.json',payload)
         return {'status':'SUCCEEDED','decision_id':rid,'count':len(result['decisions']),'cancelled_orders':cancelled}
     except Exception as exc:

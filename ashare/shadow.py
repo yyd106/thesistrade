@@ -10,10 +10,11 @@ different rule sets, so the contribution of each layer can be measured side by s
 Each book runs twice: with board lot sizes (100 shares, STAR 200) at live account scale, and with
 fractional shares, because at CNY 100,000 lot rounding alone can decide whether a trade happens.
 Daily bars approximate intraday execution: an entry fills when the day's range touches the band,
-exits fill at the stop or target level, or at the open when the price gaps through it. Stops are
-checked before targets. No book places orders; nothing here reaches the live ledger.
+exits fill at the stop or target level, or at the open when the price gaps through it. Opening
+events come first, then intraday double touches assume the stop first. No book places orders.
 """
 import json
+from collections import Counter
 from datetime import date, datetime, timedelta
 from .calendar import trading_day, last_completed_day, SH
 from .storage import now, normalize_time, digest
@@ -22,7 +23,8 @@ from .paper import fee, lot_rules
 BOOKS = ('A', 'B', 'C', 'D')
 VARIANTS = ('lot', 'frac')
 INITIAL_CENTS = 10_000_000
-METHOD = 'opening-evidence-v2'
+METHOD = 'opening-evidence-v3'
+CURRENT_KEY = 'shadow_current_v3'
 
 
 def encode(value):
@@ -68,14 +70,86 @@ def indicators(bars, day, config):
 
 
 def plan_at(store, symbol, at):
-    row = store.db.execute('''SELECT * FROM plans WHERE symbol=? AND activated_at<? AND valid_until>? AND status!='DRAFT'
-        AND json_extract(payload_json,'$.kind')!='RISK_EXIT_ONLY' ORDER BY activated_at DESC,rowid DESC LIMIT 1''', (symbol, at, at)).fetchone()
-    return {**dict(row), 'payload': json.loads(row['payload_json'])} if row else None
+    rows = store.db.execute('''SELECT * FROM plans WHERE symbol=? AND activated_at<?
+        AND json_extract(payload_json,'$.kind')!='RISK_EXIT_ONLY' ORDER BY activated_at DESC,rowid DESC''', (symbol, at))
+    for row in rows:
+        event = store.db.execute('''SELECT status FROM plan_events WHERE plan_id=? AND at<?
+            ORDER BY at DESC,id DESC LIMIT 1''', (row['id'], at)).fetchone()
+        if not event or event[0] != 'ACTIVE':
+            continue
+        # The newest historical ACTIVE plan is authoritative even after expiry;
+        # an older, superseded plan must never become eligible again.
+        return {**dict(row), 'status': 'ACTIVE', 'payload': json.loads(row['payload_json'])} if row['valid_until'] > at else None
+    return None
 
 
-def decision_at(store, at):
-    row = store.db.execute('SELECT * FROM portfolio_decisions WHERE created_at<? AND valid_until>? ORDER BY created_at DESC,rowid DESC LIMIT 1', (at, at)).fetchone()
-    return {d['key']: {**d, '_valid_until': row['valid_until'], '_id': row['id']} for d in json.loads(row['payload_json']).get('decisions', [])} if row else None
+def decision_at(store, at, diagnostics=None):
+    """Reconstruct the opening authorization, not today's mutable source rows."""
+    from .portfolio_strategy import row_token
+    from . import portfolio_history
+    row = store.db.execute('SELECT * FROM portfolio_decisions WHERE created_at<? ORDER BY created_at DESC,rowid DESC LIMIT 1', (at,)).fetchone()
+    if not row:
+        return None
+    payload = json.loads(row['payload_json'])
+    items = payload.get('decisions', [])
+    bykey = {d.get('key'): d for d in items}
+    accepted = {}
+    history = portfolio_history.snapshot(store, row['id'])
+    required = {'key', 'route', 'identity', 'source_id', 'source_token', 'reference_id', 'related_keys', 'evidence_ids'}
+    for d in items:
+        key = d.get('key', '')
+        if not key.startswith('watchlist:'):
+            continue
+        status, reason = 'VERIFIED', None
+        dependencies = {key}
+        if row['valid_until'] <= at:
+            status, reason = 'INVALIDATED', 'PORTFOLIO_EXPIRED'
+        elif len(bykey) != len(items) or not required <= set(d) or 'risk_groups' not in payload:
+            status, reason = 'INSUFFICIENT', 'SOURCE_PROOF_MISSING'
+        else:
+            dependencies.update(d['related_keys'])
+            refs = {x.get('reference_id'): x.get('key') for x in items if x.get('reference_id')}
+            if any(ref not in refs for ref in d['evidence_ids']):
+                status, reason = 'INSUFFICIENT', 'DEPENDENCY_RECORD_MISSING'
+            dependencies.update(refs[ref] for ref in d['evidence_ids'] if ref in refs)
+            for group in payload['risk_groups']:
+                if key in group.get('keys', []):
+                    dependencies.update(group['keys'])
+            for dependency in sorted(dependencies):
+                if status != 'VERIFIED':
+                    break
+                item = bykey.get(dependency)
+                if not item or not required <= set(item):
+                    status, reason = 'INSUFFICIENT', 'DEPENDENCY_RECORD_MISSING'
+                    break
+                source, missing = (portfolio_history.source_at(store, history, item, at) if history is not None else
+                    portfolio_history.legacy_source_at(store, item['route'], item['identity'], at))
+                if missing:
+                    status = 'INVALIDATED' if missing == 'SOURCE_CHANGED_SINCE_DECISION' else 'INSUFFICIENT'
+                    reason = missing
+                elif (source or {}).get('id') != item['source_id']:
+                    status, reason = 'INVALIDATED', 'SOURCE_ID_CHANGED'
+                elif row_token(source) != item['source_token']:
+                    status, reason = 'INVALIDATED', 'SOURCE_TOKEN_CHANGED'
+            if status == 'VERIFIED' and d.get('action') == 'ALLOW' and d.get('membership_token') not in (None, 'legacy'):
+                member = store.db.execute('''SELECT fingerprint FROM industry_memberships
+                    WHERE symbol=? AND at<? ORDER BY at DESC,id DESC LIMIT 1''', (d.get('symbol') or d['identity'], at)).fetchone()
+                token = d.get('membership_token')
+                if member and member[0] != token:
+                    status, reason = 'INVALIDATED', 'MEMBERSHIP_CHANGED'
+                elif not member and token not in (None, 'legacy'):
+                    status, reason = 'INSUFFICIENT', 'MEMBERSHIP_HISTORY_MISSING'
+            if status == 'VERIFIED' and history is None:
+                # Legacy created_at was sampled before taking the publication
+                # write lock. It cannot establish visibility before this open.
+                status, reason = 'INSUFFICIENT', 'LEGACY_PUBLICATION_TIME_UNPROVEN'
+        check = {'at': at, 'portfolio_id': row['id'], 'key': key, 'status': status,
+                 'reason': reason, 'dependencies': sorted(dependencies)}
+        if diagnostics is not None:
+            diagnostics.append(check)
+        if status == 'VERIFIED':
+            accepted[key] = {**d, '_valid_until': row['valid_until'], '_id': row['id']}
+    return accepted
 
 
 def entry_price(levels, o, h, l):
@@ -91,13 +165,13 @@ def entry_price(levels, o, h, l):
 
 
 def exit_price(stop, target, o, h, l):
-    """Stop first (conservative). Gaps through a level fill at the open."""
+    """Known opening events precede the unknown intraday path; then stop first."""
     if stop and o <= stop:
         return o, 'STOP'
-    if stop and l <= stop:
-        return stop, 'STOP'
     if target and o >= target:
         return o, 'TARGET'
+    if stop and l <= stop:
+        return stop, 'STOP'
     if target and h >= target:
         return target, 'TARGET'
     return None, None
@@ -284,16 +358,26 @@ def run_day(store, config, day, symbols, data, run_id):
 def run(store, config, at=None):
     """Replay a complete consecutive prefix into an immutable, input-addressed batch.
 
-    Late/corrected bars regenerate all dependent days. V1 and previous V2 batches
+    Late/corrected bars regenerate all dependent days. All previous method batches
     remain intact; a single pointer is published only after the replay commits.
     """
     if not config.get('shadow_books_enabled', True):
         return {'status': 'DISABLED'}
     at = normalize_time(at or now())
+    from .portfolio_history import observe
+    observe(store)
     last = last_completed_day(at)
     if not last:
         return {'status': 'CALENDAR_UNKNOWN'}
     first = start_day(store, config, at)
+    # Freeze source evidence, its fingerprint and every resulting book-day in
+    # one snapshot; a concurrent publication cannot alter the replay mid-run.
+    with store.db:
+        store.db.execute('BEGIN IMMEDIATE')
+        return _run_locked(store, config, at, first, last)
+
+
+def _run_locked(store, config, at, first, last):
     symbols = sorted(i['symbol'] for i in config['watchlist'])
     data = {s: {d: b for d, b in bars_for(store, s).items() if d <= last} for s in symbols}
     processed, missing = [], []
@@ -304,26 +388,36 @@ def run(store, config, at=None):
             break
         processed.append(day)
     cutoffs = [normalize_time(d + 'T09:30:00+08:00') for d in processed]
-    evidence = [{'at': t, 'plans': {s: plan_at(store, s, t) for s in symbols}, 'decisions': decision_at(store, t)} for t in cutoffs]
+    checks = []
+    evidence = [{'at': t, 'plans': {s: plan_at(store, s, t) for s in symbols}, 'decisions': decision_at(store, t, checks)} for t in cutoffs]
+    authorization = {'status': 'INSUFFICIENT' if any(c['status'] == 'INSUFFICIENT' for c in checks) else 'CHECKED',
+                     'counts': dict(Counter(c['status'] for c in checks)),
+                     'reasons': dict(Counter(c['reason'] for c in checks if c['reason'])), 'checks': checks}
     settings = {k: v for k, v in config.items() if k.startswith(('paper_', 'shadow_'))}
-    rid = digest(encode([METHOD, first, last, symbols, data, evidence, settings]))[:32]
+    rid = digest(encode([METHOD, first, last, symbols, data, evidence, authorization, settings]))[:32]
     result = {'status': 'SUCCEEDED' if not missing else ('PARTIAL' if processed else 'WAITING_DATA'),
               'method': METHOD, 'run_id': rid, 'start': first, 'requested_through': last,
               'through': processed[-1] if processed else None, 'missing': missing, 'days': processed,
-              'limitations': '日线近似；未模拟盘中授权更新、12小时心跳、账户回撤停机及公司行为，不代表可执行净收益。缺价未确证停牌时等待。'}
-    with store.db:
-        exists = store.db.execute('SELECT 1 FROM shadow_evaluations WHERE id=?', (rid,)).fetchone()
-        if not exists:
-            for day in processed:
-                run_day(store, config, day, symbols, data, rid)
-            store.db.execute('INSERT INTO shadow_evaluations VALUES(?,?,?,?)', (rid, METHOD, at, encode(result)))
-        store.db.execute("INSERT OR REPLACE INTO service_state VALUES('shadow_current_v2',?)", (rid,))
+              'authorization_checks': authorization,
+              'limitations': '日线近似；未模拟盘中授权更新、12小时心跳、账户回撤停机及公司行为，不代表可执行净收益。缺价未确证停牌时等待。'
+                  '开盘部分减仓与同日剩余仓位退出的先后仍是独立已知边界。'
+                  '授权核验：' + encode(authorization['counts']) + '；原因：' + encode(authorization['reasons']) +
+                  '。A/B按历史计划与行情近似；C/D另需来源和发布可见性证明。旧组合缺少提交时间上界，不能仅凭created_at确认开盘前可用。'
+                  'INSUFFICIENT表示历史证据不足，相关C/D项保守跳过，不是研究WAIT，也不能用对应收益评价组合有效性。'}
+    if not missing and authorization['status'] == 'INSUFFICIENT':
+        result['status'] = 'INSUFFICIENT'
+    exists = store.db.execute('SELECT 1 FROM shadow_evaluations WHERE id=?', (rid,)).fetchone()
+    if not exists:
+        for day in processed:
+            run_day(store, config, day, symbols, data, rid)
+        store.db.execute('INSERT INTO shadow_evaluations VALUES(?,?,?,?)', (rid, METHOD, at, encode(result)))
+    store.db.execute('INSERT OR REPLACE INTO service_state VALUES(?,?)', (CURRENT_KEY, rid))
     return {**result, 'days': [] if exists else processed, 'reused': bool(exists)}
 
 
 def status(store):
     row = store.db.execute("""SELECT e.payload_json FROM shadow_evaluations e JOIN service_state s
-        ON s.key='shadow_current_v2' AND e.id=s.value WHERE e.method=?""", (METHOD,)).fetchone()
+        ON s.key=? AND e.id=s.value WHERE e.method=?""", (CURRENT_KEY, METHOD)).fetchone()
     return json.loads(row[0]) if row else {'status': 'NOT_RUN', 'method': METHOD}
 
 
