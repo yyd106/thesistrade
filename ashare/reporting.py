@@ -61,12 +61,20 @@ def portfolio(store, config, a, at):
             'qty':p['qty']/p['qty_scale'],'sellable_qty':p['qty']/p['qty_scale'],'weight_pct':pct(value,a['equity_cents']),
             'unrealized_cents':unrealized,'unrealized_return_pct':pct(unrealized,cost) if unrealized is not None else None,
             'quote_same_day':p['valuation_complete'],'valuation_basis':'LAST_QUOTE' if p.get('price_micros') else 'COST_FALLBACK'})
+    cashflows = {r[0]: r[1] for r in store.db.execute(
+        "SELECT kind,sum(amount_cents) amount FROM paper_flows WHERE account_id='DEMO_PAPER' "
+        "AND kind IN ('CASH_DIVIDEND','DIVIDEND_TAX') AND created_at<=? GROUP BY kind", (normalize_time(at),))}
+    dividend = cashflows.get('CASH_DIVIDEND', 0)
+    dividend_tax = -cashflows.get('DIVIDEND_TAX', 0)
     return {
         'holdings': sorted(holdings, key=lambda p: (-p['market_value_cents'], p['symbol'])),
         'cash_weight_pct': pct(a['cash_cents'], a['equity_cents']),
         'stock_weight_pct': pct(a['market_value_cents'], a['equity_cents']),
         'total_profit_cents': a['equity_cents'] + a['withdrawn_cents'] - a['initial_cents'],
-        'cumulative_dividend_cents': store.db.execute("SELECT coalesce(sum(amount_cents),0) FROM paper_flows WHERE account_id='DEMO_PAPER' AND kind='CASH_DIVIDEND' AND created_at<=?", (normalize_time(at),)).fetchone()[0],
+        'cumulative_dividend_cents': dividend,
+        'cumulative_dividend_tax_cents': dividend_tax,
+        'cumulative_net_dividend_cents': dividend - dividend_tax,
+        'dividend_accounting_version': 'CASH_DIVIDEND_TAX_V1',
         'cumulative_realized_cents': sum(store.db.execute(f'SELECT coalesce(sum(realized_cents),0) FROM {table} WHERE occurred_at<=?', (normalize_time(at),)).fetchone()[0] for table in ('paper_fills', 'dynamic_fills', 'global_fills')),
         'unrealized_cents': sum(p['unrealized_cents'] for p in holdings)
             if all(p['unrealized_cents'] is not None for p in holdings) else None,
