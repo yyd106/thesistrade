@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from .calendar import local, last_completed_day
 
-VERSION='portfolio-review-3'
+VERSION='portfolio-review-4'
 
 
 def executions(store, end, known_at):
@@ -156,27 +156,50 @@ def build(store,config,start,end,known_at):
         cash=sum(f['amount_cents'] for f in flows)+sum((1 if f['side']=='SELL' else -1)*f.get('gross_cents',f['qty']*f['price_cents'])-f['fee_cents'] for f in fills if f['occurred_at']<boundary)
         mv=total([p['market_value_cents'] for p in valuations])
         initial=next((f for f in flows if f['kind']=='SIMULATED_INITIAL'),None)
+        dividend=sum(f['amount_cents'] for f in flows if f['kind']=='CASH_DIVIDEND')
+        tax=-sum(f['amount_cents'] for f in flows if f['kind']=='DIVIDEND_TAX')
         return {'cash_cents':cash if initial else None,'equity_cents':cash+mv if initial and mv is not None else None,
             'market_value_cents':mv,'cost_cents':sum(p['cost_cents'] for p in valuations),'unrealized_cents':total([p['unrealized_cents'] for p in valuations]),
             'cumulative_realized_cents':sum(p['realized_cents'] for p in states.values()),
+            'cumulative_dividend_cents':dividend if initial else None,
+            'cumulative_dividend_tax_cents':tax if initial else None,
+            'cumulative_net_dividend_cents':dividend-tax if initial else None,
             'valuation_complete':all(p['quality'] in ('CLOSE','RECENT','NO_POSITION') for p in valuations)}
     first,last=balance(start,opening),balance(end,closing)
     cumulative=last['cumulative_realized_cents']+last['unrealized_cents'] if last['unrealized_cents'] is not None else None
     from .dividends import parse,KIND
     dividends=[]
-    for f in store.db.execute("SELECT reference,amount_cents,created_at FROM paper_flows WHERE kind=? AND created_at>=? AND created_at<?",(KIND,start,end)):
+    for f in store.db.execute("SELECT reference,amount_cents,created_at FROM paper_flows WHERE account_id='DEMO_PAPER' AND kind=? AND created_at>=? AND created_at<?",(KIND,start,end)):
         d=parse(f['reference'])
         if d:dividends.append({'symbol':d['symbol'],'ex_date':d['ex_date'],'record_date':d['record_date'],'qty':d['qty'],
                                'cash_per_share':format(d['cash'],'f'),'amount_cents':f['amount_cents'],'credited_at':f['created_at']})
+    # Tax is a separate posted cashflow. Never subtract it from immutable fill
+    # realized P&L or move a later catch-up charge back to the original sale day.
+    period_flows=list(store.db.execute("SELECT kind,amount_cents FROM paper_flows WHERE account_id='DEMO_PAPER' AND created_at>=? AND created_at<?",(start,end)))
+    period_dividend=sum(f['amount_cents'] for f in period_flows if f['kind']=='CASH_DIVIDEND')
+    period_tax=-sum(f['amount_cents'] for f in period_flows if f['kind']=='DIVIDEND_TAX')
+    period_trading=total([p['period_profit_cents'] for p in positions])
+    from .dividend_tax import tax_history
+    taxes=[{k:d[k] for k in ('symbol','qty','record_date','ex_date','sold_at','posted_at','tax_cents')}
+           for d in tax_history(store) if start<=d['posted_at']<end]
+    net=last['cumulative_net_dividend_cents']
     return {'version':VERSION,'scope':'ALL_POSITIONS','window_start':start,'window_end':end,
         'positions':sorted(positions,key=lambda p:-(p['closing']['market_value_cents'] or 0)),'research':list(research.values()),
         'fills':[{**({'portfolio_decision':f['portfolio_decision']} if f.get('portfolio_decision') else {}),**{k:f.get(k) for k in ('qty_scale','gross_cents','price_micros','fx_micros')},**{k:f[k] for k in ('id','order_id','research_id','origin','symbol','side','qty','price_cents','fee_cents','realized_cents','occurred_at','recorded_at')}} for f in fills if f['id'] in {i for p in positions for i in p['fill_ids']}],
         'opening':first,'closing':last,'totals':{'holding_count':sum(p['closing']['qty']>0 for p in positions),'reviewed_position_count':len(positions),
             'period_fill_count':len(window),'period_fee_cents':sum(f['fee_cents'] for f in window),'period_realized_cents':sum(f['realized_cents'] for f in window),
-            'period_profit_cents':total([p['period_profit_cents'] for p in positions]),'cumulative_profit_cents':cumulative},
-        'dividends':dividends,
+            'period_profit_cents':period_trading,'cumulative_profit_cents':cumulative,
+            'period_dividend_cents':period_dividend,'period_dividend_tax_cents':period_tax,
+            'period_net_dividend_cents':period_dividend-period_tax,
+            'account_period_profit_cents':period_trading+period_dividend-period_tax if period_trading is not None else None},
+        'dividends':dividends,'dividend_taxes':taxes,'dividend_accounting_version':'CASH_DIVIDEND_TAX_V1',
+        'period_dividend_tax_cents':period_tax,'period_net_dividend_cents':period_dividend-period_tax,
+        'cumulative_dividend_cents':last['cumulative_dividend_cents'],
+        'cumulative_dividend_tax_cents':last['cumulative_dividend_tax_cents'],'cumulative_net_dividend_cents':net,
+        'account_period_profit_cents':period_trading+period_dividend-period_tax if period_trading is not None else None,
+        'account_cumulative_profit_cents':cumulative+net if cumulative is not None and net is not None else None,
         'valuation_notice':'按截止前最后报价估值；非收盘、缺失和事后补齐的历史报价逐项标注。期内损益=期内已实现+期末浮动−期初浮动，已计费用；短期盈亏不等于研究因果已验证。'
-            '现金分红记入现金（见dividends），不在持仓损益内；除息日股价按分红下调不是亏损。'}
+            '税前现金分红与分红税分别记入现金（见dividends、dividend_taxes），不改成交损益；账户损益另加税前分红并减已扣税。补扣税计入实际入账期间，不回写历史成交或复盘。'}
 
 
 def model_view(portfolio,budget=40000):
@@ -192,6 +215,10 @@ def model_view(portfolio,budget=40000):
                 'levels':plan.get('levels'),'event_analysis':{k:a[k] for k in ('direction','rationale','invalidation','conditions') if k in a}})
         view={k:portfolio[k] for k in ('version','scope','window_start','window_end','positions','opening','closing','totals','valuation_notice')}
         if portfolio.get('dividends'):view['dividends']=portfolio['dividends']
+        for key in ('dividend_taxes','dividend_accounting_version','period_dividend_tax_cents','period_net_dividend_cents',
+                    'cumulative_dividend_cents','cumulative_dividend_tax_cents','cumulative_net_dividend_cents',
+                    'account_period_profit_cents','account_cumulative_profit_cents'):
+            if key in portfolio:view[key]=portfolio[key]
         view['research']=research;view['fills']=portfolio['fills']
         if len(json.dumps(view,ensure_ascii=False))<=budget:return view
     raise ValueError('全仓复盘资料超过预算，事实已保存；需减少单条研究长度或分批处理')
