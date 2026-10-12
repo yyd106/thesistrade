@@ -298,11 +298,17 @@ def extended(args, config):
         finally:store.close()
     if command == 'dividends':
         from .dividends import due, history, supported
+        from .dividend_tax import tax_due, tax_history
         from .paper import positions
         store = Store(config['data_dir'])
         try:
             stamp = now();held = positions(store, stamp);expected = due(store, stamp)
+            taxes = tax_history(store)
+            pending_taxes = tax_due(store, stamp)
             return {'executing_ledger_credits': supported(store, config), 'credits': history(store),
+                    'tax_basis': 'CN_A_INDIVIDUAL_DAILY_NET_V1',
+                    'taxes': taxes, 'tax_due': pending_taxes,
+                    'tax_paid_cents': sum(item['tax_cents'] for item in taxes),
                     # On the research node a newly verified dividend is listed here until the next publication
                     # reaches the cloud and it credits (minutes); one listed for hours is an error to report.
                     'due': expected['due'], 'not_yet_credited': [d for d in expected['due'] if not d['credited']], 'conflicts': expected['conflicts'],
