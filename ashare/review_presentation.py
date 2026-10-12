@@ -145,6 +145,10 @@ def accounting(portfolio, store=None, known_at=None, positions=None):
         'dividend_count': portfolio.get('dividend_count', len(valid)),
         'dividends_known': 'dividends' in portfolio or portfolio.get('dividends_known', False),
         'valuation_notice': text(portfolio.get('valuation_notice'), 700)}
+    for key in ('dividend_accounting_version', 'period_dividend_tax_cents', 'period_net_dividend_cents',
+                'cumulative_dividend_tax_cents', 'cumulative_net_dividend_cents', 'account_period_profit_cents'):
+        if key in portfolio:
+            result[key] = portfolio[key]
     start, end = stamp(portfolio.get('window_start')), stamp(portfolio.get('window_end'))
     if store and start and end:
         # A read-only supplement to frozen reports. The window is the credit time,
@@ -158,12 +162,15 @@ def accounting(portfolio, store=None, known_at=None, positions=None):
         equity = (portfolio.get('closing') or {}).get('equity_cents')
         initial = [row for row in flows if row['kind'] == 'SIMULATED_INITIAL']
         cumulative = sum(row['amount_cents'] for row in credited) if initial else portfolio.get('cumulative_dividend_cents')
+        taxes = [row for row in flows if row['kind'] == 'DIVIDEND_TAX']
+        cumulative_tax = -sum(row['amount_cents'] for row in taxes) if initial else portfolio.get('cumulative_dividend_tax_cents')
+        net = cumulative - cumulative_tax if type(cumulative) is int and type(cumulative_tax) is int else portfolio.get('cumulative_net_dividend_cents')
         withdrawn = -sum(row['amount_cents'] for row in flows if row['kind'] == 'SIMULATED_WITHDRAWAL')
         account = equity + withdrawn - sum(row['amount_cents'] for row in initial) if type(equity) is int and initial else None
-        difference = account - trading - cumulative if type(trading) is int and account is not None and type(cumulative) is int else None
+        difference = account - trading - net if type(trading) is int and account is not None and type(net) is int else None
         basis = 'FROZEN_EQUITY_WITH_LEDGER_FLOWS' if account is not None else 'TRADE_PNL_PLUS_LEDGER_DIVIDENDS'
-        if account is None and type(trading) is int and type(cumulative) is int:
-            account = trading + cumulative
+        if account is None and type(trading) is int and type(net) is int:
+            account = trading + net
         if not initial:
             basis = 'FROZEN_DISPLAY' if type(cumulative) is int else 'FLOW_HISTORY_UNAVAILABLE'
             # An incomplete cloud replica must retain a signed reconciliation,
@@ -173,11 +180,18 @@ def accounting(portfolio, store=None, known_at=None, positions=None):
                 difference = portfolio.get('reconciliation_difference_cents')
         if initial:
             result.update(dividend_cents=sum(row['amount_cents'] for row in period), dividend_count=len(period), dividends_known=True)
+            period_tax = -sum(row['amount_cents'] for row in taxes if row['created_at'] >= start)
+            period_net = result['dividend_cents'] - period_tax
+            period_trading = (portfolio.get('totals') or {}).get('period_profit_cents')
+            result.update(dividend_accounting_version='CASH_DIVIDEND_TAX_V1', period_dividend_tax_cents=period_tax,
+                          period_net_dividend_cents=period_net,
+                          account_period_profit_cents=period_trading + period_net if type(period_trading) is int else None)
         result.update(period_dividend_cents=result['dividend_cents'] if result['dividends_known'] else None,
                       cumulative_dividend_cents=cumulative, cumulative_dividend_count=len(credited) if initial else portfolio.get('cumulative_dividend_count'),
+                      cumulative_dividend_tax_cents=cumulative_tax, cumulative_net_dividend_cents=net,
                       account_cumulative_profit_cents=account, reconciliation_difference_cents=difference,
                       accounting_basis=basis,
-                      accounting_notice='以冻结复盘估值和截止前已入账流水对账；累计分红包含此前及已清仓股份的分红，24小时分红仅统计本期入账。累计交易损益含全部历史卖出和期末浮动损益、已计费用；账户累计收益还含现金分红。展示补充不会修改原复盘记录。')
+                      accounting_notice='以冻结复盘估值和截止前已入账流水对账；累计税前分红包含此前及已清仓股份的分红，账户收益另加税前分红并减已扣分红税。24小时分红和分红税仅统计本期实际入账，补扣不回写旧成交或旧复盘。累计交易损益含全部历史卖出和期末浮动损益、已计成交费用。')
         if positions is None:
             positions = portfolio.get('positions') or []
         result['quote_provenance'] = [

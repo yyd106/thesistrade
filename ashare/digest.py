@@ -288,12 +288,17 @@ def execution(store, config, a, b):
     risk = _json(risk[0]['payload_json'], {}) if risk else {}
     from .dividends import parse, KIND
     dividends = []
-    for r in _rows(store, 'SELECT reference,amount_cents FROM paper_flows WHERE kind=? AND created_at>=? AND created_at<? ORDER BY created_at', (KIND, a, b)):
+    credited = _rows(store, "SELECT reference,amount_cents FROM paper_flows WHERE account_id='DEMO_PAPER' AND kind=? AND created_at>=? AND created_at<? ORDER BY created_at", (KIND, a, b))
+    for r in credited:
         d = parse(r['reference'])
         if d:
             dividends.append({'symbol': d['symbol'], 'name': _names(config).get(d['symbol'], d['symbol']), 'ex_date': d['ex_date'],
                               'qty': d['qty'], 'cash_per_share': format(d['cash'], 'f'), 'amount_cents': r['amount_cents']})
+    tax_flows = _rows(store, "SELECT amount_cents FROM paper_flows WHERE account_id='DEMO_PAPER' AND kind='DIVIDEND_TAX' AND created_at>=? AND created_at<?", (a, b))
+    dividend_tax = -sum(row['amount_cents'] for row in tax_flows)
     return {'fills': fills, 'orders_created': dict(orders), 'dividends': dividends,
+            'dividend_tax_cents': dividend_tax, 'dividend_tax_count': len(tax_flows),
+            'net_dividend_cents': sum(d['amount_cents'] for d in credited) - dividend_tax,
             'equity_start_cents': start['equity_cents'] if start else None, 'equity_end_cents': end['equity_cents'] if end else None,
             'marked_start_at': start['at'] if start else None, 'equity_change_cents': equity_change,
             'withdrawal_change_cents': withdrawn_change,
@@ -571,6 +576,8 @@ def markdown(d):
         L.append('- 当天没有成交。')
     for x in e.get('dividends', []):
         L.append(f"- 分红入账：{x['name']} {x['qty']} 股 × 每股 {x['cash_per_share']} 元 = {_yuan(x['amount_cents'])} 元（税前，除息日 {x['ex_date']}）。")
+    if e.get('dividend_tax_count'):
+        L.append(f"- 分红已扣税 {_yuan(e['dividend_tax_cents'])} 元（{e['dividend_tax_count']} 笔，按实际入账日计）；当期分红净入账 {_yuan(e['net_dividend_cents'])} 元。已从现金和账户收益扣除，不重复扣减成交损益。")
     withdrawals = e.get('withdrawals', {})
     if withdrawals.get('count'):
         L.append(f"- 当天模拟利润提取：{withdrawals['count']} 笔，共 {_yuan(withdrawals['amount_cents'])} 元；这是资金流出，不计投资亏损。")

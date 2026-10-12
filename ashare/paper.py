@@ -318,6 +318,10 @@ def settle(store,config,at):
             reserve=remaining*o['limit_cents']+max(0,fee(order_config,'BUY',prev[0]+gross+remaining*o['limit_cents'])-prev[1]-costs) if o['side']=='BUY' and remaining else 0
             store.db.execute('UPDATE paper_orders SET filled_qty=?,reserved_cents=?,status=? WHERE id=?',(filled,reserve,'FILLED' if not remaining else 'PARTIAL',o['id']))
             results.append({'fill_id':fid,'order_id':o['id'],'symbol':o['symbol'],'side':o['side'],'qty':qty,'price_cents':price})
+        # Today's disposal can be offset by a later buyback. Tax only finalized
+        # daily net sales; catch up older debts in this same cash transaction.
+        from .dividend_tax import reconcile_taxes_inside
+        reconcile_taxes_inside(store, config, at)
         store.db.commit()
     except BaseException:
         store.db.rollback();raise
