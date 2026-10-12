@@ -7,8 +7,9 @@ the record-date close, once per dividend. The lots keep their cost; instead the 
 the dividends already received on the shares still held, so it measures price plus cash received
 against cost (paper.positions -> dividend_cents, slots.hard_reason).
 
-Not handled: dividend tax deducted at sale, bonus shares and capital-reserve conversions,
-rights issues, differentiated dividends (never verified), and the dynamic and global routes."""
+Individual dividend tax is reconciled after each sale day closes (dividend_tax).
+Not handled: bonus shares and capital-reserve conversions, rights issues,
+differentiated dividends (never verified), and the dynamic and global routes."""
 from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta
@@ -100,14 +101,21 @@ def _credited(store, symbol, ex_date):
                             (KIND, len(prefix), prefix)).fetchone() is not None
 
 
-def apply(store, symbol, action, at):
+def apply(store, symbol, action, at, config=None):
     """Credit one verified dividend for the shares held at the record-date close; a no-op when it was
     already credited, the ex-date has not come, or nothing was held. Returns the credit or None."""
+    from .dividend_tax import can_post
+    config = config or {'mode': 'paper'}
+    if not can_post(store, config):
+        return None
     at = normalize_time(at)
     if action['ex_date'] > local(at).date().isoformat():
         return None
     store.db.execute('BEGIN IMMEDIATE')
     try:
+        if not can_post(store, config):
+            store.db.commit()
+            return None
         qty = held_at_record(store, symbol, action['record_date'])
         cents = amount_cents(qty, action['cash']) if qty > 0 else 0
         if _credited(store, symbol, action['ex_date']) or cents <= 0:
@@ -117,6 +125,10 @@ def apply(store, symbol, action, at):
         store.db.execute('INSERT INTO paper_flows VALUES(?,?,?,?,?,?)', (digest(ACCOUNT + ':' + ref)[:24], ACCOUNT, KIND, cents, ref, at))
         if store.db.execute('UPDATE paper_accounts SET cash_cents=cash_cents+? WHERE id=?', (cents, ACCOUNT)).rowcount != 1:
             raise ValueError('模拟账户未初始化，不能记入分红')
+        # A dividend learned after disposal brings its tax into the same cash
+        # transaction; a failed debit rolls back this credit too.
+        from .dividend_tax import reconcile_taxes_inside
+        reconcile_taxes_inside(store, config, at)
         store.db.commit()
     except BaseException:
         store.db.rollback()
@@ -140,10 +152,15 @@ def _published(store, at):
 
 
 def credit(store, config, at):
-    """Credit every verified cash dividend due on shares held at its record date."""
+    """Credit due dividends, then reconcile all credited dividend taxes (no lookback cap)."""
+    from .dividend_tax import can_post
+    if not can_post(store, config):
+        return {'credited': [], 'conflicts': []}
     at = normalize_time(at)
     found, conflicts = _published(store, at)
-    credited = [done for done in (apply(store, symbol, a, at) for symbol, a in found) if done]
+    credited = [done for done in (apply(store, symbol, a, at, config) for symbol, a in found) if done]
+    from .dividend_tax import reconcile_taxes
+    reconcile_taxes(store, config, at)
     return {'credited': credited, 'conflicts': conflicts}
 
 
