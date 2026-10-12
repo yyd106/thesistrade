@@ -42,6 +42,8 @@ def public_fields():
       period_profit_cents cumulative_profit_cents period_fee_cents period_fill_count entry_research_ids research_ids research_gap
       fill_ids holding_count reviewed_position_count dividend_cents dividend_count dividends_known plan thesis decision trigger
       period_dividend_cents cumulative_dividend_cents cumulative_dividend_count account_cumulative_profit_cents
+      dividend_accounting_version period_dividend_tax_cents cumulative_dividend_tax_cents period_net_dividend_cents
+      cumulative_net_dividend_cents account_period_profit_cents dividend_taxes tax_cents posted_at sold_at record_date ex_date
       reconciliation_difference_cents accounting_basis accounting_notice quote_provenance quote_source quote_source_label
       quote_time_kind quote_time_notice provenance_status
       position_key verdict reason supported_points contradicted_points pending_points next_check validation_warnings
