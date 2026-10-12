@@ -472,7 +472,7 @@ class Scheduler:
             self.experiment_future=self.experiment_pool.submit(experiment_runner.worker,dict(config),pending['id'],self.experiment_cancel)
 
     def credit_dividends(self,store,config,stamp):
-        """Credit due cash dividends. A failure is recorded in service_state and never stops the clock."""
+        """Credit dividends and reconcile closed-day tax; failures remain explicit in service_state."""
         from .dividends import credit
         try:
             result=credit(store,config,stamp)
