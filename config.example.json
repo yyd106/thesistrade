@@ -2,6 +2,8 @@
   "schema_version": 1,
   "mode": "paper",
   "timezone": "Asia/Shanghai",
+  "strategy_freshness_enabled": true,
+  "global_macro_context_enabled": true,
   "data_dir": "../ashare-data",
   "watchlist_kind": "user_selected",
   "watchlist": [

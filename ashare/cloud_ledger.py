@@ -9,7 +9,7 @@ APPEND=('quotes','dynamic_quotes','global_quotes','slots','decisions','paper_ord
 SUPPORT=('snapshots','studies','plans','global_plans','dynamic_news','dynamic_cases')
 BOOT=SUPPORT+APPEND+MUTABLE+('portfolio_runs','portfolio_decisions','reviews','lessons','research_methods','research_improvements','app_users')
 # Advertised by the cloud so a newer research node only uses what the deployed cloud understands.
-FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','cash_dividend_credit','quote_health','notices','supervision_summary','review_news_display_v1','review_news_display_v2','approval_receipts_v1','simulated_withdrawals_v1')
+FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','cash_dividend_credit','quote_health','notices','supervision_summary','review_news_display_v1','review_news_display_v2','approval_receipts_v1','simulated_withdrawals_v1','strategy_freshness_v1')
 PRIMARY={'latest_trade_checks':'symbol'}
 # Appended rows the cloud later updates in place; their updates travel through the change log.
 UPDATED_APPEND=('slots',)
@@ -153,10 +153,12 @@ def export_ledger_v2(store,body,at,limit=1500,config=None):
         from .quote_health import changed_since
         from .notices import for_replica
         from .withdrawals import status as withdrawal_status
+        from .freshness_sync import history as freshness_history
         packet['extras']={}
         for key,build in (('quote_health',lambda:changed_since(store,extras['quote_health'],at)),
                           ('notices',lambda:for_replica(store,extras['notices'])),
-                          ('withdrawals',lambda:withdrawal_status(store,config or {'deployment_role':'cloud','mode':'paper'},at))):
+                          ('withdrawals',lambda:withdrawal_status(store,config or {'deployment_role':'cloud','mode':'paper'},at)),
+                          ('freshness',lambda:freshness_history(store,at))):
             if key not in extras:continue
             try:packet['extras'][key]=build()
             except Exception as exc:
@@ -217,7 +219,8 @@ def import_extras(store,config,extras):
     if not isinstance(extras,dict):return
     from datetime import datetime,timezone
     stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
-    for key,apply in (('quote_health',_mirror_health),('notices',_mirror_notices),('withdrawals',_mirror_withdrawals)):
+    from .freshness_sync import mirror_history
+    for key,apply in (('quote_health',_mirror_health),('notices',_mirror_notices),('withdrawals',_mirror_withdrawals),('freshness',mirror_history)):
         if key+'_error' in extras:
             put(store,'extras_error_'+key,{'at':stamp,'error':'云端：'+str(extras[key+'_error'])[:200]});continue
         if key not in extras:continue

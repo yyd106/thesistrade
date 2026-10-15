@@ -234,6 +234,86 @@ function renderChanged(id,key,draw) {
   box.querySelectorAll('details[data-key]').forEach(d=>{if(opened.has(d.dataset.key))d.open=true;});
   renderingCache.set(id,signature);
 }
+function freshnessDuration(seconds) {
+  if(typeof seconds!=='number'||!Number.isFinite(seconds)||seconds<0)return '未知';
+  if(seconds===0)return '0 分钟';
+  if(seconds<60)return '不足 1 分钟';
+  if(seconds<3600)return Math.round(seconds/60)+' 分钟';
+  return (seconds/3600).toLocaleString('zh-CN',{maximumFractionDigits:1})+' 小时';
+}
+function freshnessCount(value) {return Number.isSafeInteger(value)&&value>=0?String(value):'未知';}
+function freshnessAge(age,count) {
+  if(count===0)return '无成交';
+  if(!age||age.known===0||age.known==null)return '未知';
+  return '均值 '+freshnessDuration(age.mean_seconds)+' / 最大 '+freshnessDuration(age.max_seconds)
+    +(age.unknown?'；另 '+freshnessCount(age.unknown)+' 笔未知':'');
+}
+function freshnessLease(view) {
+  const lease=view.current_lease;
+  if(!lease)return '当前云端研究有效期：待同步核对';
+  if(!lease.initialized||!lease.execution_enabled)return '云端执行尚未启用';
+  return lease.active?'云端研究有效期还剩 '+freshnessDuration(lease.remaining_seconds):'云端研究已过期，暂停新买入';
+}
+function drawStrategyFreshness(box,view) {
+  const panel=details('策略新鲜度 · '+freshnessLease(view),'strategy-freshness');
+  box.append(panel);
+  if(view.current_lease)panel.append(el('p','当前云端状态：'+freshnessLease(view)+'。','subtle'));
+  if(view.stale)panel.append(el('p','统计摘要尚未更新，以下仅为上次快照；当前研究有效期以上方云端实时状态为准。','caution'));
+  const data=view.summary;
+  if(view.status!=='OK'||!data){panel.append(el('p',view.status==='AWAITING_SYNC'?'策略新鲜度统计等待本机同步，未知不表示没有中断或成交。':'策略新鲜度统计暂不可用，未知不表示没有中断或成交。','empty'));return;}
+  panel.append(el('p','统计截至 '+when(data.as_of)+'（北京时间）。计划签发龄是计划签发后的时长；原研究龄是所依据研究完成后的时长，续签不会让原研究变新。','subtle'));
+  const heartbeat=data.heartbeat||{};
+  panel.append(el('p','最近研究完成 '+(heartbeat.completed_at?when(heartbeat.completed_at):'未知')+'；云端接收 '+(heartbeat.received_at?when(heartbeat.received_at):'未知')+'；续期记录覆盖截至 '+(heartbeat.observed_until?when(heartbeat.observed_until):'未知')+'。','subtle'));
+  panel.append(el('h3','研究续期记录'));
+  const windows=data.heartbeat?.windows||{};
+  for(const [key,title] of [['24h','过去 24 小时'],['7d','过去 7 天']]){
+    const w=windows[key]||{},known=typeof w.observed_seconds==='number'&&w.observed_seconds>0;
+    const stats='中断 '+freshnessCount(w.interruption_count)+' 次，累计 '+freshnessDuration(w.interruption_seconds)+'，最长 '+freshnessDuration(w.longest_interruption_seconds)+(w.ongoing_interruption?'；覆盖末端仍在中断':'');
+    panel.append(el('p',title+'：'+(w.coverage_complete?stats:'整窗未知，覆盖不足（未知 '+freshnessDuration(w.unknown_seconds)+'）'+(known?'；已覆盖 '+freshnessDuration(w.observed_seconds)+' 内'+stats:''))+'。'));
+  }
+  panel.append(el('p','按云端接受的新研究凭证计算：接收后有效至研究完成后 12 小时。页面刷新和重复发送不续期；这与电脑是否在线是两个维度。','subtle'));
+  const routes={watchlist:'自选股',global:'全球资产',dynamic:'动态事件'},plans=data.plans||{};
+  const planBox=details('计划有效情况与年龄','freshness-plans');panel.append(planBox);
+  if(plans.status!=='CURRENT')planBox.append(el('p','历史时点的计划状态不可回放，数量与年龄未知；不以今天的状态代替。','subtle'));
+  else{
+    planBox.append(el('p',(view.stale?'以下是上次快照中的计划状态。':'以下为统计时点的计划状态。')+'时间有效不等于已满足买入条件。','subtle'));
+    for(const [route,title] of Object.entries(routes)){
+      const p=plans.routes?.[route]||{};
+      planBox.append(el('h4',title),el('p','时间有效 '+freshnessCount(p.time_valid_count)+' 份；仍标为活跃但已过期 '+freshnessCount(p.expired_active_count)+' 份；尚未到签发时间 '+freshnessCount(p.future_active_count)+' 份；时间待核对 '+freshnessCount(p.unknown_validity_count)+' 份。'));
+      if(p.time_valid_count>0){
+        planBox.append(el('p','有效计划中，最旧计划签发龄 '+freshnessDuration(p.plan_age?.max_seconds)+'；最旧原研究龄 '+freshnessDuration(p.research_age?.max_seconds)+'；最短剩余有效期 '+freshnessDuration(p.min_remaining_seconds)+'。'));
+        if(p.research_age?.unknown)planBox.append(el('p','另有 '+freshnessCount(p.research_age.unknown)+' 份原研究时间未知。','subtle'));
+      }
+      if(p.max_age_threshold_seconds!=null)planBox.append(el('p','超过计划签发龄上限 '+freshnessDuration(p.max_age_threshold_seconds)+'：'+freshnessCount(p.over_max_age_count)+' 份。','subtle'));
+      if(p.protective_count)planBox.append(el('p','有效计划含 '+freshnessCount(p.protective_count)+' 份仅用于保护性退出的计划。','subtle'));
+      if(route==='dynamic'&&p.ready_count!=null)planBox.append(el('p','其中已准备就绪 '+freshnessCount(p.ready_count)+' 份，仍须核对其他交易条件。','subtle'));
+    }
+  }
+  const fillBox=details('过去 7 天成交时的计划与原研究年龄','freshness-fills'),fills=data.fills||{};panel.append(fillBox);
+  fillBox.append(el('p','区间 '+when(fills.window_start)+' 至 '+when(fills.window_end)+'；按成交笔数计算，买入、普通卖出、保护性退出分别统计。','subtle'));
+  if(fills.coverage_state!=='CURRENT')fillBox.append(el('p',fills.ledger_observed_until?'云端账本副本更新至 '+when(fills.ledger_observed_until)+'；更新后发生的成交尚未确认。':'成交覆盖未知，尚无可确认的账本同步时间。','caution'));
+  const groups={BUY:'买入',SELL:'普通卖出',PROTECTIVE_EXIT:'保护性退出',UNKNOWN:'方向待核对'};
+  for(const [route,title] of Object.entries(routes)){
+    const entries=fills.routes?.[route]||{};
+    fillBox.append(el('h4',title));
+    const total=Object.keys(groups).reduce((n,key)=>n+(Number.isSafeInteger(entries[key]?.count)?entries[key].count:0),0);
+    if(total===0){fillBox.append(el('p',fills.coverage_state==='UNKNOWN'?'成交情况未知。':fills.coverage_state==='CURRENT'?'本期无成交。':'已同步范围内无成交；完整窗口仍待核对。','subtle'));continue;}
+    const rows=[];
+    for(const [key,name] of Object.entries(groups)){
+      const group=entries[key];if(!group||group.count===0)continue;
+      rows.push([name+' '+freshnessCount(group.count)+' 笔',freshnessAge(group.plan_age,group.count),freshnessAge(group.research_age,group.count)]);
+      if(group.classification_unknown_count)rows.push(['其中 '+freshnessCount(group.classification_unknown_count)+' 笔退出原因待核对','不推断为保护性退出','年龄按可得记录列示']);
+    }
+    const scroll=el('div',null,'scroll');dataTable(scroll,['成交分组','计划签发龄','原研究龄'],rows);fillBox.append(scroll);
+  }
+  panel.append(el('p','仅统计与展示，不改变计划有效期、买卖资格或仓位。','subtle'));
+}
+function renderStrategyFreshness(s) {
+  const box=$('strategy-freshness');if(!box)return;
+  const view=s.strategy_freshness;box.hidden=!view;
+  if(!view){box.replaceChildren();renderingCache.delete('strategy-freshness');return;}
+  renderChanged('strategy-freshness',view,root=>drawStrategyFreshness(root,view));
+}
 function table(id,headers,rows,empty='暂无记录。') {
   renderChanged(id,rows,box=>{if(!rows.length){box.append(el('p',empty,'empty'));return;}
     const t=el('table'),head=el('tr');headers.forEach(h=>head.append(el('th',h)));t.append(head);
@@ -1012,7 +1092,7 @@ function render(s) {
   const risk=$('portfolio-risk');if(risk){risk.hidden=!s.account.investment_policy;risk.textContent='无杠杆模拟 · 持有周期按天 · 每小时复核'+(s.account.risk?.drawdown_bps!=null?' · 当前回撤 '+(s.account.risk.drawdown_bps/100).toFixed(2)+'%':'')+' / 风控阈值25%';}
   if(s.research_lease){const r=s.research_lease;attention.append(el('p',r.active?'组合研究已同步 · 最近完成 '+when(r.completed_at):'本地组合研究已过期或尚未就绪：暂停新买入，继续持仓风险检查。',r.active?'subtle':'caution'));}
   attention.hidden=!attention.textContent;
-  renderWatchlist(s);renderAccount(s);renderWithdrawals(s);renderActivity(s);renderFollowups(s);renderDynamic(s);renderPortfolioStrategy(s);
+  renderWatchlist(s);renderAccount(s);renderWithdrawals(s);renderActivity(s);renderFollowups(s);renderDynamic(s);renderPortfolioStrategy(s);renderStrategyFreshness(s);
   if(!editing)$('watchlist').value=fixedWatchlist(s).map(w=>w.symbol+' '+w.name).join('\n');
   $('settings-summary').textContent=fixedWatchlist(s).length+' 只固定关注股票 · '+(s.scheduler_enabled?'自动运行已开启':'已暂停');
   $('schedule').textContent=scheduleSummary(s.schedule);

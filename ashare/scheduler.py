@@ -433,7 +433,7 @@ class Scheduler:
                     with store.db:put(store,'page_display_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
                 except Exception:pass
             self.page_display_future=None
-        if self.stop.is_set() or role(config)!='research' or not remote_supports(store,FEATURE):return
+        if self.stop.is_set() or role(config)!='research' or not (remote_supports(store,FEATURE) or remote_supports(store,'strategy_freshness_v1')):return
         if self.page_display_future is not None:return
         if self.last_page_display is not None and time.monotonic()-self.last_page_display<60:return
         self.last_page_display=time.monotonic()

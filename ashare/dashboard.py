@@ -82,6 +82,7 @@ def status(config, *, overview=False, page_diagnostics=True):
         from .cloud_dashboard import add_strategy_times
         from .supervision import view as supervision_view
         from .withdrawals import status as withdrawal_status
+        from .freshness_sync import local_view as freshness_view
         return add_strategy_times(store,{'deployment_role':config.get('deployment_role','standalone'),'version':__version__,'at':at,'mode':config['mode'],'live_execution':False,'model_auth':'CHATGPT_SUBSCRIPTION',
             'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,
             'market_phase':phase(at),'quote_max_age_seconds':config['quote_max_age_seconds'],'schedule':{'collection':config['collection_times'],'slots':config['slot_times'],'review':config['review_time'],
@@ -89,6 +90,7 @@ def status(config, *, overview=False, page_diagnostics=True):
             'fixed_watchlist':config['watchlist'],'watchlist':plans,'observation':observation_view(store,at,config),'dynamic':dynamic_view(store,config,at,page_diagnostics=page_diagnostics),'account':a,'reviews':reviews,'followups':followup_view(store,at),
             'industry':__import__('ashare.industry_presentation',fromlist=['current']).current(__import__('ashare.industry',fromlist=['view']).view(store,config,at),at),
             'supervision':supervision_view(store),'withdrawals':withdrawal_status(store,config,at),
+            'strategy_freshness':freshness_view(store,config,at) if page_diagnostics else None,
             'next_runs':next_runs(config,at),'portfolio':portfolio(store,config,a,at),
             'trade_effects':trade_effects(store,config,at),'portfolio_strategy':portfolio_strategy_view(store,config,at),
             'active_jobs':[dict(r) for r in store.db.execute("SELECT * FROM jobs WHERE status IN ('PENDING','RUNNING') ORDER BY scheduled_at")],

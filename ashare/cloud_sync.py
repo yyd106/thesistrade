@@ -16,12 +16,15 @@ def notices_unresolved(store):
 def pull(store,config):
     if role(config)!='research':return None
     for _ in range(200):
+        extras={'quote_health':value(store,'quote_health_since'),
+                'notices':{'since':value(store,'cloud_notices_since'),'known':notices_unresolved(store)},
+                'withdrawals':True}
+        if config.get('strategy_freshness_enabled',True) and remote_supports(store,'strategy_freshness_v1'):
+            extras['freshness']=True
         # An older cloud ignores the v2 fields and answers with the v1 full-table packet.
         packet=request(config,'/api/sync/ledger',{'cursors':value(store,'ledger_cursors',{}),'protocol':2,
             'change_cursor':value(store,'ledger_change_cursor'),'support_since':value(store,'ledger_support_since'),
-            'extras':{'quote_health':value(store,'quote_health_since'),
-                      'notices':{'since':value(store,'cloud_notices_since'),'known':notices_unresolved(store)},
-                      'withdrawals':True}})
+            'extras':extras})
         ledger.import_ledger(store,config,packet)
         if not packet['more']:return packet
     raise RuntimeError('账本仍在分页同步，完成前不进行组合决策或复盘')
@@ -269,6 +272,9 @@ def receive_display(store,body):
 
 
 def handle(store,config,path,body,at):
+    if path=='/api/sync/freshness':
+        from .freshness_sync import receive
+        return receive(store,body,at)
     if path=='/api/sync/bootstrap':return ledger.import_bootstrap(store,config,body,at)
     if path=='/api/sync/ledger':return ledger.export_ledger(store,body.get('cursors',{}),at,body=body,config=config)
     if path=='/api/sync/strategy':return receive_strategy(store,config,body,at)
@@ -397,9 +403,18 @@ def page_display_once(config,cancel_event=None):
     store=None
     try:
         store=Store(config['data_dir'])
-        if not remote_supports(store,FEATURE):return {'status':'UNSUPPORTED'}
+        if not remote_supports(store,FEATURE) and not remote_supports(store,'strategy_freshness_v1'):return {'status':'UNSUPPORTED'}
         with task_lock(store.root,'page-display'):
             if cancel_event is not None and cancel_event.is_set():return {'status':'CANCELLED'}
+            # Independent telemetry has its own failure state, never a research heartbeat.
+            try:
+                from .freshness_sync import deliver
+                freshness=deliver(store,config,cancel_event)
+            except Exception as exc:
+                if store.db.in_transaction:store.db.rollback()
+                with store.db:put(store,'freshness_sync',{'at':now(),'status':'FAILED','error':str(exc)[:300]})
+                freshness=None
+            if not remote_supports(store,FEATURE):return freshness or {'status':'UNCHANGED'}
             result=deliver_page_display(store,config,cancel_event=cancel_event)
             if result is None and cancel_event is not None and cancel_event.is_set():return {'status':'CANCELLED'}
             return result or {'status':'UNCHANGED'}
