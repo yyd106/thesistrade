@@ -2,6 +2,9 @@ SCHEMA='''
 CREATE TABLE IF NOT EXISTS cloud_state(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cloud_nonces(nonce TEXT PRIMARY KEY,received_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cloud_receipts(sequence INTEGER PRIMARY KEY,bundle_id TEXT UNIQUE NOT NULL,received_at TEXT NOT NULL,completed_at TEXT NOT NULL,payload_hash TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS cloud_receipts_time ON cloud_receipts(received_at);
+CREATE TABLE IF NOT EXISTS freshness_receipts(sequence INTEGER PRIMARY KEY,received_at TEXT NOT NULL,completed_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS freshness_receipts_time ON freshness_receipts(received_at);
 CREATE TABLE IF NOT EXISTS cloud_contracts(key TEXT PRIMARY KEY,updated_at TEXT NOT NULL,payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cloud_outbox(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,status TEXT NOT NULL,payload_json TEXT NOT NULL,error TEXT);
 CREATE TABLE IF NOT EXISTS supervision_reviews(

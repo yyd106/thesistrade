@@ -100,11 +100,13 @@ DISPLAY_ONLY_MODULES = {
     'review_presentation.py',
     # Dashboard-only stock detail/history projections.
     'stock_detail.py',
+    'strategy_freshness.py', 'freshness_sync.py',
 }
 LOCATION_OR_TRANSIENT_KEYS = {
     'data_dir',     # Storage location, not the stored inputs (frozen per pair).
     'config_path',  # Location of the already-loaded settings.
     '_deadline',    # Per-cycle monotonic deadline; policy budget/code are included.
+    'strategy_freshness_enabled',  # Read-only telemetry does not alter a research input.
 }
 
 

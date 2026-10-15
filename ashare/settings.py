@@ -1,6 +1,7 @@
 import re
 
 DEFAULTS = {
+ 'strategy_freshness_enabled':True,
  'industry_enabled':False,'industry_policy':{},
  'dynamic_enabled':False,'dynamic_model_timeout_seconds':120,
  'collection_times': ['08:00','20:00'], 'review_time': '19:30',
@@ -116,7 +117,7 @@ def validate_settings(config):
                    ('backup_daily_keep',0,60),('disk_free_warn_gb',1,1000),('db_size_warn_gb',1,1000),
                    ('evaluation_horizon_days',5,60),('weekly_report_weekday',0,6),('shadow_risk_per_trade_bps',10,200)):
         if type(config[k]) is not int or not lo<=config[k]<=hi:raise ValueError(f'{k}必须为{lo}到{hi}之间整数')
-    for k in ('evaluation_enabled','shadow_books_enabled'):
+    for k in ('evaluation_enabled','shadow_books_enabled','strategy_freshness_enabled'):
         if type(config[k]) is not bool:raise ValueError(k+'须为true或false')
     for k in ('evaluation_time','weekly_report_time','digest_time'):
         if not isinstance(config[k],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',config[k]):raise ValueError(k+'格式错误')

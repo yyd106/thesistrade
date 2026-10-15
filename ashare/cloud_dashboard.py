@@ -26,6 +26,7 @@ def status(store,config):
     from .global_research import active_plan
     from .notices import open_for_display as open_notices
     from .withdrawals import status as withdrawal_status
+    from .freshness_sync import cloud_view as freshness_view
     at=now();a=account(store,at);a['risk']=state(store);a['investment_policy']=public()
     cache=copy.deepcopy(value(store,'display',{}))
     if not cache:
@@ -71,5 +72,6 @@ def status(store,config):
       'decisions':[dict(r) for r in store.db.execute('SELECT * FROM decisions WHERE EXISTS(SELECT 1 FROM paper_orders o WHERE o.decision_id=decisions.id) ORDER BY at DESC LIMIT 30')],
       'fills':[dict(r) for r in store.db.execute('SELECT * FROM paper_fills ORDER BY recorded_at DESC LIMIT 20')],
       'state':dict(store.db.execute('SELECT key,value FROM service_state')),'source_checks':[],'background_failures':[],'documents':0,'snapshots':0,
-      'notices':open_notices(store),'withdrawals':withdrawal_status(store,config,at)}
+      'notices':open_notices(store),'withdrawals':withdrawal_status(store,config,at),
+      'strategy_freshness':freshness_view(store,config,at)}
     return add_strategy_times(store,result)

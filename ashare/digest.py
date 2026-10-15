@@ -482,6 +482,10 @@ def build(store, config, day):
     from .build import info
     d = {'day': day, 'generated_at': normalize_time(now()), 'window': {'from': a, 'to': b}, 'version': __version__,
          'build_id': info(config, store)['build_id']}
+    # A past report ends at that day's boundary; today's report stops at its
+    # generation time. Current plan labels cannot be reconstructed historically.
+    from .freshness_sync import local_view
+    d['strategy_freshness'] = local_view(store, config, min(b, d['generated_at']))
     d['availability'] = _safe('availability', lambda: availability(store, a, b))
     spans = d['availability']['spans']
     for name, fn in (('jobs', lambda: jobs(store, a, b)), ('collection', lambda: collection(store, a, b, spans)),
@@ -512,6 +516,100 @@ def _job_names():
     return {**JOB_NAMES, **JOB_KIND_NAMES}
 
 
+def _freshness_duration(seconds):
+    import math
+    if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
+        return '未知'
+    if seconds == 0:
+        return '0 分钟'
+    if seconds < 60:
+        return '不足 1 分钟'
+    if seconds < 3600:
+        return f'{seconds / 60:.0f} 分钟'
+    return f'{seconds / 3600:.1f} 小时'
+
+
+def _freshness_count(value):
+    return str(value) if type(value) is int and value >= 0 else '未知'
+
+
+def _freshness_age(age):
+    age = age or {}
+    if not age.get('known'):
+        return '未知'
+    text = f"均值 {_freshness_duration(age.get('mean_seconds'))} / 最大 {_freshness_duration(age.get('max_seconds'))}"
+    if age.get('unknown'):
+        text += f"；另 {_freshness_count(age['unknown'])} 笔未知"
+    return text
+
+
+def freshness_markdown(view):
+    if view is None:
+        return []
+    lines = ['', '## 策略新鲜度', '']
+    data = view.get('summary')
+    if view.get('status') != 'OK' or not data:
+        return lines + ['- 统计暂不可用，未知不表示没有中断或成交。']
+    stamp = local(data['as_of']).strftime('%Y-%m-%d %H:%M')
+    lines += [f'- 统计截至 {stamp}（北京时间）；过去 24 小时及 7 天均以此为终点，不包含终点后的记录。',
+              '- 计划签发龄从计划签发时计算；原研究龄从所依据研究完成时计算。续签不会让原研究变新。',
+              '- 研究续期按云端接受的新研究凭证计算，有效至研究完成后 12 小时；页面刷新和重复发送不续期，与本机在线是两个维度。']
+    heartbeat = data['heartbeat']
+    times = [f"{title} {local(heartbeat[key]).strftime('%Y-%m-%d %H:%M') if heartbeat[key] else '未知'}"
+             for key, title in (('completed_at', '最近研究完成'), ('received_at', '云端接收'), ('observed_until', '续期记录覆盖截至'))]
+    lines.append('- ' + '；'.join(times) + '。')
+    for key, title in (('24h', '过去 24 小时'), ('7d', '过去 7 天')):
+        w = data['heartbeat']['windows'][key]
+        stats = (f"中断 {_freshness_count(w['interruption_count'])} 次，累计 {_freshness_duration(w['interruption_seconds'])}，"
+                 f"最长 {_freshness_duration(w['longest_interruption_seconds'])}")
+        if w['ongoing_interruption']:
+            stats += '；覆盖末端仍在中断'
+        if not w['coverage_complete']:
+            stats = (f"整窗未知，覆盖不足（未知 {_freshness_duration(w['unknown_seconds'])}）"
+                     + (f"；已覆盖 {_freshness_duration(w['observed_seconds'])}内{stats}" if w['observed_seconds'] else ''))
+        lines.append(f'- {title}：{stats}。')
+    routes = {'watchlist': '自选股', 'global': '全球资产', 'dynamic': '动态事件'}
+    plans = data['plans']
+    if plans['status'] != 'CURRENT':
+        lines.append('- 历史时点的计划状态不可回放：有效数量、过期活跃数量及当前年龄未知，不以今天的状态代替。')
+    else:
+        lines += ['', '| 路线 | 时间有效 | 仍标活跃但已过期 | 最旧计划签发龄 | 最旧原研究龄 | 最短剩余有效期 |',
+                  '|---|---|---|---|---|---|']
+        notes = []
+        for route, title in routes.items():
+            p = plans['routes'][route]
+            lines.append(f"| {title} | {_freshness_count(p['time_valid_count'])} | {_freshness_count(p['expired_active_count'])} | "
+                         f"{_freshness_duration(p['plan_age']['max_seconds'])} | {_freshness_duration(p['research_age']['max_seconds'])} | "
+                         f"{_freshness_duration(p['min_remaining_seconds'])} |")
+            if p['max_age_threshold_seconds'] is not None:
+                notes.append(f"- {title}超过计划签发龄上限 {_freshness_duration(p['max_age_threshold_seconds'])}：{_freshness_count(p['over_max_age_count'])} 份。")
+            if p['unknown_validity_count'] or p['future_active_count'] or p['research_age']['unknown']:
+                notes.append(f"- {title}：有效期未知 {_freshness_count(p['unknown_validity_count'])} 份，尚未到签发时间 {_freshness_count(p['future_active_count'])} 份，原研究时间未知 {_freshness_count(p['research_age']['unknown'])} 份。")
+        lines += [''] + notes + ['- 以上为统计时点快照；时间有效不等于已满足买入条件。']
+    fills = data['fills']
+    lines += ['', '近 7 天成交时年龄（按成交笔数计算，各分组互不重复）：', '']
+    if fills['coverage_state'] != 'CURRENT':
+        observed = fills['ledger_observed_until']
+        lines += [('- 账本副本更新至 ' + local(observed).strftime('%Y-%m-%d %H:%M') + '；之后的成交尚未确认。')
+                  if observed else '- 成交覆盖未知，尚无可确认的账本同步时间。', '']
+    groups = {'BUY': '买入', 'SELL': '普通卖出', 'PROTECTIVE_EXIT': '保护性退出', 'UNKNOWN': '方向待核对'}
+    lines += ['| 路线 / 成交分组 | 笔数 | 计划签发龄 | 原研究龄 |', '|---|---|---|---|']
+    for route, title in routes.items():
+        entries = fills['routes'][route]
+        if not sum(v['count'] for v in entries.values()):
+            empty = ('本期无成交' if fills['coverage_state'] == 'CURRENT' else
+                     '已同步范围内无成交，完整窗口仍待核对' if fills['coverage_state'] == 'REPLICA' else '成交情况未知')
+            lines.append(f'| {title} | {empty} | — | — |')
+        for group, label in groups.items():
+            item = entries[group]
+            if not item['count']:
+                continue
+            note = f"（{item['classification_unknown_count']} 笔退出原因待核对）" if item['classification_unknown_count'] else ''
+            lines.append(f"| {title} / {label}{note} | {item['count']} | {_freshness_age(item['plan_age'])} | {_freshness_age(item['research_age'])} |")
+    lines += ['', '- 仅统计与展示；不据历史统计推断当时执行许可，也不改变计划有效期、买卖资格或仓位。']
+    return lines
+
+
 def markdown(d):
     names = _job_names()
     b = d['window']['to']
@@ -532,6 +630,7 @@ def markdown(d):
         L.append('- 断网时停止、联网后重做的任务：' + '、'.join(f'{k} {n}' for k, n in stopped.items()) + '。')
     if not offline and not paused:
         L.append('- 没有断网或停顿记录。')
+    L += freshness_markdown(d.get('strategy_freshness'))
     c = d['collection']
     L += ['', '## 抓取', ''] + _failed(c) + [f"- 采集尝试 {c['attempts']} 次，失败 {c['failed']} 次" + (f"（网络类错误 {c['network_errors']} 次）" if c['network_errors'] else '')
                                               + (f"；其中离线或停顿期间尝试 {c['attempts_offline']} 次、失败 {c['failed_offline']} 次" if c['attempts_offline'] else '') + '。']
