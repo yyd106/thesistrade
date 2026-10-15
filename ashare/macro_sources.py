@@ -25,6 +25,7 @@ ASSETS={
  'COPPER':{'name':'铜','group':'工业金属','unit':'价格'},
  'AGRICULTURE':{'name':'农产品','group':'商品','unit':'价格'},
  'US10Y':{'name':'美国10年期国债收益率','group':'利率','unit':'%','series':'DGS10','change_unit':'bp'},
+ 'US10Y_REAL':{'name':'美国10年期通胀保值国债实际收益率','group':'利率','unit':'%','series':'DFII10','change_unit':'bp'},
  'USD':{'name':'广义贸易加权美元指数','group':'汇率','unit':'指数','series':'DTWEXBGS'},
  'EURUSD':{'name':'欧元兑美元','group':'汇率','unit':'美元/欧元','series':'DEXUSEU'},
  'USDJPY':{'name':'美元兑日元','group':'汇率','unit':'日元/美元','series':'DEXJPUS'},
@@ -110,28 +111,53 @@ def parse_series(raw,series,at):
  if not values:raise ValueError('没有已发布的历史观测')
  return [{'date':k,'value':v} for k,v in sorted(values.items())]
 
-def refresh_markets(store,at=None,fetch_fn=None,priority_assets=None):
- at=normalize_time(at or now());fetch_fn=fetch_fn or data.fetch
+MARKET_REFRESH_SECONDS=6*3600
+MARKET_REFRESH_LIMIT=5
+
+def refresh_markets(store,at=None,fetch_fn=None,priority_assets=None,*,assets=None,clock=None):
+ """Refresh at most five due series; callers may request a bounded subset.
+
+ Observation dates come from FRED. Availability is the actual local receipt,
+ never the observation date or a historical caller-supplied research time.
+ """
+ at=normalize_time(at or now());fetch_fn=fetch_fn or data.fetch;clock=clock or now
  cached={r['asset']:dict(r) for r in store.db.execute('SELECT * FROM macro_markets')}
  requested=set()
  for r in store.db.execute("SELECT payload_json FROM macro_events WHERE status!='INVALIDATED' ORDER BY created_at DESC LIMIT 100"):
   requested.update(x['asset'] for x in json.loads(r[0]).get('impacts',[]))
- targets=[a for a,m in ASSETS.items() if m.get('series') and (a not in cached or (datetime.fromisoformat(at)-datetime.fromisoformat(cached[a]['checked_at'])).total_seconds()>=21600)]
- baseline=['US10Y','USD','WTI','SP500','EURUSD','BRENT','NATGAS','NASDAQ','USDJPY','GBPUSD','AUDUSD','NZDUSD','USDCNY']
- targets=sorted(targets,key=lambda a:(a not in (priority_assets or []),a not in requested,cached.get(a,{}).get('checked_at',''),baseline.index(a)))[:5]
+ def due(asset):
+  if asset not in cached:return True
+  try:
+   elapsed=(datetime.fromisoformat(at)-datetime.fromisoformat(normalize_time(cached[asset]['checked_at']))).total_seconds()
+  except (KeyError,TypeError,ValueError,AttributeError):return True
+  return elapsed<0 or elapsed>=MARKET_REFRESH_SECONDS
+ targets=[a for a,m in ASSETS.items() if m.get('series') and (assets is None or a in assets)
+          and due(a)]
+ baseline=['US10Y','USD','US10Y_REAL','WTI','SP500','EURUSD','BRENT','NATGAS','NASDAQ','USDJPY','GBPUSD','AUDUSD','NZDUSD','USDCNY']
+ order={a:i for i,a in enumerate(baseline)}
+ targets=sorted(targets,key=lambda a:(a not in (priority_assets or []),a not in requested,cached.get(a,{}).get('checked_at',''),order.get(a,len(order)),a))[:MARKET_REFRESH_LIMIT]
  start=(datetime.fromisoformat(at)-timedelta(days=370)).date().isoformat()
  def read(asset):
   m=ASSETS[asset];url='https://fred.stlouisfed.org/graph/fredgraph.csv?id='+m['series']+'&cosd='+start
   try:
-   raw=fetch_fn(url);points=parse_series(raw,m['series'],at)
-   return asset,raw,{'series':m['series'],'url':'https://fred.stlouisfed.org/series/'+m['series'],'points':points,'as_of':at,'unit':m['unit']},None
-  except Exception as exc:return asset,None,None,str(exc)[:180]
+   raw=fetch_fn(url);receipt=max(at,normalize_time(clock()));points=parse_series(raw,m['series'],receipt)
+   return asset,raw,{'series':m['series'],'url':'https://fred.stlouisfed.org/series/'+m['series'],
+                    'points':points,'observation_date':points[-1]['date'],'as_of':receipt,
+                    'fetched_at':receipt,'available_at':receipt,'unit':m['unit']},None,receipt
+  except Exception as exc:return asset,None,None,str(exc)[:180],max(at,normalize_time(clock()))
  failures=[]
  with ThreadPoolExecutor(max_workers=3,thread_name_prefix='macro-history') as pool:
-  for asset,raw,payload,error in pool.map(read,targets):
+  for asset,raw,payload,error,receipt in pool.map(read,targets):
+   try:previous=json.loads(cached[asset]['payload_json']) if asset in cached else {}
+   except (ValueError,TypeError):previous={}
+   if not isinstance(previous,dict):previous={}
    if error:
     failures.append(ASSETS[asset]['name']+'：'+error)
-    payload=json.loads(cached[asset]['payload_json']) if asset in cached else {}
-   else:payload['raw_path']=store.raw(raw,'.csv')
-   with store.db:store.db.execute('INSERT OR REPLACE INTO macro_markets VALUES(?,?,?,?,?)',(asset,at,'FAILED' if error else 'OK',json.dumps(payload,ensure_ascii=False),error))
+    payload=previous
+   else:
+    # A repeat fetch does not make an unchanged observation newly available.
+    if previous.get('fetched_at') and all(payload[k]==previous.get(k) for k in ('series','unit','points')):
+     payload['available_at']=previous.get('available_at') or previous['fetched_at']
+    payload['raw_path']=store.raw(raw,'.csv')
+   with store.db:store.db.execute('INSERT OR REPLACE INTO macro_markets VALUES(?,?,?,?,?)',(asset,receipt,'FAILED' if error else 'OK',json.dumps(payload,ensure_ascii=False),error))
  return failures
