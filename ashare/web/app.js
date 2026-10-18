@@ -1999,6 +1999,7 @@ function renderGlobalMacro(d){
       box.append(el('h4',title));
       values.forEach(s=>{const row=el('p',null,'macro-source');row.append(el('strong',s.source),el('span',(labels[s.status]||'待检查')+(s.checked_at?' · '+shortTime(s.checked_at):'')+(s.coverage?' · '+s.coverage:''),'subtle'));
         if(s.latest_at)row.append(el('span','最新发布 '+shortTime(s.latest_at),'subtle'));
+        if(s.poll_minutes)row.append(el('span',(s.role?s.role+' · ':'')+'约每'+s.poll_minutes+'分钟检查'+(s.next_check_at?' · 下次 '+shortTime(s.next_check_at):''),'subtle'));
         if(s.status==='FAILED')row.append(el('span',s.detail?.includes('CERTIFICATE_VERIFY_FAILED')?'来源证书暂未通过验证，稍后重试。':s.detail?.includes('403')?'来源暂时拒绝访问，当前覆盖存在缺口。':'本次获取未成功，稍后重试。','caution'));
         if(s.status==='STALE')row.append(el('span','可连接，但近期新闻覆盖不足。','caution'));
         if(s.url)row.append(link('公开订阅',s.url));box.append(row);
