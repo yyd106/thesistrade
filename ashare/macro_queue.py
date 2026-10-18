@@ -6,7 +6,8 @@ from datetime import datetime,timedelta
 from .storage import normalize_time
 from .observation_pool import policy
 from .news_catalog import source_priority, family
-from .news_triage import context,input_hash,policy as news_policy
+from .news_triage import context,input_hash,policy as news_policy,diverse
+from .news_relevance import profiles,assess
 
 CATALYST=re.compile(r'关税|出口.{0,4}(?:管制|限制|禁)|战争|袭击|制裁|tariff|sanction|export control|加息|降息|rate cut|rate hike|OPEC|\bwar\b|attack|blockade|shutdown|shut down|outage|capital expenditure|clinical trial|FDA approv|断供|停产|停运|封锁|产能|资本开支',re.I)
 SHOCK=re.compile(r'shutdown|shut down|blockade|export (?:ban|control)|supply disruption|suspend.{0,20}(?:production|export)|cuts?.{0,20}(?:rates?|output)|关税.{0,8}(?:实施|提高)|断供|停产|停运|封锁|出口管制|降息|加息',re.I)
@@ -29,7 +30,6 @@ def same_event(a,b):
 
 def prepare(store,start,end,at,config=None,candidate_limit=4):
  from .macro import topics
- from .observation import view
  limit=policy(config)['news_queue_limit'];end=normalize_time(end);at=normalize_time(at)
  screening_policy=news_policy(config);trials={r['input_hash']:dict(r) for r in store.db.execute('SELECT * FROM macro_triage_attempts')}
  cutoff=normalize_time((datetime.fromisoformat(end)-timedelta(hours=48)).isoformat())
@@ -40,12 +40,11 @@ def prepare(store,start,end,at,config=None,candidate_limit=4):
   store.db.execute("UPDATE macro_news SET status='FAILED' WHERE status IN ('PENDING','DORMANT') AND attempts>=3")
  rows=[dict(r) for r in store.db.execute("SELECT n.*,m.status macro_status,m.attempts macro_attempts FROM dynamic_news n LEFT JOIN macro_news m ON m.news_id=n.id WHERE n.status NOT IN ('DUPLICATE','REVISED') AND n.published_at>=? AND n.published_at<=? AND n.first_seen_at<=? ORDER BY n.published_at DESC LIMIT 12000",(cutoff,end,at))]
  old_events={r['news_id']:json.loads(r['payload_json']) for r in store.db.execute('SELECT news_id,payload_json FROM macro_events')}
- focus=[i for i in view(store,at,config)['items'] if i['pool_tier']=='FOCUS']
- focus_themes={l['theme'] for i in focus for l in i['links'] if l['status']=='TRACKING' and l.get('review_state')=='CURRENT' and l.get('materiality',{}).get('admitted')}
+ current=profiles(store,config,at)
  official={n['source'] for n in rows if family(n['source'])=='PRIMARY'};eligible=[];updates=[]
  for n in rows:
-  classified=topics(n)
-  if not classified:
+  classified=topics(n);relevance=assess(n,current,classified)
+  if not classified and not relevance['related']:
    if n['macro_status']!='DONE':updates.append((n['id'],'IGNORED'))
    continue
   screening=context(store,n,at)
@@ -61,13 +60,16 @@ def prepare(store,start,end,at,config=None,candidate_limit=4):
    with store.db:store.db.execute("UPDATE macro_news SET status='PENDING',attempts=0 WHERE news_id=?",(n['id'],))
    n['macro_status']='PENDING';n['macro_attempts']=0
   age=max(0,(datetime.fromisoformat(end)-datetime.fromisoformat(n['published_at'])).total_seconds()/3600)
-  related=bool(set(classified)&focus_themes)
-  score=round(20*(1-age/48))+source_priority(n['source'])+12*bool(CATALYST.search(n['title']+' '+n['body']))+25*bool(SHOCK.search(n['title']))-20*bool(COMMENTARY.search(n['title']))+10*related
+  related=relevance['priority_related']
+  score=round(20*(1-age/48))+source_priority(n['source'])+12*bool(CATALYST.search(n['title']+' '+n['body']))+25*bool(SHOCK.search(n['title']))-20*bool(COMMENTARY.search(n['title']))+relevance['score']
   score+=12*bool(EXPECTATION_CATALYST.search(n['title']+' '+n['body']))
   if screening and screening['decision']=='DEEP':score+=50
   if legacy:score+=5
+  # Local-only scheduling fields; the triage/research packets whitelist public
+  # news fields and never serialize membership or the relevance profile.
+  n.update(_news_priority=score,_news_related=related,_news_relevance=relevance['kind'])
   body=normalized(n['body']);title=normalized(n['title'])
-  eligible.append({'n':n,'score':score,'related':related,'body':body,'title_bits':shingles(title),'body_bits':shingles(body),
+  eligible.append({'n':n,'score':score,'related':related,'reason':relevance['reason'],'body':body,'title_bits':shingles(title),'body_bits':shingles(body),
    'actions':tuple(ACTION.findall(n['body'].lower())),'entities':tuple(ENTITIES.findall(re.sub(r'More coverage\.\s*$','',n['body']))),
    'numbers':tuple(re.findall(r'\d+(?:[.,]\d+)*%?',n['body'])),'negative':tuple(NEGATION.findall(n['body'].lower()))})
  # Prefer an already studied representative; copied stories do not restart research.
@@ -84,7 +86,11 @@ def prepare(store,start,end,at,config=None,candidate_limit=4):
   if entry is not rep and entry['n']['macro_status']!='DONE':updates.append((entry['n']['id'],'MERGED'))
  candidates=[e for e in representatives if e['n']['macro_status']!='DONE' and (e['n']['macro_attempts'] or 0)<3]
  candidates.sort(key=lambda e:(-e['score'],e['n']['published_at'],e['n']['id']))
- diverse_sources=[];seen_sources=set()
+ # Preserve discovery before publisher diversity consumes the bounded queue.
+ # Otherwise many publishers' company stories can displace every global shock
+ # before the model batch's own two discovery slots have a chance to see it.
+ reserve=[e for e in candidates if not e['related']][:min(2,limit//2)]
+ diverse_sources=list(reserve);seen_sources={e['n']['source'] for e in reserve}
  for e in candidates:
   if e['n']['source'] not in seen_sources and len(diverse_sources)<min(16,limit//2):
    diverse_sources.append(e);seen_sources.add(e['n']['source'])
@@ -93,18 +99,5 @@ def prepare(store,start,end,at,config=None,candidate_limit=4):
  for e in candidates:updates.append((e['n']['id'],'PENDING' if e in queue else 'DORMANT'))
  with store.db:
   store.db.executemany('INSERT INTO macro_news(news_id,status) VALUES(?,?) ON CONFLICT(news_id) DO UPDATE SET status=excluded.status',updates)
-  store.db.executemany('INSERT OR REPLACE INTO macro_news_queue VALUES(?,?,?,?,?)',[(e['n']['id'],r['n']['id'],e['score'],'相同事件报道合并' if e is not r else '重点标的相关新证据' if e['related'] else '新事件候选',at) for e,r in mapping])
- if candidate_limit>4:return [e['n'] for e in queue[:candidate_limit]]
- # At most two focus-related slots before reserving capacity for new discoveries.
- chosen=[e for e in queue if e['related']][:2]
- def append_diverse(values):
-  sources=Counter(e['n']['source'] for e in chosen)
-  for e in values:
-   if len(chosen)>=4:return
-   if e in chosen or sources[e['n']['source']]>=3:continue
-   chosen.append(e);sources[e['n']['source']]+=1
- append_diverse([e for e in queue if not e['related']]);append_diverse(queue)
- for e in queue:
-  if len(chosen)>=4:break
-  if e not in chosen:chosen.append(e)
- return [e['n'] for e in chosen]
+  store.db.executemany('INSERT OR REPLACE INTO macro_news_queue VALUES(?,?,?,?,?)',[(e['n']['id'],r['n']['id'],e['score'],'相同事件报道合并' if e is not r else e['reason'],at) for e,r in mapping])
+ return diverse([e['n'] for e in queue],candidate_limit if candidate_limit>4 else 4)

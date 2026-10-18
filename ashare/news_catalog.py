@@ -14,6 +14,11 @@ CATALOG=(
  ('BLS美国劳工统计','https://www.bls.gov/feed/bls_latest.rss','PRIMARY','通胀与就业',1080),
  ('FDA药品与医疗监管','https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml','PRIMARY','医药与医疗监管',336),
  ('美国出口管制公告','https://www.federalregister.gov/api/v1/documents.rss?conditions%5Bagencies%5D%5B%5D=industry-and-security-bureau','PRIMARY','出口限制与供应链',1080),
+ ('中国人民银行','https://www.pbc.gov.cn/goutongjiaoliu/113456/2986536/index.html','PRIMARY','中国货币、信贷与金融政策',336),
+ ('NVIDIA官方发布','https://nvidianews.nvidia.com/cats/press_release.xml','PRIMARY','AI算力、芯片供给与数据中心产业',336),
+ ('OpenAI官方发布','https://openai.com/news/rss.xml','PRIMARY','AI基础设施、算力投资与产品发布',336),
+ ('SEC监管公告','https://www.sec.gov/news/pressreleases.rss','PRIMARY','证券监管、加密资产监管与执法',336),
+ ('Ethereum官方博客','https://blog.ethereum.org/en/feed.xml','PRIMARY','以太坊协议升级、安全与生态；源站日期不代表秒级时间',336),
  ('WHO全球卫生','https://www.who.int/rss-feeds/news-english.xml','PRIMARY','公共卫生',336),
  ('Bloomberg市场','https://feeds.bloomberg.com/markets/news.rss','MEDIA','全球金融与产业',48),
  ('Financial Times','https://www.ft.com/rss/home','MEDIA','全球经济与产业',48),
@@ -27,8 +32,11 @@ META.update({
  '商务部新闻':{'family':'PRIMARY','coverage':'中国贸易政策','max_age_hours':336},
  '联合国新闻':{'family':'PRIMARY','coverage':'国际事件与人道局势','max_age_hours':168},
 })
-EXTRA_HOSTS={'www.whitehouse.gov','feeds.bloomberg.com','www.bloomberg.com','www.ft.com','www.cnbc.com','feeds.bbci.co.uk','www.bbc.co.uk','www.bbc.com','apps.bea.gov','www.bea.gov','www.bls.gov','www.fda.gov','www.federalregister.gov','www.who.int'}
-GAPS=[{'source':'Trump 社媒 / 讲话直播','reason':'Truth Social 公开页对采集端返回403；尚无授权直连，也未接入直播转写。白宫文字声明与媒体报道可用。'},{'source':'Reuters / AP','reason':'尚未接入授权新闻流，不将媒体转述计为直连覆盖。'}]
+for name, meta in META.items():
+ meta['poll_minutes']={'WHO全球卫生':360,'联合国新闻':120,'EIA能源资讯':60}.get(name,30)
+ meta['role']='背景与突发补充' if name in ('WHO全球卫生','联合国新闻') else '财经发现' if meta['family'] in ('MEDIA','WIRE') else '一手核验'
+EXTRA_HOSTS={'www.whitehouse.gov','feeds.bloomberg.com','www.bloomberg.com','www.ft.com','www.cnbc.com','feeds.bbci.co.uk','www.bbc.co.uk','www.bbc.com','apps.bea.gov','www.bea.gov','www.bls.gov','www.fda.gov','www.federalregister.gov','www.who.int','www.pbc.gov.cn','nvidianews.nvidia.com','openai.com','www.sec.gov','blog.ethereum.org'}
+GAPS=[{'source':'X/Twitter 人物与机构实时流','reason':'尚未接入；官方实时API需要开发者凭据及按量付费。现有公开新闻与机构订阅不代表已监控X原帖。'},{'source':'Trump 社媒 / 讲话直播','reason':'Truth Social 公开页对采集端返回403；尚无授权直连，也未接入直播转写。白宫文字声明与媒体报道可用。'},{'source':'Reuters / AP','reason':'尚未接入授权新闻流，不将媒体转述计为直连覆盖。'}]
 def article_hosts(name):
  meta=META.get(name,{})
  host=urlsplit(meta.get('url','')).hostname
@@ -38,13 +46,15 @@ def family(name):return META.get(name,{}).get('family','WIRE')
 def source_priority(name):return {'PRIMARY':4,'MEDIA':3,'WIRE':1}[family(name)]
 def coverage(store,at):
  from datetime import datetime
+ from .news_polling import next_check
  checks={r['source']:dict(r) for r in store.db.execute('SELECT * FROM dynamic_feed_checks')}
  health={r['source']:dict(r) for r in store.db.execute('SELECT * FROM macro_feed_health')}
  rows=[]
  for name,meta in META.items():
   check=checks.get(name,{});h=health.get(name,{});state=check.get('status','PENDING')
-  if check and (datetime.fromisoformat(at)-datetime.fromisoformat(check['checked_at'])).total_seconds()>5400:state='OVERDUE'
+  next_at=next_check(store,name,check) if check else None
+  if check and state=='OK' and (datetime.fromisoformat(at)-datetime.fromisoformat(next_at)).total_seconds()>5400:state='OVERDUE'
   elif state=='OK' and h.get('latest_at') and (datetime.fromisoformat(at)-datetime.fromisoformat(h['latest_at'])).total_seconds()>meta['max_age_hours']*3600:state='STALE'
-  rows.append({**meta,**check,'source':name,'status':state,'latest_at':h.get('latest_at'),'oldest_at':h.get('oldest_at'),'valid_count':h.get('valid_count',0)})
+  rows.append({**meta,**check,'source':name,'status':state,'next_check_at':next_at,'latest_at':h.get('latest_at'),'oldest_at':h.get('oldest_at'),'valid_count':h.get('valid_count',0)})
  return {'sources':rows,'gaps':GAPS,'available':sum(r['status']=='OK' for r in rows),'configured':len(rows),
   'note':'公开订阅提供标题与摘要；按源站实际条目采集，不代表已阅读全文或完整回补48小时。'}

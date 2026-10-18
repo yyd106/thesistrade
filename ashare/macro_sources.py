@@ -4,11 +4,11 @@ import csv,io,json,math,re,xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime,timedelta
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlsplit,urlunsplit
+from urllib.parse import urljoin,urlsplit,urlunsplit
 from .storage import now,normalize_time
 from . import dynamic_sources as data
 
-from .news_catalog import FEEDS, article_hosts
+from .news_catalog import FEEDS, META, article_hosts
 
 # Research targets are asset classes/benchmarks, not executable security identifiers.
 # Yield UP means yield rises; EURUSD UP means the euro appreciates against USD.
@@ -57,6 +57,9 @@ def parse_feed(raw,source):
    url=next((x.attrib.get('href','') for x in item if x.tag.split('}')[-1]=='link' and x.attrib.get('rel','alternate')=='alternate'),'')
   if not title or not url:continue
   try:
+   # Some official RSS feeds publish relative article links. Resolve only
+   # against that source's configured endpoint, then enforce its publisher.
+   url=urljoin(META.get(source,{}).get('url',''),url)
    p=urlsplit(url)
    if p.scheme=='http' and p.hostname in data.NEWS_HOSTS:url=urlunsplit(p._replace(scheme='https'))
    data.check_url(url)
@@ -74,14 +77,22 @@ def parse_feed(raw,source):
  return rows
 
 def collect(store,start,end,at,fetch_fn=None):
- fetch_fn=fetch_fn or data.fetch;result={'added':0,'window_counts':{},'failures':[]}
+ from . import news_polling
+ fetch_fn=fetch_fn or data.fetch;result={'added':0,'window_counts':{},'failures':[],'skipped_sources':[]}
+ feeds=[]
+ for name,url in FEEDS:
+  if news_polling.due(store,name,at):feeds.append((name,url))
+  else:
+   result['skipped_sources'].append(name)
+   failure=news_polling.deferred_failure(store,name)
+   if failure:result['failures'].append(failure)
  def read(feed):
   name,url=feed
   try:
    raw=fetch_fn(url);return name,raw,parse_feed(raw,name),None
   except Exception as exc:return name,None,[],str(exc)[:180]
  with ThreadPoolExecutor(max_workers=5,thread_name_prefix='macro-feed') as pool:
-  for name,raw,rows,error in pool.map(read,FEEDS):
+  for name,raw,rows,error in pool.map(read,feeds):
    available=[r for r in rows if r['published_at']<=at]
    count=sum(start<=r['published_at']<end for r in available)
    if not error and not available:error='订阅仅含未来时间，未作为当前新闻入库'
@@ -89,9 +100,8 @@ def collect(store,start,end,at,fetch_fn=None):
    else:
     result['added']+=data.ingest(store,available,at,store.raw(raw,'.xml'))
     result['window_counts'][name]=count
+   news_polling.record(store,name,at,count,error)
    with store.db:
-    store.db.execute('INSERT OR REPLACE INTO dynamic_feed_checks VALUES(?,?,?,?,?)',
-     (name,at,'FAILED' if error else 'OK',count,error or '公开订阅标题与摘要；未声称阅读全文或完整回补48小时'))
     if not error:
      store.db.execute('INSERT OR REPLACE INTO macro_feed_health VALUES(?,?,?,?,?)',
       (name,at,max(r['published_at'] for r in available),min(r['published_at'] for r in available),len(available)))
