@@ -4,7 +4,9 @@ import gzip
 import html
 import json
 import re
+import ssl
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
@@ -40,7 +42,15 @@ class Redirect(urllib.request.HTTPRedirectHandler):
 def fetch(url):
  check_url(url)
  req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept-Encoding':'identity'})
- with urllib.request.build_opener(Redirect()).open(req,timeout=12) as r:
+ try:response=urllib.request.build_opener(Redirect()).open(req,timeout=12)
+ except urllib.error.URLError as exc:
+  if not isinstance(exc.reason,ssl.SSLCertVerificationError):raise
+  from .public_tls import system_root_context
+  context=system_root_context()
+  if context is None:raise
+  # Retain hostname/chain verification and the same strict redirect allowlist.
+  response=urllib.request.build_opener(Redirect(),urllib.request.HTTPSHandler(context=context)).open(req,timeout=12)
+ with response as r:
   check_url(r.url);data=r.read(4_000_001)
   if len(data)>4_000_000:raise ValueError('新闻响应超过容量限制')
  if data[:2]==b'\x1f\x8b':
@@ -93,6 +103,7 @@ def ingest(store,rows,seen,raw_path):
  return added
 
 def collect(store,start,end,at,fetch_fn=fetch):
+ from . import news_polling
  counts={};failures=[];coverage={};added=0
  # Revisit the complete rolling discovery horizon; deduplication keeps this
  # idempotent and captures late reports/revisions inside the 48-hour window.
@@ -128,6 +139,11 @@ def collect(store,start,end,at,fetch_fn=fetch):
  # separate from documents/MARKET and never affect watchlist source coverage.
  from .external_news import parse_feed,parse_article
  for key,name,url,kind in __import__('ashare.external_news',fromlist=['FEEDS']).FEEDS:
+  if not news_polling.due(store,name,at):
+   failure=news_polling.deferred_failure(store,name)
+   if failure:failures.append(failure)
+   continue
+  error=None;n=0
   try:
    raw=fetch_fn(url);path=store.raw(raw,'.xml' if kind=='rss' else '.html')
    rows=parse_feed(raw,url,kind);n=0
@@ -140,11 +156,13 @@ def collect(store,start,end,at,fetch_fn=fetch):
     item={'source':name,'url':r['url'],'published_at':published,'title':r['title'],'body':body[:8000]}
     added+=ingest(store,[item],at,path);n+=int(start<=published<end)
    counts[name]=n
-  except Exception as exc:failures.append(name+'：'+str(exc)[:180])
+  except Exception as exc:
+   error=str(exc)[:180];failures.append(name+'：'+error)
+  news_polling.record(store,name,at,n,error,note='已检查；0条表示当前窗口无新条目')
  from .macro_sources import collect as collect_global
  global_result=collect_global(store,start,end,at,fetch_fn)
  added+=global_result['added'];counts.update(global_result['window_counts']);failures+=global_result['failures']
- for name in ('新浪财经快讯','联合国新闻','商务部新闻'):
+ for name in ('新浪财经快讯',):
   error=next((f for f in failures if f.startswith(name.split('快讯')[0])),None)
   with store.db:store.db.execute('INSERT OR REPLACE INTO dynamic_feed_checks VALUES(?,?,?,?,?)',
    (name,at,'FAILED' if error else 'OK',counts.get(name,0),error or '已检查；0条表示当前窗口无新条目'))

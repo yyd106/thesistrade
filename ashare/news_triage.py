@@ -72,13 +72,27 @@ def context(store,n,at=None):
  return json.loads(r['payload_json']) if r and (at is None or r['created_at']<=at) and r['input_hash']==input_hash(n,store,at) else None
 
 def diverse(news,limit):
- # Fill fairly across publishers and themes before taking a second item from
- # the same publisher/theme. A high-volume wire must not monopolize the batch.
+ # Respect locally ranked candidates, with bounded source/theme penalties.
+ # Absolute publisher rotation used to promote unrelated background ahead of
+ # current-company facts. Keep two discovery slots within the same budget.
  from .macro import topics
- selected=[];counts=Counter();themes=Counter();remaining=list(news)
+ selected=[];counts=Counter();themes=Counter();remaining=list(enumerate(news))
+ ranked=bool(news) and all('_news_priority' in n for n in news)
+ reserve=min(2,limit//2,sum(not n.get('_news_related') for n in news)) if ranked else 0
+ discovered=0;theme={id(n):(topics(n) or ['OTHER'])[0] for n in news}
  while remaining and len(selected)<limit:
-  n=min(remaining,key=lambda n:(counts[n['source']],themes[(topics(n) or ['OTHER'])[0]],news.index(n)))
-  selected.append(n);remaining.remove(n);counts[n['source']]+=1;themes[(topics(n) or ['OTHER'])[0]]+=1
+  choices=remaining
+  if ranked:
+   if discovered<reserve and len(selected)%2==1:
+    choices=[x for x in remaining if not x[1].get('_news_related')] or remaining
+   varied=[x for x in choices if counts[x[1]['source']]<max(3,(limit+1)//2)]
+   choices=varied or choices
+   key=lambda x:(-x[1]['_news_priority']+16*counts[x[1]['source']]+4*themes[theme[id(x[1])]],x[0])
+  else:
+   key=lambda x:(counts[x[1]['source']],themes[theme[id(x[1])]],x[0])
+  chosen=min(choices,key=key);n=chosen[1]
+  selected.append(n);remaining.remove(chosen);counts[n['source']]+=1;themes[theme[id(n)]]+=1
+  discovered+=not n.get('_news_related')
  return selected
 
 def select(store,config,candidates,at,model_fn=None):
