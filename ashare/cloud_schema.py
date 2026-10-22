@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS freshness_receipts(sequence INTEGER PRIMARY KEY,recei
 CREATE INDEX IF NOT EXISTS freshness_receipts_time ON freshness_receipts(received_at);
 CREATE TABLE IF NOT EXISTS cloud_contracts(key TEXT PRIMARY KEY,updated_at TEXT NOT NULL,payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cloud_outbox(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,status TEXT NOT NULL,payload_json TEXT NOT NULL,error TEXT);
+CREATE TABLE IF NOT EXISTS strategy_export_cache(
+ id INTEGER PRIMARY KEY CHECK(id=1),generated_at TEXT NOT NULL,start_at TEXT NOT NULL,end_at TEXT NOT NULL,
+ filename TEXT NOT NULL,sha256 TEXT NOT NULL,archive BLOB NOT NULL,received_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS supervision_reviews(
  id TEXT PRIMARY KEY,kind TEXT NOT NULL,subject_id TEXT NOT NULL,input_hash TEXT NOT NULL,
  created_at TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,

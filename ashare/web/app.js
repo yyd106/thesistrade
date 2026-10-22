@@ -37,6 +37,37 @@ class LocalApi {
     if (!response.ok) throw new ApiError(readableError(data.error) || '资料读取失败，请稍后重试。','HTTP',response.status);
     return data;
   }
+  async strategyArchive() {
+    // An archive may contain weeks of research. Its body needs the same longer
+    // deadline as preparation; normal JSON refreshes retain their short timeout.
+    const signal=AbortSignal.timeout(300000);
+    let response;
+    try {
+      response=await this.transport('/api/strategy-export',{method:'GET',cache:'no-store',credentials:'same-origin',headers:{Accept:'application/zip'},signal});
+      if(response.status===401){
+        if(typeof location!=='undefined')location.assign('/login?next='+encodeURIComponent(location.pathname));
+        throw new ApiError('登录已失效，请重新登录。','AUTH',401);
+      }
+      const contentType=(response.headers.get('Content-Type')||'').split(';')[0].trim().toLowerCase();
+      if(!response.ok||!['application/zip','application/x-zip-compressed'].includes(contentType)){
+        let message=response.status===403?'仅管理员可以下载策略，请重新登录管理员账号。':'策略文件暂未准备好，请稍后重试。';
+        if(contentType==='application/json'){
+          try{const data=await response.json();message=readableError(data.error)||message;}catch(error){if(signal.aborted)throw error;}
+        }
+        throw new ApiError(message,response.ok?'RESPONSE':'HTTP',response.status);
+      }
+      const blob=await response.blob();
+      const signature=new Uint8Array(await blob.slice(0,4).arrayBuffer());
+      if(signature.length!==4||signature[0]!==0x50||signature[1]!==0x4b||!((signature[2]===3&&signature[3]===4)||(signature[2]===5&&signature[3]===6))){
+        throw new ApiError('下载的策略文件不完整，请稍后重试。','RESPONSE',response.status);
+      }
+      return {blob,filename:strategyArchiveFilename(response.headers.get('Content-Disposition'))};
+    } catch(error) {
+      if(error instanceof ApiError)throw error;
+      const timeout=signal.aborted||['TimeoutError','AbortError'].includes(error?.name);
+      throw new ApiError(timeout?'整理策略用时较长，本次下载未完成，请稍后重试。':'暂时无法下载策略，请检查连接后重试。',timeout?'TIMEOUT':'NETWORK');
+    }
+  }
   async post(path, body) {
     for (let attempt=0; attempt<2; attempt++) {
       const session = await this.get('/api/session');
@@ -52,6 +83,15 @@ class LocalApi {
 }
 
 const api = new LocalApi();
+function strategyArchiveFilename(header) {
+  const fallback='研究与交易策略-近两周.zip';
+  const encoded=String(header||'').match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+  const plain=String(header||'').match(/filename\s*=\s*(?:"([^"]+)"|([^;]+))/i);
+  let filename=plain?.[1]||plain?.[2]||fallback;
+  if(encoded){try{filename=decodeURIComponent(encoded[1].trim());}catch{}}
+  filename=filename.trim().split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f<>:"|?*]/g,'_');
+  return filename.length<=200&&/\.zip$/i.test(filename)?filename:fallback;
+}
 const $ = id => document.getElementById(id);
 const money = n => n==null ? '—' : (n/100).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
 const signed = n => n==null ? '—' : (n>0?'+':'')+money(n);
@@ -112,6 +152,34 @@ const decisionReason = value => String(value||'').replace(/\b[A-Z][A-Z_]{3,}\b/g
 }[code]||blockerNames[code]||names[code]||'其他交易条件待核实'));
 const brief = text => { const t=String(text||''); const sentence=t.match(/^.{12,180}?[。！？]/u);return sentence?sentence[0]:t.length>130?t.slice(0,130)+'…':t; };
 let state=null, editing=false, refreshing=false, connected=false;
+let strategyDownloadBusy=false;
+function initStrategyDownload() {
+  const box=$('strategy-download'),button=$('strategy-download-button');
+  if(!box||!button)return;
+  box.hidden=currentUser?.role!=='ADMIN';
+  if(!button.dataset.bound){button.addEventListener('click',downloadStrategyArchive);button.dataset.bound='true';}
+}
+async function downloadStrategyArchive() {
+  if(currentUser?.role!=='ADMIN'||strategyDownloadBusy)return;
+  const button=$('strategy-download-button');
+  if(!button)return;
+  strategyDownloadBusy=true;button.disabled=true;button.textContent='正在整理…';button.setAttribute('aria-busy','true');
+  feedback('strategy-download-feedback','正在整理近两周的研究、交易策略和变化原因，可能需要一些时间…','pending');
+  try{
+    const {blob,filename}=await api.strategyArchive();
+    const url=URL.createObjectURL(blob),anchor=document.createElement('a');
+    try{
+      anchor.href=url;anchor.download=filename;anchor.hidden=true;document.body.append(anchor);anchor.click();
+    }finally{
+      anchor.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+    }
+    feedback('strategy-download-feedback','已开始下载。文件包含研究、交易策略及调整原因。');
+  }catch(error){
+    feedback('strategy-download-feedback',error instanceof ApiError?error.message:'策略文件未能下载，请稍后重试。','error');
+  }finally{
+    strategyDownloadBusy=false;button.disabled=false;button.textContent='下载近两周策略';button.setAttribute('aria-busy','false');
+  }
+}
 let withdrawalPreview=null,withdrawalBusy=false,withdrawalMessage='';
 let withdrawalUnknown=withdrawalPending();
 function withdrawalPending(value) {
@@ -1331,7 +1399,7 @@ function resetWatchlist(){
   $('watchlist-search').value='';if(state)renderWatchlist(state);rememberWatchlist();$('watchlist-search').focus();
 }
 async function boot() {
-  try{const session=await api.get('/api/session');if(!session.authenticated){location.replace('/login?next='+encodeURIComponent(location.pathname));return;}currentUser=session.user;document.body.dataset.role=currentUser.role;initPages();initBoardTabs();}catch(e){showRefreshProblem(e);if(e.kind!=='AUTH')setTimeout(boot,10000);return;}
+  try{const session=await api.get('/api/session');if(!session.authenticated){location.replace('/login?next='+encodeURIComponent(location.pathname));return;}currentUser=session.user;document.body.dataset.role=currentUser.role;initPages();initBoardTabs();initStrategyDownload();}catch(e){showRefreshProblem(e);if(e.kind!=='AUTH')setTimeout(boot,10000);return;}
   document.querySelectorAll('a[href^="#"]').forEach(a=>a.addEventListener('click',()=>{const target=$(a.getAttribute('href').slice(1));if(target?.tagName==='DETAILS')target.open=true;else if(target?.id==='settings-section')target.querySelector('details').open=true;}));
   document.querySelectorAll('[data-run]').forEach(b=>{b.dataset.idleLabel=b.textContent;b.addEventListener('click',()=>runAction(b));});
   $('watchlist').addEventListener('input',()=>{editing=true;pendingWatchlist=null;$('watchlist-changes').hidden=true;$('save').textContent='检查名单变更';});

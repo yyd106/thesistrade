@@ -159,7 +159,7 @@ def make_handler(config_path,token,port):
                         self.send(302,b'',headers={'Location':'/login?next='+urllib.parse.quote(path.path,safe='')})
                     else:self.send(401,{'code':'AUTH_REQUIRED','error':'请先登录。'})
                     return
-                admin_route=path.path.startswith('/admin/') or path.path in ('/api/feedback','/api/job','/api/snapshot','/api/search','/help/recovery')
+                admin_route=path.path.startswith('/admin/') or path.path in ('/api/feedback','/api/job','/api/snapshot','/api/search','/help/recovery','/api/strategy-export')
                 if admin_route and user['role']!='ADMIN':self.send(403,{'code':'ADMIN_REQUIRED','error':'此页面仅管理员可用。'});return
                 if path.path=='/' or path.path in ('/admin/feedback','/admin/settings') or re.fullmatch(r'/stocks/(sh|sz)\d{6}',path.path):
                     template=(Path(__file__).parent/'web'/'index.html').read_text()
@@ -183,6 +183,20 @@ def make_handler(config_path,token,port):
                         row=store.db.execute('SELECT * FROM jobs WHERE id=?',(query.get('id',[''])[0],)).fetchone()
                         self.send(200,dict(row)) if row else self.send(404,{'error':'未找到此任务记录。'})
                     finally:store.close()
+                elif path.path=='/api/strategy-export':
+                    if not self.origin_ok():return
+                    if path.query:raise ValueError('下载范围固定为近14个北京时间自然日，无需额外参数。')
+                    try:
+                        if cfg.get('deployment_role')=='cloud':
+                            from .strategy_export_sync import read_cache
+                            raw,filename=read_cache(cfg['data_dir'],now())
+                        else:
+                            from .strategy_export import build_archive
+                            raw,filename=build_archive(cfg['data_dir'])
+                    except (ValueError,RuntimeError,OSError) as exc:
+                        self.send(503,{'error':str(exc)[:300]});return
+                    self.send(200,raw,'application/zip',headers={
+                        'Content-Disposition':'attachment; filename="'+filename+'"'})
                 elif path.path=='/health':
                     from .cloud_ledger import FEATURES
                     from .build import code_fingerprint

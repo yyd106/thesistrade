@@ -272,6 +272,9 @@ def receive_display(store,body):
 
 
 def handle(store,config,path,body,at):
+    if path=='/api/sync/strategy-export':
+        from .strategy_export_sync import receive
+        return receive(store,body,at)
     if path=='/api/sync/freshness':
         from .freshness_sync import receive
         return receive(store,body,at)
