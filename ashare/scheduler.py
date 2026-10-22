@@ -167,6 +167,8 @@ class Scheduler:
         # Page collection and HTTPS must never occupy the ledger/strategy worker.
         self.page_display_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='page-display')
         self.page_display_future=None;self.last_page_display=None
+        self.strategy_export_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='strategy-export')
+        self.strategy_export_future=None;self.last_strategy_export=None
         self.dynamic_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='dynamic')
         self.dynamic_futures={}
         self.global_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='global-paper')
@@ -305,6 +307,7 @@ class Scheduler:
                     from .cloud_sync import sync_once
                     self.sync_future=self.sync_pool.submit(sync_once,config);self.last_sync=time.monotonic()
                 self.page_display_tick(store,config)
+                self.strategy_export_tick(store,config,offline)
                 with store.db:store.db.execute("UPDATE jobs SET status='MIGRATED',finished_at=? WHERE kind IN ('slot','dynamic_slot','global_slot','settle') AND status='PENDING'",(stamp,))
             elif role(config)=='cloud':
                 from .cloud_runtime import value,fence
@@ -439,6 +442,24 @@ class Scheduler:
         self.last_page_display=time.monotonic()
         self.page_display_future=self.page_display_pool.submit(page_display_once,dict(config),self.stop)
 
+    def strategy_export_tick(self,store,config,offline=None):
+        """Read-only download preparation cannot occupy research or ledger workers."""
+        from .cloud_sync import remote_supports
+        from .strategy_export_sync import FEATURE,worker
+        if self.strategy_export_future is not None and self.strategy_export_future.done():
+            try:self.strategy_export_future.result()
+            except Exception as exc:
+                from .cloud_runtime import put
+                try:
+                    with store.db:put(store,'strategy_export_sync',{'at':now(),'status':'FAILED','error':'策略档案同步未完成，将自动重试。','error_type':type(exc).__name__})
+                except Exception:pass
+            self.strategy_export_future=None
+        if self.stop.is_set() or offline or role(config)!='research' or not remote_supports(store,FEATURE):return
+        if self.strategy_export_future is not None:return
+        if self.last_strategy_export is not None and time.monotonic()-self.last_strategy_export<300:return
+        self.last_strategy_export=time.monotonic()
+        self.strategy_export_future=self.strategy_export_pool.submit(worker,dict(config),cancel_event=self.stop)
+
     def experiment_tick(self,store,config,stamp,offline=None):
         """Bounded local observation work; research and supervision take priority."""
         if role(config)=='cloud':
@@ -515,3 +536,4 @@ class Scheduler:
         self.supervision_pool.shutdown(wait=True,cancel_futures=True)
         self.stop.set();self.pool.shutdown(wait=True,cancel_futures=True);self.dynamic_pool.shutdown(wait=True,cancel_futures=True);self.global_pool.shutdown(wait=True,cancel_futures=True);self.monitor.close();self.sync_pool.shutdown(wait=True,cancel_futures=True);self.reports_pool.shutdown(wait=True,cancel_futures=True)
         self.page_display_pool.shutdown(wait=True,cancel_futures=True)
+        self.strategy_export_pool.shutdown(wait=True,cancel_futures=True)
