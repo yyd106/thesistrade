@@ -16,6 +16,7 @@ const elements=new Map(),element=id=>{
 };
 const context=vm.createContext({document:{addEventListener(){},createElement:tag=>new Element(tag),createTextNode:text=>Object.assign(new Element('#text'),{textContent:text}),getElementById:element,querySelectorAll(){return [];}},fetch(){throw Error('No real network in synthetic UI test');},AbortSignal,URLSearchParams});
 vm.runInContext(await readFile(new URL('../ashare/web/app.js',import.meta.url),'utf8'),context,{filename:'app.js'});
+vm.runInContext("currentUser={role:'ADMIN'}",context);
 const get=name=>vm.runInContext(name,context),full=node=>[node.textContent,...node.children.map(full)].join(' ');
 const setState=value=>{context.fixtureState=value;vm.runInContext('state=fixtureState',context);};
 const closing={qty:100,cost_cents:100000,market_value_cents:134100,average_cost_cents:1000,price_cents:1341,unrealized_cents:34100,cumulative_realized_cents:-26179,equity_cents:10033021,quality:'CLOSE',quote_at:'2026-09-30T08:14:58Z',valuation_complete:true};
