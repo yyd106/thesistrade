@@ -211,6 +211,91 @@ class PortfolioStrategyTests(unittest.TestCase):
         self.assertEqual(result['status'],'SUCCEEDED',result)
         d=ps.decision(self.store,self.cfg,'global','BTC',self.later(121))
         self.assertEqual(d['action'],'HOLD');self.assertEqual(d['target_bps'],d['current_bps'])
+        payload=ps.active(self.store,self.later(121))['payload'];audit=payload['publication_audit']
+        item=next(x for x in audit['decisions'] if x['key']=='global:BTC')
+        self.assertEqual((audit['analysis_as_of'],audit['published_at']),(at,self.later(121)))
+        self.assertEqual(payload['account'],audit['analysis_account'])
+        self.assertNotEqual(audit['analysis_account']['equity_cents'],audit['publication_account']['equity_cents'])
+        self.assertEqual(item['model_action'],'HOLD')
+        self.assertEqual(item['model_target_bps'],item['analysis_basis']['current_bps'])
+        self.assertEqual(item['published_target_bps'],d['target_bps'])
+        self.assertNotEqual(item['model_target_bps'],item['published_target_bps'])
+        self.assertEqual(item['adjustment_codes'],['HOLD_PAUSE_CURRENT_REBASE'])
+        for stage in ('analysis','publication'):
+            basis=item[stage+'_basis'];equity=max(1,audit[stage+'_account']['equity_cents'])
+            self.assertEqual(basis['current_bps'],(basis['current_value_cents']*10000+equity-1)//equity)
+
+    def test_publication_audit_retains_model_choice_without_changing_model_contract(self):
+        self.quote();self.plan();captured={}
+        def model(prompt,schema,*args):
+            packet=json.loads(prompt.split('<UNTRUSTED_INPUT>')[1].split('</UNTRUSTED_INPUT>')[0])
+            self.assertEqual(prompt,ps.PROMPT+'\n<UNTRUSTED_INPUT>'+ps.encoded(packet)+'</UNTRUSTED_INPUT>')
+            self.assertEqual(schema,ps.SCHEMA)
+            self.assertNotIn('publication_audit',packet)
+            captured.update(packet=packet)
+            return self.output(packet,{'global:BTC':{'action':'ALLOW','target_bps':100}})
+        result=ps.run(self.store,self.cfg,self.at,model_fn=model,clock=lambda:self.at)
+        self.assertEqual(result['status'],'SUCCEEDED',result)
+        payload=ps.active(self.store,self.at)['payload'];audit=payload['publication_audit']
+        self.assertEqual(audit['version'],1)
+        self.assertEqual(audit['target_method'],'MODEL_DISCRETION_WITH_HARD_CONSTRAINTS')
+        self.assertEqual(audit['validation'],{'analysis':'PASSED','publication':'PASSED'})
+        self.assertEqual(audit['analysis_account'],captured['packet']['account'])
+        self.assertEqual(audit['analysis_account'],audit['publication_account'])
+        item=next(x for x in audit['decisions'] if x['key']=='global:BTC')
+        self.assertEqual((item['model_action'],item['published_action']),('ALLOW','ALLOW'))
+        self.assertEqual((item['model_target_bps'],item['published_target_bps']),(100,100))
+        self.assertEqual(item['analysis_basis'],item['publication_basis'])
+        self.assertEqual(item['adjustment_codes'],[])
+        self.assertEqual(ps.decision(self.store,self.cfg,'global','BTC',self.at)['target_bps'],100)
+        for account in (audit['analysis_account'],audit['publication_account']):
+            self.assertEqual(set(account),{'cash_cents','equity_cents','available_cents','reserved_cents',
+                'withdrawal_reserved_cents','market_value_cents'})
+            self.assertTrue(all(type(v) is int for v in account.values()))
+        def check_keys(value):
+            if isinstance(value,dict):
+                self.assertFalse(set(value)&{'input_guard','guard','source_token','membership_token','orders','research','prompt'})
+                for v in value.values():check_keys(v)
+            elif isinstance(value,list):
+                for v in value:check_keys(v)
+        check_keys(audit)
+
+    def test_audit_distinguishes_model_allow_from_expired_source_publication_pause(self):
+        self.quote();plan,_=self.plan()
+        with self.store.db:self.store.db.execute('UPDATE global_plans SET valid_until=? WHERE id=?',(self.later(1),plan['id']))
+        result=ps.run(self.store,self.cfg,self.at,
+            model_fn=lambda prompt,*args:self.output(json.loads(prompt.split('<UNTRUSTED_INPUT>')[1].split('</UNTRUSTED_INPUT>')[0]),
+                {'global:BTC':{'action':'ALLOW','target_bps':100}}),clock=lambda:self.later(2))
+        self.assertEqual(result['status'],'SUCCEEDED',result)
+        payload=ps.active(self.store,self.later(2))['payload']
+        item=next(x for x in payload['publication_audit']['decisions'] if x['key']=='global:BTC')
+        decision=next(x for x in payload['decisions'] if x['key']=='global:BTC')
+        self.assertEqual((item['model_action'],item['model_target_bps']),('ALLOW',100))
+        self.assertEqual((item['published_action'],item['published_target_bps']),('PAUSE',0))
+        self.assertTrue(item['analysis_basis']['can_increase'])
+        self.assertFalse(item['publication_basis']['can_increase'])
+        self.assertEqual(item['publication_basis']['recorded_blockers'],[])
+        self.assertEqual(item['adjustment_codes'],['ALLOW_ELIGIBILITY_LOST','HOLD_PAUSE_CURRENT_REBASE'])
+        self.assertEqual((decision['action'],decision['target_bps']),('PAUSE',0))
+        self.assertEqual(decision['reason'],'现有证据保持观察，不把重复驱动视为独立机会；发布时条件变化，暂停新增买入')
+
+    def test_audit_preserves_model_reduce_when_price_move_removes_minimum_gap(self):
+        _,_,instrument=self.enter();self.fill(instrument)
+        at=self.later(120);self.quote(at=at)
+        def moving(prompt,*args):
+            packet=json.loads(prompt.split('<UNTRUSTED_INPUT>')[1].split('</UNTRUSTED_INPUT>')[0])
+            current=next(x['current_bps'] for x in packet['candidates'] if x['key']=='global:BTC')
+            self.quote(price=99,at=self.later(121))
+            return self.output(packet,{'global:BTC':{'action':'REDUCE','target_bps':current-100}})
+        result=ps.run(self.store,self.cfg,at,model_fn=moving,clock=lambda:self.later(121))
+        self.assertEqual(result['status'],'SUCCEEDED',result)
+        payload=ps.active(self.store,self.later(121))['payload']
+        item=next(x for x in payload['publication_audit']['decisions'] if x['key']=='global:BTC')
+        self.assertEqual((item['model_action'],item['published_action']),('REDUCE','HOLD'))
+        self.assertEqual(item['analysis_basis']['current_bps']-item['model_target_bps'],100)
+        self.assertLess(item['publication_basis']['current_bps']-item['model_target_bps'],100)
+        self.assertEqual(item['published_target_bps'],item['publication_basis']['current_bps'])
+        self.assertEqual(item['adjustment_codes'],['REDUCE_MINIMUM_GAP_LOST','HOLD_PAUSE_CURRENT_REBASE'])
 
     def test_scheduler_coalesces_sources_and_retains_dirty_request(self):
         self.cfg['scheduler_enabled']=True
