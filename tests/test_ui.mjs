@@ -4,6 +4,7 @@ import vm from 'node:vm';
 const source=await readFile(new URL('../ashare/web/app.js',import.meta.url),'utf8');
 const context=vm.createContext({document:{addEventListener(){}},fetch(){throw Error('Unexpected real network');},AbortSignal,URLSearchParams});
 vm.runInContext(source,context,{filename:'app.js'});
+vm.runInContext("currentUser={role:'ADMIN'}",context);
 const LocalApi=vm.runInContext('LocalApi',context);
 const reply=(status,data)=>({ok:status>=200&&status<300,status,json:async()=>data});
 let calls=[],count=0;

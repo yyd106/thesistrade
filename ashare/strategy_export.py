@@ -7,6 +7,7 @@ decision is not an accepted publication; both timelines retain their own baselin
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import hashlib
 import io
 import json
@@ -15,6 +16,8 @@ import re
 import sqlite3
 import zipfile
 from zoneinfo import ZoneInfo
+
+from .strategy_change_log import load_records, render_records
 
 SCHEMA = 'strategy-export-v1'
 TIMEZONE = 'Asia/Shanghai'
@@ -640,6 +643,17 @@ FIELD_LABELS = {
     'risk_groups': '共同风险约束', 'members': '组内标的', 'cap_bps': '上限基点',
     'research_method': '研究方法', 'event_reviews': '公告核验', 'corporate_actions': '公司行为',
     'risk_parameters': '风险参数', 'notice': '说明', 'code': '缺口类别', 'table': '记录类别',
+    'inclination': '研究倾向', 'pricing': '估值与价格反映', 'priced_in': '价格是否已反映',
+    'dimensions': '分维度分析', 'hypothesis_test': '可检验假设', 'claim': '假设命题',
+    'metric': '检验指标', 'operator': '比较方式', 'threshold': '阈值', 'deadline': '核验期限',
+    'impact': '事件冲击', 'business_link': '业务传导', 'stance': '研究方向',
+    'buy_low_cents': '买入下限（人民币分）', 'buy_high_cents': '买入上限（人民币分）',
+    'stop_cents': '止损价（人民币分）', 'sell_cents': '止盈价（人民币分）',
+    'buy_low_micros': '买入下限（美元百万分之一）', 'buy_high_micros': '买入上限（美元百万分之一）',
+    'stop_micros': '止损价（美元百万分之一）', 'sell_micros': '止盈价（美元百万分之一）',
+    'stop_bps': '成本止损基点', 'take_profit_bps': '成本止盈基点',
+    'paper_stop_loss_bps': '程序止损参数（基点）', 'paper_take_profit_bps': '程序止盈参数（基点）',
+    'paper_entry_band_bps': '程序入场区间参数（基点）', 'last_complete_date': '行情截至交易日',
 }
 ACTION_LABELS = {'ALLOW': '允许新增', 'HOLD': '保持', 'PAUSE': '暂停新增', 'REDUCE': '减仓', 'EXIT': '退出'}
 ROUTE_LABELS = {'watchlist': '公司研究', 'dynamic': '事件研究', 'global': '全球资产'}
@@ -677,13 +691,310 @@ def _details(value, depth=0):
     return lines
 
 
+def _present(value):
+    return value is not None and value != '' and value != [] and value != {}
+
+
+def _select_fields(value, keys):
+    return {key: value[key] for key in keys if isinstance(value, dict) and _present(value.get(key))}
+
+
+def _source_clock(record):
+    return record.get('activated_at') or record.get('created_at')
+
+
+def _no_later(value, cutoff):
+    try:
+        return _time(value) <= _time(cutoff)
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _frozen_source(data, decision, item):
+    """Only the matching, contemporaneous frozen source may explain a decision."""
+    ref = decision.get('source_refs', {}).get(item.get('key'))
+    source = data['frozen_sources'].get(ref, {})
+    record = source.get('record', {})
+    if (source.get('table') == SOURCE_TABLES.get(item.get('route'))
+            and record.get('id') == item.get('source_id')
+            and record.get('symbol') == item.get('symbol')
+            and _no_later(_source_clock(record), decision['record']['created_at'])):
+        return ref, source
+    return None, None
+
+
+def _report_cards(data):
+    """Presentation-only index; never adds inferred research to the export data."""
+    cards, referenced = {}, set()
+    for decision in data['decisions']:
+        for item in decision['payload'].get('decisions', []):
+            ref, source = _frozen_source(data, decision, item)
+            identity = ('frozen', ref) if source else ('missing', item.get('key'), item.get('source_id'))
+            card = cards.setdefault(identity, {
+                'table': source['table'] if source else SOURCE_TABLES.get(item.get('route')),
+                'record': source['record'] if source else {}, 'ref': ref,
+                'symbol': item.get('symbol'), 'name': item.get('name'), 'route': item.get('route'),
+                'source_id': item.get('source_id'), 'decisions': [], 'origin': 'frozen' if source else 'missing'})
+            card['decisions'].append((decision, item))
+            if source:
+                referenced.add((source['table'], source['record']['id']))
+    for route, table in SOURCE_TABLES.items():
+        for entry in data['research'].get(table, []):
+            record = entry['record']
+            if (table, record['id']) in referenced:
+                continue
+            cards[('retained', table, record['id'])] = {
+                'table': table, 'record': record, 'ref': None, 'symbol': record.get('symbol'),
+                'name': record.get('name'), 'route': route, 'source_id': record['id'],
+                'decisions': [], 'origin': 'retained'}
+    studies = {entry['record']['id']: entry['record'] for entry in data['research'].get('studies', [])}
+    linked_stocks = {(c['record'].get('study_id'), c['symbol']) for c in cards.values()
+                     if _no_later(studies.get(c['record'].get('study_id'), {}).get('created_at'),
+                                  _source_clock(c['record']))}
+    for entry in data['research'].get('studies', []):
+        record = entry['record']
+        stocks = _payload(record, 'result_json').get('stocks', [])
+        for index, stock in enumerate(stocks or [{'symbol': record.get('symbol')}]):
+            if (record['id'], stock.get('symbol')) in linked_stocks:
+                continue
+            cards[('study', record['id'], index)] = {
+                'table': 'studies', 'record': record, 'stock': stock, 'ref': None,
+                'symbol': stock.get('symbol'), 'name': None, 'route': 'watchlist',
+                'source_id': record['id'], 'decisions': [], 'origin': 'retained'}
+    for entry in data['research'].get('industry_hypotheses', []):
+        record = entry['record']
+        payload = _payload(record)
+        cards[('industry', record['id'])] = {
+            'table': 'industry_hypotheses', 'record': record, 'ref': None,
+            'symbol': record.get('symbol'), 'name': payload.get('name'), 'route': 'industry',
+            'source_id': record['id'], 'decisions': [], 'origin': 'retained'}
+    return sorted(cards.values(), key=lambda c: (str(c['symbol'] or ''), str(c['route'] or ''),
+                                               _source_clock(c['record']) or '', str(c['ref'] or c['source_id'] or '')))
+
+
+def _research_material(studies, card):
+    record, table = card['record'], card['table']
+    plan = _payload(record, 'plan_json' if table == 'dynamic_cases' else 'payload_json')
+    study, stock = None, card.get('stock', {})
+    if table == 'plans' and record.get('study_id'):
+        candidate = studies.get(record['study_id'])
+        if candidate and _no_later(candidate.get('created_at'), _source_clock(record)):
+            study = candidate
+            stock = next((s for s in _payload(study, 'result_json').get('stocks', [])
+                          if s.get('symbol') == card['symbol']), {})
+    if table == 'dynamic_cases':
+        analysis = _payload(record, 'analysis_json')
+    elif table in ('studies', 'plans'):
+        analysis = stock or (plan.get('analysis') if isinstance(plan.get('analysis'), dict) else {})
+    elif table == 'industry_hypotheses':
+        analysis = plan
+    else:
+        analysis = plan.get('analysis') if isinstance(plan.get('analysis'), dict) else {}
+    judgment = analysis.get('decision') if isinstance(analysis.get('decision'), dict) else {}
+    return plan, analysis, judgment, study
+
+
+def _report_section(title, groups, missing):
+    lines = ['##### ' + title, '']
+    populated = [(label, value) for label, value in groups if _present(value)]
+    if not populated:
+        return lines + [missing, '']
+    for label, value in populated:
+        lines += ['**' + label + '**', ''] + _details(value) + ['']
+    return lines
+
+
+def _price_rule(plan, low, high, scale, currency):
+    levels = plan.get('levels') if isinstance(plan.get('levels'), dict) else plan
+    def amount(key):
+        value = levels.get(key)
+        if type(value) not in (int, float):
+            return '未记录'
+        rendered = format(Decimal(str(value)) / scale, 'f')
+        if '.' in rendered:
+            rendered = rendered.rstrip('0').rstrip('.')
+        return rendered + ' ' + currency
+    return amount(low) + ' — ' + amount(high)
+
+
+def _stock_reports(data):
+    cards = _report_cards(data)
+    studies = {entry['record']['id']: entry['record'] for entry in data['research'].get('studies', [])}
+    news = {entry['record']['id']: entry['record'] for entry in data['research'].get('dynamic_news', [])}
+    lines = ['## 逐标的研究与交易方案', '',
+             '每个标的、每条研究路线展开最后一次组合决定引用的方案；尚无组合决定的，展开最后一份留存研究。历史来源逐项列在索引，完整研究与逐次决定仍保留在原始记录及交易文档中。',
+             '内容来自已留存字段的确定性编排，不新增投资判断；缺失项不能视为条件已满足。固定时间栏使用北京时间；引用原文中的时间保留原记录格式。', '']
+    if not cards:
+        return lines + ['本窗口没有可整理的逐标的研究或组合项目；请查看末尾原始记录与总览中的证据缺口。', '']
+    latest = {}
+    def order(card):
+        if card['decisions']:
+            decision = card['decisions'][-1][0]
+            return True, decision['record']['created_at'], decision.get('source_order', 0)
+        return False, _source_clock(card['record']) or '', 0
+    for card in cards:
+        key = (card['symbol'], card['route'])
+        if key not in latest or order(card) > order(latest[key]):
+            latest[key] = card
+    detail_numbers = {id(card): number for number, card in enumerate(latest.values(), 1)}
+    lines += ['#### 历史来源版本索引', '',
+              f'共 {len(cards)} 份来源版本，展开 {len(latest)} 份最新方案。索引仅省去重复排版，不删除任何原始版本或决策。',
+              '按来源编号在下方原始研究记录检索；冻结引用对应策略数据.json 的 frozen_sources，逐次对应关系见 decisions 的 source_refs。', '',
+              '| 标的代码 / 路线 | 来源编号 | 形成时间 | 来源性质 | 冻结引用 | 窗口内决定次数及首末编号 | 最新方案 |',
+              '| --- | --- | --- | --- | --- | --- | --- |']
+    for card in cards:
+        decisions = card['decisions']
+        span = (str(len(decisions)) + ' 次；' + str(decisions[0][0]['record']['id']) + ' → ' +
+                str(decisions[-1][0]['record']['id'])) if decisions else '未找到匹配冻结组合'
+        lines.append('| ' + ' | '.join((
+            _cell(str(card['symbol'] or '未记录') + ' / ' + ROUTE_LABELS.get(card['route'], '产业研究')),
+            _cell(card['source_id']), _local(_source_clock(card['record'])),
+            {'frozen': '决策时冻结', 'missing': '历史来源缺失', 'retained': '导出时留存'}[card['origin']],
+            _cell(card['ref'] or '—'), _cell(span),
+            str(detail_numbers[id(card)]) if id(card) in detail_numbers else '见原始记录')) + ' |')
+    lines += ['']
+    for number, card in enumerate(latest.values(), 1):
+        record, table = card['record'], card['table']
+        plan, analysis, judgment, study = _research_material(studies, card)
+        name = card.get('name') or analysis.get('name') or '名称未记录'
+        symbol = card.get('symbol') or '代码未记录'
+        title = f'{name}（{symbol}）'
+        lines += [f'### {number}. {_safe_text(title)} · {_safe_text(ROUTE_LABELS.get(card["route"], "产业研究"))}', '',
+                  '来源记录：' + _safe_text(card['source_id']) + '；冻结来源引用：' + _safe_text(card['ref']) + '。', '',
+                  '#### 一、覆盖范围与版本', '']
+        if card['origin'] == 'frozen':
+            lines += ['此卡使用组合决定当时冻结的来源。明确关联的公司研究按研究编号查询；只有不晚于计划形成时间的同一标的研究才在本卡展开。', '']
+        elif card['origin'] == 'missing':
+            lines += ['**历史研究缺口：缺少匹配且不晚于决策时点的冻结来源，无法还原当时研究与程序价格规则。未用当前来源补写历史。**', '']
+        else:
+            lines += ['此卡是导出时留存的研究版本，本窗口未找到引用此版本的匹配冻结组合；不据此推断已经发布或授权交易。', '']
+        lines += [f'- 研究/计划形成时间：{_local(_source_clock(record))}',
+                  '- 研究依据截止时间：' + _local(plan.get('analysis_as_of')),
+                  '- 行情截至交易日：' + _safe_text((plan.get('basis') or {}).get('last_complete_date') if isinstance(plan.get('basis'), dict) else None),
+                  '- 关联公司研究：' + _safe_text(record.get('study_id') or (record.get('id') if table == 'studies' else None)),
+                  '- 公司研究形成时间：' + _local((study or (record if table == 'studies' else {})).get('created_at')),
+                  '- 原记录状态：' + _safe_text(record.get('status') or record.get('state') or record.get('model_status')),
+                  '- 计划有效期至：' + _local(record.get('valid_until') or record.get('expires_at')), '']
+        if not plan.get('analysis_as_of'):
+            lines += ['研究依据的统一截止时点未单独留存；形成时间、行情日期和资料发布时间各有含义，不能相互替代。', '']
+        if table == 'plans' and record.get('study_id') and (study is None or not analysis):
+            reason = '关联研究未留存或晚于计划形成时间' if study is None else '关联研究没有同一标的的输出'
+            lines += ['公司研究缺口：' + reason + '；只展示计划自身留存的内容。', '']
+        lines += ['#### 二、研究方案与分析依据', '']
+        lines += _report_section('1. 研究问题、假设与判断', [
+            ('明确命题与可检验假设', _select_fields(analysis, ('topic', 'thesis', 'hypothesis_test', 'stance', 'action'))),
+            ('研究倾向', judgment.get('inclination')),
+            ('计划留存的研究依据', plan.get('thesis'))],
+            '未记录明确研究问题或假设；不能把组合选中结果倒推成研究结论。')
+        evidence = _select_fields(analysis, ('facts', 'evidence', 'direct_company_evidence', 'evidence_ids'))
+        lines += _report_section('2. 证据、来源与取得时点', [
+            ('研究引用', evidence), ('关键证据及交易含义', judgment.get('key_evidence')),
+            ('计划证据编号', plan.get('evidence_ids')),
+            ('明确关联新闻的引用信息', news.get(record.get('news_id')))],
+            '未记录可核对的证据引用；研究判断的事实基础在本报告中无法复核。')
+        lines += ['证据编号用于回溯，不代表已提供原始文件。未列出资料标题、链接、发布时间或取得时间的引用，其元数据在本报告中缺失；不从编号猜测。新闻元数据为导出时查询。', '']
+        lines += _report_section('3. 分析推导与价格反映', [
+            ('原始分析', _select_fields(analysis, ('analysis', 'rationale', 'reason', 'impact', 'business_link', 'causal_chain', 'profit_capture', 'dimensions'))),
+            ('价格反映判断', _select_fields(judgment, ('pricing',)) or _select_fields(analysis, ('pricing', 'priced_in'))),
+            ('研究方法与约定', _select_fields(plan, ('research_method', 'research_contract', 'method_id')))],
+            '未单独记录分析推导或价格反映判断；不得仅凭入场区间解释为估值结论。')
+        lines += _report_section('4. 催化观察、反证与核验计划', [
+            ('研究成立条件', judgment.get('trigger')),
+            ('后续观察与待检验预测', _select_fields(analysis, ('next_checks', 'next_check', 'forecasts'))),
+            ('反证与其他解释', _select_fields(analysis, ('counterpoints', 'alternatives')) or _select_fields(plan, ('counterpoints',))),
+            ('研究失效条件', judgment.get('invalidation') or analysis.get('invalidation'))],
+            '未记录催化观察、反证或核验计划；不能视为没有反证或风险。')
+        lines += ['#### 三、程序交易规则（记录值）', '',
+                  '以下价格与限制是该版本的程序计划，研究观点和组合目标分别见前后两节。记录缺失时不套用当前默认参数。', '']
+        if table == 'global_plans':
+            interval = _price_rule(plan, 'buy_low_micros', 'buy_high_micros', 1_000_000, '美元')
+            exits = _price_rule(plan, 'stop_micros', 'sell_micros', 1_000_000, '美元')
+        else:
+            interval = _price_rule(plan, 'buy_low_cents', 'buy_high_cents', 100, '元')
+            exits = _price_rule(plan, 'stop_cents', 'sell_cents', 100, '元')
+        cap = plan.get('max_stock_pct', plan.get('max_position_pct'))
+        lines += ['- 入场价格区间：' + interval,
+                  '- 止损价 / 止盈价：' + exits,
+                  '- 计划仓位上限：' + (f'{cap:g}%' if type(cap) in (int, float) else '未记录'), '']
+        lines += _report_section('入场触发、限制与退出条件', [
+            ('计划类别、公式及限制', _select_fields(plan, ('kind', 'formula', 'blockers'))),
+            ('止损止盈参数', _select_fields(plan, ('risk_parameters', 'stop_bps', 'take_profit_bps'))),
+            ('持有期、复核与报价基准', _select_fields(plan, ('holding_days', 'holding_unit', 'recheck_hours', 'reference_quote_at')))],
+            '未记录程序入场、退出与复核条件，无法从研究观点补齐执行规则。')
+        lines += ['未留存明确持有期或退出条件的部分均为缺口；研究失效条件不自动等于程序已实现的卖出条件。', '',
+                  '#### 四、组合决定与交易对应', '']
+        if not card['decisions']:
+            lines += ['本窗口未找到与此卡对应的冻结组合决定；不代表没有其他版本的决定。', '']
+        else:
+            lines += [f'本来源被窗口内组合决定引用 {len(card["decisions"])} 次；此处展开最后一次。全部当轮理由、动作、仓位及发布变化见“交易策略变更.md”，首末编号见历史来源版本索引。', '']
+        for decision, item in card['decisions'][-1:]:
+            lines += ['- 决策编号：' + _safe_text(decision['record']['id']) + '；形成时间：' + _local(decision['record']['created_at']),
+                      '- 动作：' + _action(item) + '；当时当前仓位：' + _weight(item.get('current_bps')) + '；单项上限：' + _weight(item.get('max_bps')),
+                      '- 当轮记录理由：' + _safe_text(item.get('reason')),
+                      '- 组合证据引用：' + _safe_text('、'.join(map(str, item.get('evidence_ids') or [])) or '未记录'),
+                      '- 发布状态：' + _safe_text(decision['publication']['state']) + '；组合有效期至：' + _local(decision['record'].get('valid_until')),
+                      '- 来源有效期至：' + _local(item.get('source_valid_until')) + '；允许增加：' + ('是' if item.get('can_increase') is True else '否' if item.get('can_increase') is False else '未记录'), '']
+        lines += ['**成交核对：本报告未纳入模拟成交明细，无法确认是否成交、成交价、数量或盈亏。应以云端账本核对决策编号、来源计划编号和标的代码；已确认发布不等于已成交。**', '',
+                  '#### 五、缺口与版本追溯', '']
+        coverage = (
+            ('明确研究命题/可检验假设', _select_fields(analysis, ('topic', 'thesis', 'hypothesis_test'))),
+            ('证据引用', evidence or judgment.get('key_evidence') or plan.get('evidence_ids')),
+            ('统一研究依据截止时间', plan.get('analysis_as_of')),
+            ('价格反映判断', judgment.get('pricing') or analysis.get('pricing')),
+            ('研究成立条件', judgment.get('trigger')),
+            ('反证/其他解释', analysis.get('counterpoints') or analysis.get('alternatives') or plan.get('counterpoints')),
+            ('研究失效条件', judgment.get('invalidation') or analysis.get('invalidation')),
+            ('后续核验计划', analysis.get('next_checks') or analysis.get('next_check')),
+            ('明确计划持有期', plan.get('holding_days')),
+        )
+        lines += ['| 核对字段 | 留存情况 |', '| --- | --- |']
+        lines += ['| ' + label + ' | ' + ('已留存，见上文' if _present(value) else '未记录，不能补推') + ' |'
+                  for label, value in coverage]
+        lines += ['', '“已留存”只描述字段覆盖，不评价证据质量或策略可执行性。', '']
+        lines += _report_section('研究资料缺口', [
+            ('原研究披露的缺口', _select_fields(analysis, ('missing_fields', 'missing', 'admission_gaps')))],
+            '原研究未单列资料缺口；不代表资料已齐全。')
+        lines += _report_section('版本与适用范围', [
+            ('来源版本', _select_fields(record, ('strategy_version', 'fingerprint', 'previous_id'))),
+            ('计划版本与沿用关系', _select_fields(plan, ('strategy_version', 'build', 'model', 'research_reuse', 'previous_plan_id', 'renewed_from')))],
+            '版本信息未记录；仅可凭来源记录编号追溯。')
+    return lines
+
+
 def _overview(data):
     c = data['coverage']
     lines = ['# 近14天研究与交易策略', '',
              f'北京时间 {_local(data["start_at"])} 至 {_local(data["end_at"])}。', '',
              f'生成组合 {c["generated_decisions"]} 次，其中可确认发布 {c["acknowledged_decisions"]} 次；'
              f'具备冻结来源 {c["frozen_decisions"]} 次。', '',
-             '[研究策略](研究策略.md) · [交易策略变更](交易策略变更.md) · [结构化完整投影](策略数据.json)', '',
+             '[研究策略](研究策略.md) · [研究评审与交易策略变更](交易策略变更.md) · [结构化完整投影](策略数据.json)', '',
+             '## 阅读入口', '',
+             '1. 在下方标的索引定位股票代码和研究路线，再打开“研究策略.md”的“逐标的研究与交易方案”。',
+             '2. 每张卡按研究问题与证据、分析推导、催化与反证、程序价格规则、组合仓位与发布、缺口与版本阅读。',
+             '3. 需要核对调整原因时读“交易策略变更.md”；需要复核原始字段时读研究文档后半部及“策略数据.json”。', '',
+             '研究判断回答“为什么关注”，程序规则回答“什么条件允许执行”，组合决定回答“该轮分配多少”。三者分别保留，不从选股结果反推研究理由。',
+             '窗口是近14个北京时间自然日；模板不表示策略还能继续执行两周，执行期限须逐项查看。', '',
+             '## 标的索引（窗口内最后一次生成决定）', '',
+             '这里是窗口内最后一条留存决定，不自动代表当前有效、已发布或已成交。尚未进入组合的研究见研究文档中的来源版本卡。', '',
+             '| 股票/资产 | 代码 | 研究路线 | 最后决定时间 | 动作 / 目标仓位 | 发布状态 | 当时研究来源 |',
+             '| --- | --- | --- | --- | --- | --- | --- |']
+    latest = {}
+    for decision in data['decisions']:
+        for item in decision['payload'].get('decisions', []):
+            latest[item['key']] = (decision, item)
+    for key in sorted(latest):
+        decision, item = latest[key]
+        ref, source = _frozen_source(data, decision, item)
+        lines.append('| ' + ' | '.join((
+            _cell(item.get('name') or '名称未记录'), _cell(item.get('symbol')),
+            _cell(ROUTE_LABELS.get(item.get('route'), item.get('route'))),
+            _local(decision['record']['created_at']), _action(item), _cell(decision['publication']['state']),
+            _cell(item.get('source_id')) + ('；匹配冻结来源' if source else '；历史来源缺失'))) + ' |')
+    if not latest:
+        lines += ['| 本窗口没有可用组合决定 | — | — | — | — | — | — |']
+    lines += ['',
+             f'本窗口留存研究策略评审 {len(data["research"].get("strategy_reviews", []))} 份；'
+             '详见前两份文档开头，逐项区分事实澄清、认可但待实施、已实施及其原因。', '',
              '## 可用范围与限制', '']
     lines += ['- ' + text for text in c['limitations']]
     lines += ['', '## 研究版本数量', '']
@@ -698,7 +1009,13 @@ def _overview(data):
 def _research(data):
     lines = ['# 研究策略', '', '依照研究形成时间列出本窗口各次可用输出。窗口外的关联研究另作标记。',
              'WATCH 表示资料足以观察，不直接授权下单；原记录状态不等于现在仍有效。', '']
+    lines += render_records(data['research'].get('strategy_reviews', []))
+    lines += _stock_reports(data)
+    lines += ['## 原始研究记录（完整追溯）', '',
+              '以下保留原有逐表、逐版本记录；上方方案卡仅重排已留存字段，不替代原始记录。', '']
     for table, entries in data['research'].items():
+        if table == 'strategy_reviews':
+            continue
         lines += ['## ' + TABLE_LABELS[table], '']
         if not entries:
             lines += ['本窗口没有可用记录；不能据此认定未发生研究。', '']
@@ -729,7 +1046,10 @@ def _trading(data):
         return next((item for item in version.get('payload', {}).get('decisions', [])
                      if item.get('key') == ref['key']), None)
 
-    lines = ['# 交易策略变更', '', '生成记录与已确认发布记录分别比较。窗口首项使用窗口前基线；缺少基线时只记首次观察。',
+    lines = ['# 研究策略评审与交易策略变更', '',
+             '本文件先列研究策略评审与采纳状态，再列模拟交易决定的变化及当轮依据。', '']
+    lines += render_records(data['research'].get('strategy_reviews', []))
+    lines += ['## 交易策略变化', '', '生成记录与已确认发布记录分别比较。窗口首项使用窗口前基线；缺少基线时只记首次观察。',
              '每次保留原始组合总结与每个项目的理由；账面占比变化不自动解释为主动调仓或行情波动。',
              '“当轮理由”是当时记录的决策依据。系统没有单独记录明确调整原因时，不从前后差异推断新的原因。', '',
              '## 每日变化概览', '',
@@ -766,10 +1086,11 @@ def _trading(data):
         lines += ['', '原始组合总结：', '', _safe_text(payload.get('summary', '原总结不可用。')), '']
         for item in payload.get('decisions', []):
             name = item.get('name') or item.get('symbol') or item.get('key')
-            lines += [f'### {_safe_text(name)} · {_safe_text(ROUTE_LABELS.get(item.get("route"), item.get("route")))}', '',
+            lines += [f'### {_safe_text(name)}（{_safe_text(item.get("symbol"))}） · {_safe_text(ROUTE_LABELS.get(item.get("route"), item.get("route")))}', '',
                       f'动作：{_safe_text(ACTION_LABELS.get(item.get("action"), item.get("action")))}；当前占比 {_weight(item.get("current_bps"))}；目标占比 {_weight(item.get("target_bps"))}。', '',
                       '当轮记录理由（原始理由）：' + _safe_text(item.get('reason')), '',
-                      '来源：' + _safe_text(item.get('source_id')) + '；冻结来源引用：' + _safe_text(decision['source_refs'].get(item.get('key'), '缺失，未用当前来源补写历史')) + '。', '']
+                      '来源：' + _safe_text(item.get('source_id')) + '；冻结来源引用：' + _safe_text(decision['source_refs'].get(item.get('key'), '缺失，未用当前来源补写历史')) + '。',
+                      '研究与程序规则：在“研究策略.md”的逐标的方案中按代码、来源编号及冻结引用核对。', '']
         comparisons = [('相对上一生成版本的变化', decision['generated_change'])]
         published = decision['acknowledged_change']
         if published is not None and 'items_ref' not in published:
@@ -812,6 +1133,7 @@ def build_archive(data_dir, at=None):
         db.rollback()
     finally:
         db.close()
+    data['research']['strategy_reviews'] = load_records(database.parent, data['start_at'], data['end_at'])
     rendered = (_overview(data), _research(data), _trading(data), _json(data) + '\n')
     encoded = [value.encode('utf-8') for value in rendered]
     if sum(map(len, encoded)) > MAX_UNCOMPRESSED:

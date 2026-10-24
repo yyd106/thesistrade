@@ -159,7 +159,7 @@ def make_handler(config_path,token,port):
                         self.send(302,b'',headers={'Location':'/login?next='+urllib.parse.quote(path.path,safe='')})
                     else:self.send(401,{'code':'AUTH_REQUIRED','error':'请先登录。'})
                     return
-                admin_route=path.path.startswith('/admin/') or path.path in ('/api/feedback','/api/job','/api/snapshot','/api/search','/help/recovery','/api/strategy-export')
+                admin_route=path.path.startswith('/admin/') or path.path in ('/api/feedback','/api/job','/api/snapshot','/api/search','/api/document','/api/observations','/help/recovery','/api/strategy-export')
                 if admin_route and user['role']!='ADMIN':self.send(403,{'code':'ADMIN_REQUIRED','error':'此页面仅管理员可用。'});return
                 if path.path=='/' or path.path in ('/admin/feedback','/admin/settings') or re.fullmatch(r'/stocks/(sh|sz)\d{6}',path.path):
                     template=(Path(__file__).parent/'web'/'index.html').read_text()
@@ -205,8 +205,8 @@ def make_handler(config_path,token,port):
                 elif path.path=='/api/status':
                     value=status(cfg,overview=True)
                     if user['role']!='ADMIN':
-                        for key in ('jobs','active_jobs','source_checks','background_failures','notices'):value[key]=[]
-                        value['state']={k:v for k,v in value['state'].items() if k=='heartbeat'}
+                        from .privacy import guest_status
+                        value=guest_status(value)
                     self.send(200,value)
                 elif path.path in ('/api/withdrawals','/api/withdrawals/result'):
                     from .withdrawals import status as withdrawal_status
@@ -218,7 +218,11 @@ def make_handler(config_path,token,port):
                     store=Store(cfg['data_dir'])
                     try:
                         if path.path=='/api/withdrawals':
-                            self.send(200,withdrawal_status(store,cfg,now()))
+                            value=withdrawal_status(store,cfg,now())
+                            if user['role']!='ADMIN':
+                                from .privacy import withdrawal_result
+                                value=withdrawal_result(value)
+                            self.send(200,value)
                         else:
                             from .approvals import request_info
                             query=urllib.parse.parse_qs(path.query)
@@ -240,7 +244,13 @@ def make_handler(config_path,token,port):
                     query=urllib.parse.parse_qs(path.query)
                     offset=int(query.get('offset',['0'])[0])
                     if not 0<=offset<=100000:raise ValueError('分页位置无效。')
-                    self.send(200,detail(cfg,query.get('symbol',[''])[0],offset))
+                    value=detail(cfg,query.get('symbol',[''])[0],offset)
+                    if user['role']!='ADMIN':
+                        from .privacy import guest_stock,is_archived
+                        if is_archived(value['stock']):
+                            self.send(403,{'code':'ADMIN_REQUIRED','error':'归档研究仅管理员可用。'});return
+                        value=guest_stock(value)
+                    self.send(200,value)
                 elif path.path=='/api/feedback':
                     from .feedback import listing
                     query=urllib.parse.parse_qs(path.query);offset=int(query.get('offset',['0'])[0])

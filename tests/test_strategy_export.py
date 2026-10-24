@@ -91,6 +91,45 @@ class StrategyExportTests(unittest.TestCase):
         self.assertEqual(data['decisions'][0]['generated_change']['categories'], ['renewal_only'])
         self.assertEqual(data['decisions'][1]['previous_generated_id'], 'first')
 
+    def test_review_supplement_is_in_both_documents_without_changing_decisions(self):
+        self.decision('unchanged', START, sent=True)
+        baseline = self.archive()[3]
+        folder = self.root / 'workflow' / 'strategy-changes'
+        folder.mkdir(parents=True)
+        record = {'schema': 'research-strategy-change-v1', 'id': 'llm-review',
+                  'occurred_on': '2026-10-21', 'recorded_at': AT,
+                  'title': '外部建议评审', 'source': 'llm_review', 'production_change': False,
+                  'items': [{'topic': '失效条件', 'before': '文字说明', 'accepted': '提出量化核对接口',
+                             'reason': '减少传递歧义', 'status': 'accepted_pending',
+                             'next_step': '待设计与验证', 'effect_scope': 'research'}], 'evidence': []}
+        (folder / 'review.json').write_text(json.dumps(record, ensure_ascii=False), encoding='utf-8')
+        before = hashlib.sha256((self.root / 'agent.sqlite3').read_bytes()).hexdigest()
+        _, _, archive, data = self.archive()
+        self.assertEqual(data['research']['strategy_reviews'], [record])
+        self.assertEqual(data['decisions'], baseline['decisions'])
+        self.assertEqual(data['coverage'], baseline['coverage'])
+        for name in ('研究策略.md', '交易策略变更.md'):
+            text = archive.read(name).decode()
+            self.assertIn('外部建议评审', text)
+            self.assertIn('认可方向，尚未实施', text)
+            self.assertIn('减少传递歧义', text)
+            self.assertIn('生产规则变更：否', text)
+            self.assertLess(text.index('外部建议评审'), text.index('公司研究原文') if name == '研究策略.md' else text.index('每日变化概览'))
+        self.assertIn('研究策略评审 1 份', archive.read('总览.md').decode())
+        self.assertEqual(before, hashlib.sha256((self.root / 'agent.sqlite3').read_bytes()).hexdigest())
+        past = self.archive('2026-10-22T11:59:59+00:00')[3]
+        self.assertEqual(past['research']['strategy_reviews'], [])
+        # The database-path entry point resolves the same fixed sibling directory.
+        content, _ = export.build_archive(self.root / 'agent.sqlite3', AT)
+        self.assertEqual(content, self.archive()[0])
+
+    def test_invalid_review_cannot_silently_disappear_from_download(self):
+        folder = self.root / 'workflow' / 'strategy-changes'
+        folder.mkdir(parents=True)
+        (folder / 'bad.json').write_text('{"schema":"unsupported"}', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            self.archive()
+
     def test_missing_baseline_is_not_fabricated_change(self):
         self.decision('initial', START, action='ALLOW', target=1000)
         data = self.archive()[3]
