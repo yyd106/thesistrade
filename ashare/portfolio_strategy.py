@@ -176,6 +176,51 @@ def validate(raw, packet):
     return raw
 
 
+def publication_audit(packet, fresh, model_choices, result, published_at):
+    """Bounded program receipts only; never used as model input or execution authority."""
+    account_keys = ('cash_cents','equity_cents','available_cents','reserved_cents',
+                    'withdrawal_reserved_cents','market_value_cents')
+    constraint_keys = ('valuation_ready','halted','gross_cap_bps','symbol_cap_bps')
+    basis_keys = ('current_bps','current_value_cents','qty','cost_cents','max_bps',
+                  'can_increase','source_id','source_valid_until')
+
+    def account_summary(s):
+        return {k:s['account'][k] for k in account_keys if type(s['account'].get(k)) is int}
+
+    def basis(c):
+        research = c.get('research') or {}
+        return {**{k:c.get(k) for k in basis_keys}, 'source_kind':research.get('kind'),
+                # These are recorded source blockers, not every reason can_increase may be false.
+                'recorded_blockers':list(research.get('blockers') or [])}
+
+    before = {c['key']:c for c in packet['candidates']}
+    after = {c['key']:c for c in fresh['candidates']}
+    published = {d['key']:d for d in result['decisions']}
+    decisions = []
+    for chosen in model_choices:
+        key = chosen['key']; c = after[key]; d = published[key]; codes = []
+        if chosen['action']=='ALLOW' and d['action']=='PAUSE':
+            if not c['can_increase']:codes.append('ALLOW_ELIGIBILITY_LOST')
+            if chosen['target_bps']<=c['current_bps']:codes.append('ALLOW_TARGET_REACHED')
+            if not fresh['valuation_ready']:codes.append('VALUATION_UNAVAILABLE')
+            if fresh['halted']:codes.append('ACCOUNT_HALTED')
+        if chosen['action'] in ('REDUCE','EXIT') and d['action']=='HOLD':
+            if not fresh['valuation_ready']:codes.append('VALUATION_UNAVAILABLE')
+            if chosen['action']=='REDUCE' and c['current_bps']-chosen['target_bps']<100:
+                codes.append('REDUCE_MINIMUM_GAP_LOST')
+        if d['action'] in ('HOLD','PAUSE') and d['target_bps']!=chosen['target_bps']:
+            codes.append('HOLD_PAUSE_CURRENT_REBASE')
+        decisions.append({'key':key,'model_action':chosen['action'],'model_target_bps':chosen['target_bps'],
+            'analysis_basis':basis(before[key]),'published_action':d['action'],
+            'published_target_bps':d['target_bps'],'publication_basis':basis(c),'adjustment_codes':codes})
+    return {'version':1,'target_method':'MODEL_DISCRETION_WITH_HARD_CONSTRAINTS',
+        'analysis_as_of':packet['as_of'],'published_at':published_at,
+        'analysis_account':account_summary(packet),'publication_account':account_summary(fresh),
+        'analysis_constraints':{k:packet[k] for k in constraint_keys},
+        'publication_constraints':{k:fresh[k] for k in constraint_keys},
+        'validation':{'analysis':'PASSED','publication':'PASSED'},'decisions':decisions}
+
+
 def active(store, at):
     row = store.db.execute("SELECT * FROM portfolio_decisions WHERE status='ACTIVE' AND created_at<=? AND valid_until>? ORDER BY created_at DESC,rowid DESC LIMIT 1", (at,at)).fetchone()
     return {**dict(row),'payload':json.loads(row['payload_json'])} if row else None
@@ -218,6 +263,7 @@ def run(store, config, at=None, model_fn=None, clock=now):
         raw = (model_fn or run_json)(prompt,SCHEMA,folder/'model',min(300,config['model_timeout_seconds']))
         json_write(folder/'model-output.json',raw)
         result = validate(raw,packet)
+        model_choices = [{k:d[k] for k in ('key','action','target_bps')} for d in result['decisions']]
         from .research import model_record, record_build
         identity = {'model': model_record(folder/'model'), 'build': record_build(store,config,at)}
         completed = normalize_time(clock()); expires = normalize_time((datetime.fromisoformat(completed)+timedelta(hours=config.get("portfolio_authorization_hours",1))).isoformat())
@@ -242,6 +288,7 @@ def run(store, config, at=None, model_fn=None, clock=now):
         candidates = current_items
         payload = {**result,'as_of':at,'input_guard':packet['guard'], 'account':packet['account'],
                    'decisions':[{**candidates[d['key']],**d} for d in result['decisions']],**identity}
+        payload['publication_audit'] = publication_audit(packet,fresh,model_choices,result,completed)
         portfolio_history.freeze(store,payload['decisions'],rid)
         from .cloud_runtime import value
         payload['remote_ledger_version']=value(store,'remote_ledger_version')
