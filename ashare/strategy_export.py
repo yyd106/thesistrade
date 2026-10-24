@@ -47,7 +47,7 @@ COLUMNS = {
     'cloud_receipts': 'sequence bundle_id received_at completed_at',
 }
 JSON_KEYS = {
-    'portfolio_decisions': set('summary decisions risk_groups as_of account build model'.split()),
+    'portfolio_decisions': set('summary decisions risk_groups as_of account build model publication_audit'.split()),
     'studies': {'summary', 'stocks'},
     'plans': set('kind strategy_version research_membership_token holding_unit holding_days recheck_hours research_method '
                  'event_reviews corporate_actions basis levels blockers formula max_stock_pct risk_parameters thesis '
@@ -175,6 +175,9 @@ def project_record(table, record):
                     if isinstance(decoded.get(key), dict):
                         decoded[key] = {k: v for k, v in decoded[key].items() if k in allowed}
                 if table == 'portfolio_decisions':
+                    if 'publication_audit' in decoded:
+                        from .strategy_report_audit import project_publication_audit
+                        decoded['publication_audit'] = project_publication_audit(decoded['publication_audit'])
                     items = decoded.get('decisions', [])
                     if not isinstance(items, list) or any(not isinstance(d, dict) for d in items):
                         raise ValueError('组合项目结构损坏')
@@ -222,11 +225,13 @@ class _Reader:
         if value not in self.issues:
             self.issues.append(value)
 
-    def raw(self, table, where='', args=(), *, order='rowid', limit=None):
+    def raw(self, table, where='', args=(), *, order='rowid', limit=None, fields=None):
         if table not in self.tables:
             return []
         columns = {r[1] for r in self.db.execute('PRAGMA table_info("' + table + '")')}
-        fields = [c for c in COLUMNS[table].split() if c in columns]
+        if fields is not None and any(c not in COLUMNS[table].split() for c in fields):
+            raise ValueError('未允许的研究数据字段')
+        fields = [c for c in (fields or COLUMNS[table].split()) if c in columns]
         query = 'SELECT rowid AS _order,' + ','.join('"' + c + '"' for c in fields) + ' FROM "' + table + '"'
         if where:
             query += ' WHERE ' + where
@@ -589,11 +594,16 @@ def collect(db, at=None):
                     '已确认发布也不代表已成交；没有发布回执的本地决定不视为执行策略。',
                     '原生研究表的生命周期状态和新闻引用信息是导出时可见值；只有 frozen_sources 是决策当时冻结的来源投影。',
                     '来源更新记录只表示单个来源，不是完整历史组合；不跨缺失历史补写当时结论。']}
-    return {'schema': SCHEMA, 'generated_at': end.isoformat(), 'start_at': start.isoformat(), 'end_at': end.isoformat(),
+    data = {'schema': SCHEMA, 'generated_at': end.isoformat(), 'start_at': start.isoformat(), 'end_at': end.isoformat(),
             'timezone': TIMEZONE, 'scope': '近14个北京时间自然日，含今天，截止生成时刻；额外保留窗口前基线及明确关联研究。',
             'coverage': coverage, 'baseline': baseline, 'published_baseline': published_baseline, 'decisions': timeline,
             'published_decision_ids': accepted_ids, 'research': research, 'frozen_sources': frozen_sources,
             'source_events': source_events, 'issues': reader.issues}
+    from .strategy_report_audit import guidance_summary, summarize
+    guidance = reader.raw('strategy_guidance', fields=('status', 'adopted_at', 'retired_at')) if 'strategy_guidance' in reader.tables else None
+    coverage['guidance_summary'] = guidance_summary(guidance, start.isoformat(), end.isoformat())
+    coverage['report_audit'] = summarize(data)
+    return data
 
 
 def _safe_text(value):
@@ -654,6 +664,10 @@ FIELD_LABELS = {
     'stop_bps': '成本止损基点', 'take_profit_bps': '成本止盈基点',
     'paper_stop_loss_bps': '程序止损参数（基点）', 'paper_take_profit_bps': '程序止盈参数（基点）',
     'paper_entry_band_bps': '程序入场区间参数（基点）', 'last_complete_date': '行情截至交易日',
+    'current_value_cents': '持仓估值（人民币分）', 'qty': '持仓数量原始值', 'cost_cents': '持仓成本（人民币分）',
+    'max_bps': '仓位上限（基点）', 'can_increase': '当时增加资格', 'source_id': '来源编号',
+    'source_valid_until': '来源有效期', 'source_kind': '原计划类别', 'recorded_blockers': '已记录限制',
+    'publication': '发布时校验',
 }
 ACTION_LABELS = {'ALLOW': '允许新增', 'HOLD': '保持', 'PAUSE': '暂停新增', 'REDUCE': '减仓', 'EXIT': '退出'}
 ROUTE_LABELS = {'watchlist': '公司研究', 'dynamic': '事件研究', 'global': '全球资产'}
@@ -928,6 +942,8 @@ def _stock_reports(data):
         else:
             lines += [f'本来源被窗口内组合决定引用 {len(card["decisions"])} 次；此处展开最后一次。全部当轮理由、动作、仓位及发布变化见“交易策略变更.md”，首末编号见历史来源版本索引。', '']
         for decision, item in card['decisions'][-1:]:
+            from .strategy_report_audit import render_publication_item
+            lines += render_publication_item(decision, item, data)
             lines += ['- 决策编号：' + _safe_text(decision['record']['id']) + '；形成时间：' + _local(decision['record']['created_at']),
                       '- 动作：' + _action(item) + '；当时当前仓位：' + _weight(item.get('current_bps')) + '；单项上限：' + _weight(item.get('max_bps')),
                       '- 当轮记录理由：' + _safe_text(item.get('reason')),
@@ -997,6 +1013,8 @@ def _overview(data):
              '详见前两份文档开头，逐项区分事实澄清、认可但待实施、已实施及其原因。', '',
              '## 可用范围与限制', '']
     lines += ['- ' + text for text in c['limitations']]
+    from .strategy_report_audit import render_summary
+    lines += [''] + render_summary(data)
     lines += ['', '## 研究版本数量', '']
     lines += [f'- {TABLE_LABELS[t]}：{n}' for t, n in c['research_counts'].items()]
     if c['missing_tables']:
@@ -1050,6 +1068,7 @@ def _trading(data):
              '本文件先列研究策略评审与采纳状态，再列模拟交易决定的变化及当轮依据。', '']
     lines += render_records(data['research'].get('strategy_reviews', []))
     lines += ['## 交易策略变化', '', '生成记录与已确认发布记录分别比较。窗口首项使用窗口前基线；缺少基线时只记首次观察。',
+             '原始理由不改写；文字与数字不一致时，实际授权动作和仓位以该版本结构化 action、target_bps、current_bps 为准。HOLD/PAUSE目标跟随当前占比，不自动代表主动仓位选择；新版模型原动作及发布重设记录按组合payload.publication_audit_ref在策略数据.json的coverage.publication_audits中查阅。',
              '每次保留原始组合总结与每个项目的理由；账面占比变化不自动解释为主动调仓或行情波动。',
              '“当轮理由”是当时记录的决策依据。系统没有单独记录明确调整原因时，不从前后差异推断新的原因。', '',
              '## 每日变化概览', '',
@@ -1134,7 +1153,8 @@ def build_archive(data_dir, at=None):
     finally:
         db.close()
     data['research']['strategy_reviews'] = load_records(database.parent, data['start_at'], data['end_at'])
-    rendered = (_overview(data), _research(data), _trading(data), _json(data) + '\n')
+    from .strategy_report_audit import export_projection
+    rendered = (_overview(data), _research(data), _trading(data), _json(export_projection(data)) + '\n')
     encoded = [value.encode('utf-8') for value in rendered]
     if sum(map(len, encoded)) > MAX_UNCOMPRESSED:
         raise ExportTooLarge('完整策略导出解压后超过96MB，未截断任何记录')
