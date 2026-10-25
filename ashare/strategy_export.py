@@ -603,6 +603,8 @@ def collect(db, at=None):
     guidance = reader.raw('strategy_guidance', fields=('status', 'adopted_at', 'retired_at')) if 'strategy_guidance' in reader.tables else None
     coverage['guidance_summary'] = guidance_summary(guidance, start.isoformat(), end.isoformat())
     coverage['report_audit'] = summarize(data)
+    from .strategy_condition_report import summarize as summarize_conditions
+    coverage['condition_audit'] = summarize_conditions(data)
     return data
 
 
@@ -944,6 +946,8 @@ def _stock_reports(data):
         for decision, item in card['decisions'][-1:]:
             from .strategy_report_audit import render_publication_item
             lines += render_publication_item(decision, item, data)
+            from .strategy_condition_report import render_item as render_conditions
+            lines += render_conditions(decision, item, data)
             lines += ['- 决策编号：' + _safe_text(decision['record']['id']) + '；形成时间：' + _local(decision['record']['created_at']),
                       '- 动作：' + _action(item) + '；当时当前仓位：' + _weight(item.get('current_bps')) + '；单项上限：' + _weight(item.get('max_bps')),
                       '- 当轮记录理由：' + _safe_text(item.get('reason')),
@@ -1110,6 +1114,8 @@ def _trading(data):
                       '当轮记录理由（原始理由）：' + _safe_text(item.get('reason')), '',
                       '来源：' + _safe_text(item.get('source_id')) + '；冻结来源引用：' + _safe_text(decision['source_refs'].get(item.get('key'), '缺失，未用当前来源补写历史')) + '。',
                       '研究与程序规则：在“研究策略.md”的逐标的方案中按代码、来源编号及冻结引用核对。', '']
+            from .strategy_condition_report import render_item as render_conditions
+            lines += render_conditions(decision, item, data, compact=True)
         comparisons = [('相对上一生成版本的变化', decision['generated_change'])]
         published = decision['acknowledged_change']
         if published is not None and 'items_ref' not in published:
