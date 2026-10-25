@@ -202,6 +202,11 @@ class StrategyReportAuditTests(unittest.TestCase):
         # just rendered fields: unknown fields and nested data cannot disappear.
         restored = copy.deepcopy(reloaded)
         receipts = restored['coverage'].pop('publication_audits')
+        conditions = restored['coverage'].pop('condition_receipts', {})
+        for receipt in receipts.values():
+            for row in receipt.get('decisions', []):
+                if 'condition_audit_ref' in row:
+                    row['condition_audit'] = conditions[row.pop('condition_audit_ref')]
         for decision in [restored['baseline'], restored['published_baseline'], *restored['decisions']]:
             payload = decision['payload']
             if 'publication_audit_ref' in payload:
