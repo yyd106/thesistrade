@@ -46,6 +46,9 @@ def project_publication_audit(value):
             for key in ('analysis_basis', 'publication_basis'):
                 if isinstance(item.get(key), dict):
                     row[key] = _pick(item[key], BASIS_KEYS)
+            if 'condition_audit' in item:
+                from .condition_audit import project
+                row['condition_audit'] = project(item['condition_audit'])
             result['decisions'].append(row)
     return result
 
@@ -92,6 +95,41 @@ def _same_audit(left, right):
     return _json(left) == _json(right)
 
 
+def _condition_digest(receipt):
+    import hashlib
+    from .strategy_export import _json
+    return hashlib.sha256(_json(receipt).encode('utf-8')).hexdigest()
+
+
+def _expand_conditions(audit, data=None):
+    """Resolve a whole audit, so returned rows and their parent stay identical."""
+    if not isinstance(audit, dict) or not isinstance(audit.get('decisions'), list):
+        return audit, None
+    index = (data or {}).get('coverage', {}).get('condition_receipts', {})
+    rows = []
+    for row in audit['decisions']:
+        if not isinstance(row, dict) or 'condition_audit_ref' not in row:
+            rows.append(row)
+            continue
+        reference = row['condition_audit_ref']
+        if not isinstance(reference, str) or not isinstance(index, dict) or reference not in index:
+            return None, '条件审计引用对应的集中记录缺失。'
+        receipt = index[reference]
+        try:
+            matching = reference == _condition_digest(receipt)
+        except (TypeError, ValueError, OverflowError):
+            matching = False
+        if not matching:
+            return None, '条件审计引用与内容摘要不匹配。'
+        if 'condition_audit' in row and not _same_audit(row['condition_audit'], receipt):
+            return None, '内嵌条件审计与集中记录冲突。'
+        expanded = dict(row)
+        del expanded['condition_audit_ref']
+        expanded['condition_audit'] = receipt
+        rows.append(expanded)
+    return {**audit, 'decisions': rows}, None
+
+
 def _publication_audit(decision, data=None):
     """Resolve only this decision's receipt; never fall back across identities."""
     payload = decision.get('payload', {})
@@ -104,13 +142,27 @@ def _publication_audit(decision, data=None):
             return None, '审计引用与本组合决定编号不一致。'
         if not isinstance(index, dict) or reference not in index:
             return None, '审计引用对应的集中记录缺失。'
-        if has_inline and not _same_audit(payload['publication_audit'], index[reference]):
-            return None, '内嵌审计与集中记录冲突。'
-        return index[reference], None
+        receipt, problem = _expand_conditions(index[reference], data)
+        if problem:
+            return None, problem
+        if has_inline:
+            inline, problem = _expand_conditions(payload['publication_audit'], data)
+            if problem:
+                return None, problem
+            if not _same_audit(inline, receipt):
+                return None, '内嵌审计与集中记录冲突。'
+        return receipt, None
     if has_inline:
-        if isinstance(index, dict) and isinstance(identity, str) and identity in index and not _same_audit(payload['publication_audit'], index[identity]):
-            return None, '内嵌审计与集中记录冲突。'
-        return payload['publication_audit'], None
+        inline, problem = _expand_conditions(payload['publication_audit'], data)
+        if problem:
+            return None, problem
+        if isinstance(index, dict) and isinstance(identity, str) and identity in index:
+            receipt, problem = _expand_conditions(index[identity], data)
+            if problem:
+                return None, problem
+            if not _same_audit(inline, receipt):
+                return None, '内嵌审计与集中记录冲突。'
+        return inline, None
     return None, None
 
 
@@ -125,7 +177,38 @@ def export_projection(data):
     existing = coverage.get('publication_audits', {})
     if not isinstance(existing, dict):
         raise ValueError('集中审计索引格式异常，未丢弃任何记录')
-    index = dict(existing)
+    conditions = coverage.get('condition_receipts', {})
+    if not isinstance(conditions, dict):
+        raise ValueError('条件审计索引格式异常，未丢弃任何记录')
+    condition_index = dict(conditions)
+    for reference, receipt in condition_index.items():
+        if not isinstance(reference, str) or reference != _condition_digest(receipt):
+            raise ValueError('条件审计索引内容摘要不匹配，未丢弃任何记录')
+    resolving = {**data, 'coverage': {**coverage, 'condition_receipts': condition_index}}
+
+    def compact_conditions(receipt):
+        expanded, problem = _expand_conditions(receipt, resolving)
+        if problem:
+            raise ValueError(problem + '未丢弃任何记录')
+        if not isinstance(expanded, dict) or not isinstance(expanded.get('decisions'), list):
+            return expanded
+        rows = []
+        for row in expanded['decisions']:
+            if not isinstance(row, dict) or 'condition_audit' not in row:
+                rows.append(row)
+                continue
+            value = row['condition_audit']
+            reference = _condition_digest(value)
+            if reference in condition_index and not _same_audit(condition_index[reference], value):
+                raise ValueError('条件审计内容摘要冲突，未丢弃任何记录')
+            condition_index[reference] = value
+            compact = dict(row)
+            del compact['condition_audit']
+            compact['condition_audit_ref'] = reference
+            rows.append(compact)
+        return {**expanded, 'decisions': rows}
+
+    index = {identity: compact_conditions(receipt) for identity, receipt in existing.items()}
     versions = [d for d in (data.get('baseline'), data.get('published_baseline'), *data.get('decisions', [])) if d]
     for decision in versions:
         payload = decision.get('payload', {})
@@ -134,12 +217,14 @@ def export_projection(data):
         identity = decision.get('record', {}).get('id')
         if not isinstance(identity, str) or not identity:
             raise ValueError('审计记录缺少组合决定编号，未丢弃任何记录')
-        receipt = payload['publication_audit']
+        receipt = compact_conditions(payload['publication_audit'])
         if identity in index and not _same_audit(index[identity], receipt):
             raise ValueError('同一组合决定的审计记录冲突，未丢弃任何记录')
         index[identity] = receipt
     if index or 'publication_audits' in coverage:
         coverage['publication_audits'] = index
+    if condition_index or 'condition_receipts' in coverage:
+        coverage['condition_receipts'] = condition_index
     result = {**data, 'coverage': coverage}
 
     def projected(decision):
@@ -381,7 +466,8 @@ def render_summary(data):
     else:
         lines += ['该旧档案或数据库未提供完整规则表统计；不能把缺失当作0。']
     lines += ['上述仅统计独立研究指导 strategy_guidance，不包括写在程序中的交易/风控规则，也不等于所有已采纳提案数。后文“已记录研究规则”的版本数是本报告选入数量（窗口内采纳＋当前适用基准），不是全库规则总数。', '']
-    return lines
+    from .strategy_condition_report import render_summary as render_conditions
+    return lines + render_conditions(data)
 
 
 def render_publication_item(decision, item, data=None):
