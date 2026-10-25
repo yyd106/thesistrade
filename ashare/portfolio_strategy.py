@@ -176,7 +176,7 @@ def validate(raw, packet):
     return raw
 
 
-def publication_audit(packet, fresh, model_choices, result, published_at):
+def publication_audit(packet, fresh, model_choices, result, published_at, observed_hits=None):
     """Bounded program receipts only; never used as model input or execution authority."""
     account_keys = ('cash_cents','equity_cents','available_cents','reserved_cents',
                     'withdrawal_reserved_cents','market_value_cents')
@@ -213,6 +213,19 @@ def publication_audit(packet, fresh, model_choices, result, published_at):
         decisions.append({'key':key,'model_action':chosen['action'],'model_target_bps':chosen['target_bps'],
             'analysis_basis':basis(before[key]),'published_action':d['action'],
             'published_target_bps':d['target_bps'],'publication_basis':basis(c),'adjustment_codes':codes})
+    try:
+        from . import condition_audit
+        receipts = condition_audit.build(packet,fresh,model_choices,result,published_at,observed_hits=observed_hits)
+        for d in decisions:
+            receipt = condition_audit.project(receipts.get(d['key']))
+            d['condition_audit'] = receipt if condition_audit.validate_receipt(receipt) else condition_audit.degraded()
+    except Exception:
+        # Observational metadata must never invalidate an otherwise valid decision.
+        for d in decisions:
+            d['condition_audit'] = {'version':1,'catalog_version':'portfolio-conditions-v1','status':'DEGRADED',
+                'evaluation':'VALIDATION_REPLAY','analysis':{},'publication':{},'publication_recheck':{},
+                'hit_ids':[],'hit_attribution':'NOT_RECORDED','model_trigger':'NOT_RECORDED',
+                'model_termination':'NOT_RECORDED','execution':'NOT_CAPTURED','error_code':'AUDIT_UNAVAILABLE'}
     return {'version':1,'target_method':'MODEL_DISCRETION_WITH_HARD_CONSTRAINTS',
         'analysis_as_of':packet['as_of'],'published_at':published_at,
         'analysis_account':account_summary(packet),'publication_account':account_summary(fresh),
@@ -277,18 +290,29 @@ def run(store, config, at=None, model_fn=None, clock=now):
         # Normal market moves during inference must not make HOLD fail its equality check.
         # Rebase unchanged positions and only tighten permissions; never enlarge a model target.
         current_items={c['key']:c for c in fresh['candidates']}
+        observed_hits={key:[] for key in current_items}
+        def observe_hit(key, condition_id):
+            nonlocal observed_hits
+            try:
+                observed_hits[key].append(condition_id)
+            except Exception:
+                observed_hits=None
         for d in result['decisions']:
             c=current_items[d['key']]
             if d['action']=='ALLOW' and (not c['can_increase'] or d['target_bps']<=c['current_bps'] or not fresh['valuation_ready'] or fresh['halted']):
                 d.update(action='PAUSE',reason=d['reason']+'；发布时条件变化，暂停新增买入')
+                observe_hit(d['key'],'PUB_ALLOW_GUARD')
             if d['action'] in ('REDUCE','EXIT') and (not fresh['valuation_ready'] or (d['action']=='REDUCE' and c['current_bps']-d['target_bps']<100)):
                 d.update(action='HOLD',reason=d['reason']+'；发布时调整条件变化，保持仓位')
-            if d['action'] in ('HOLD','PAUSE'):d['target_bps']=c['current_bps']
+                observe_hit(d['key'],'PUB_REDUCTION_GUARD')
+            if d['action'] in ('HOLD','PAUSE'):
+                if d['target_bps']!=c['current_bps']:observe_hit(d['key'],'PUB_PASSIVE_REBASE')
+                d['target_bps']=c['current_bps']
         validate(result,fresh)
         candidates = current_items
         payload = {**result,'as_of':at,'input_guard':packet['guard'], 'account':packet['account'],
                    'decisions':[{**candidates[d['key']],**d} for d in result['decisions']],**identity}
-        payload['publication_audit'] = publication_audit(packet,fresh,model_choices,result,completed)
+        payload['publication_audit'] = publication_audit(packet,fresh,model_choices,result,completed,observed_hits=observed_hits)
         portfolio_history.freeze(store,payload['decisions'],rid)
         from .cloud_runtime import value
         payload['remote_ledger_version']=value(store,'remote_ledger_version')
