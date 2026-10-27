@@ -93,6 +93,78 @@ class ConfigApprovalTests(unittest.TestCase):
             self.apply(approval_id)
         self.assertNotEqual(json.loads(self.path.read_text())['paper_entry_band_bps'], 100)
 
+    def test_watchlist_change_preserves_approved_nested_key_order(self):
+        raw = json.loads(self.path.read_text())
+        changes = {'watchlist': raw['watchlist'] + [{'symbol': 'sz301563', 'name': '云汉芯城'}]}
+        expected = config_journal.encoded({**raw, **changes})
+        approval_id = self.authorize(self.request(changes))
+        result = self.apply(approval_id, changes)
+        self.assertEqual(self.path.read_bytes(), expected)
+        self.assertEqual(self.rows()[0]['after'], changes['watchlist'])
+        self.assertEqual(self.rows()[0]['operation_id'], result['operation_id'])
+        with self.assertRaises(ValueError):
+            self.apply(approval_id, changes)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_interrupted_watchlist_change_recovers_exact_approved_bytes(self):
+        raw = json.loads(self.path.read_text())
+        changes = {'watchlist': raw['watchlist'] + [{'symbol': 'sz301563', 'name': '云汉芯城'}]}
+        expected = config_journal.encoded({**raw, **changes})
+        approval_id = self.authorize(self.request(changes))
+        with patch.object(config_journal, '_publish', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.apply(approval_id, changes)
+        store = Store(self.data)
+        try:
+            row = store.db.execute('SELECT id,payload_json FROM config_apply_journal').fetchone()
+            operation_id = row['id']
+            self.assertEqual(json.loads(row['payload_json'])['after_sha'], config_journal.sha(expected))
+        finally:
+            store.close()
+        result = config_ops.recover(self.path)
+        self.assertEqual(result[0]['operation_id'], operation_id)
+        self.assertEqual(self.path.read_bytes(), expected)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(config_ops.recover(self.path), [])
+
+    def test_legacy_sorted_watchlist_intent_keeps_hash_guard_and_safe_upgrade_cancellation(self):
+        raw = json.loads(self.path.read_text())
+        changes = {'watchlist': raw['watchlist'] + [{'symbol': 'sz301563', 'name': '云汉芯城'}]}
+        before = self.path.read_bytes()
+        approval_id = self.authorize(self.request(changes))
+        with patch.object(config_journal, '_publish', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.apply(approval_id, changes)
+        # Reproduce the former journal encoding only in this temporary test database.
+        store = Store(self.data)
+        try:
+            row = store.db.execute('SELECT id,payload_json FROM config_apply_journal').fetchone()
+            operation_id = row['id']
+            with store.db:
+                store.db.execute('UPDATE config_apply_journal SET payload_json=? WHERE id=?',
+                    (json.dumps(json.loads(row['payload_json']), ensure_ascii=False, sort_keys=True), operation_id))
+        finally:
+            store.close()
+        with self.assertRaisesRegex(ValueError, '配置恢复结果与已授权操作不一致'):
+            config_ops.recover(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.rows(), [])
+        with patch('ashare.build.code_fingerprint', return_value='upgraded-code'):
+            result = config_ops.recover(self.path)
+        self.assertEqual(result[0]['operation_id'], operation_id)
+        self.assertEqual(result[0]['status'], 'ABORTED')
+        self.assertTrue(result[0]['requires_new_approval'])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.rows(), [])
+        store = Store(self.data)
+        try:
+            row = store.db.execute('SELECT status,abort_reason FROM config_apply_journal WHERE id=?', (operation_id,)).fetchone()
+            self.assertEqual(tuple(row), ('ABORTED', 'STATE_CHANGED_BEFORE_PUBLICATION'))
+            self.assertIsNone(store.db.execute('SELECT 1 FROM approval_consumptions WHERE request_id=?', (approval_id,)).fetchone())
+            self.assertIsNone(store.db.execute('SELECT 1 FROM approval_reservations WHERE request_id=? AND released_at IS NULL', (approval_id,)).fetchone())
+        finally:
+            store.close()
+
     def test_receipt_does_not_authorize_another_config_path(self):
         approval_id = self.authorize()
         other = self.path.with_name('other.json')
