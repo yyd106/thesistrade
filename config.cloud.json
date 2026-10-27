@@ -80,6 +80,18 @@
     {
       "symbol": "sh601888",
       "name": "中国中免"
+    },
+    {
+      "symbol": "sz301563",
+      "name": "云汉芯城"
+    },
+    {
+      "symbol": "sz301682",
+      "name": "宏明电子"
+    },
+    {
+      "symbol": "sh603444",
+      "name": "吉比特"
     }
   ],
   "announcement_lookback_days": 60,
