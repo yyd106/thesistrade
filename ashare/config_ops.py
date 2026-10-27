@@ -176,7 +176,7 @@ def apply(config_path, changes, *, reason, approved_by=None, approval_id=None, d
                 store.db.execute('''INSERT INTO config_apply_journal
                     (id,subject_id,approval_id,status,created_at,completed_at,payload_json) VALUES(?,?,?,?,?,?,?)''',
                     (operation_id, _subject(path), approval_id, 'APPLYING', payload['at'], None,
-                     json.dumps(payload, ensure_ascii=False, sort_keys=True)))
+                     json.dumps(payload, ensure_ascii=False)))
             row = store.db.execute('SELECT * FROM config_apply_journal WHERE id=?', (operation_id,)).fetchone()
             return journal.finish(store, path, row)
         finally:
