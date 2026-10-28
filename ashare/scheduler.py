@@ -17,6 +17,8 @@ from .connectivity import NEEDS_NETWORK,PAUSE_SECONDS,Offline,log_interval,offli
 
 
 LOG = logging.getLogger(__name__)
+PORTFOLIO_BLOCKERS = frozenset(('research', 'cycle', 'collect', 'repair', 'industry_research',
+    'review', 'dynamic_cycle', 'global_research', 'portfolio_strategy'))
 
 
 class JobCompletionPending(RuntimeError):
@@ -282,6 +284,29 @@ class Scheduler:
                 with store.db:store.db.execute("DELETE FROM service_state WHERE key='withdrawal_error'")
             except (sqlite3.Error,OSError):LOG.exception('Withdrawal error could not be cleared')
 
+    def start_waiting_portfolio(self, store, config, stamp, active_kinds, offline):
+        """Use an idle research boundary before starting another ordinary batch.
+
+        Never interrupt a running study or relax the publication snapshot guard.
+        The cloud trading queues keep their existing dispatch order.
+        """
+        if role(config) != 'research' or offline or len(self.global_futures) >= 2:
+            return False
+        if active_kinds & PORTFOLIO_BLOCKERS:
+            return False
+        row = store.db.execute("""SELECT * FROM jobs WHERE kind='portfolio_strategy'
+            AND status='PENDING' AND scheduled_at<=? ORDER BY scheduled_at,id LIMIT 1""", (stamp,)).fetchone()
+        if row is None:
+            return False
+        with store.db:
+            changed = store.db.execute("""UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1
+                WHERE id=? AND status='PENDING'""", (stamp, row['id'])).rowcount
+        if not changed:
+            return False
+        active_kinds.add('portfolio_strategy')
+        self.global_futures[row['id']] = self.global_pool.submit(self.work, dict(row))
+        return True
+
     def tick(self):
         config=load_config(self.config_path);store=Store(config['data_dir'])
         self.poll_seconds=config['scheduler_poll_seconds']
@@ -344,10 +369,12 @@ class Scheduler:
             # Process report queues and trading Slots in separate workers; slow PDF/model calls cannot stall the clock.
             active_kinds={r['kind'] for r in store.db.execute("SELECT id,kind FROM jobs WHERE status='RUNNING'")
                 if r['id'] not in self.pending_completions}
+            self.start_waiting_portfolio(store, config, stamp, active_kinds, offline)
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind NOT IN ('dynamic_cycle','dynamic_slot','global_research','global_slot','portfolio_strategy') ORDER BY CASE kind WHEN 'slot' THEN 0 WHEN 'review' THEN 1 ELSE 2 END,scheduled_at LIMIT 40").fetchall():
                 if len(self.futures)>=3:break
                 if row['kind'] in active_kinds:continue
                 if offline and row['kind'] in NEEDS_NETWORK:continue
+                if role(config)=='research' and 'portfolio_strategy' in active_kinds and row['kind'] in PORTFOLIO_BLOCKERS:continue
                 if row['kind'] in ('research','cycle','collect','repair','industry_research') and active_kinds & {'research','cycle','collect','repair','industry_research'}:continue
                 with store.db:
                     store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))
@@ -355,6 +382,7 @@ class Scheduler:
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind IN ('dynamic_cycle','dynamic_slot') ORDER BY CASE kind WHEN 'dynamic_slot' THEN 0 ELSE 1 END,scheduled_at DESC LIMIT 4").fetchall():
                 if len(self.dynamic_futures)>=2 or row['kind'] in active_kinds:continue
                 if offline and row['kind'] in NEEDS_NETWORK:continue
+                if role(config)=='research' and 'portfolio_strategy' in active_kinds and row['kind']=='dynamic_cycle':continue
                 # Preserve watchlist's existing allocation order. Dynamic receives
                 # the remaining shared budget after that minute's original slot.
                 if row['kind']=='dynamic_slot' and any(r[0] not in self.pending_completions for r in store.db.execute(
@@ -364,7 +392,7 @@ class Scheduler:
             for row in store.db.execute("SELECT * FROM jobs WHERE status='PENDING' AND kind IN ('global_slot','global_research','portfolio_strategy') ORDER BY CASE kind WHEN 'global_slot' THEN 0 ELSE 1 END,scheduled_at DESC").fetchall():
                 if len(self.global_futures)>=2 or row['kind'] in active_kinds:continue
                 if offline and row['kind'] in NEEDS_NETWORK:continue
-                if row['kind'] in ('global_research','portfolio_strategy') and active_kinds & {'research','cycle','collect','repair','industry_research','review','dynamic_cycle','global_research','portfolio_strategy'}:continue
+                if row['kind'] in ('global_research','portfolio_strategy') and active_kinds & PORTFOLIO_BLOCKERS:continue
                 if row['kind']=='global_slot' and any(r[0] not in self.pending_completions for r in store.db.execute(
                     "SELECT id FROM jobs WHERE kind IN ('slot','dynamic_slot') AND scheduled_at=? AND status IN ('PENDING','RUNNING')",(row['scheduled_at'],))):continue
                 with store.db:store.db.execute("UPDATE jobs SET status='RUNNING',started_at=?,attempts=attempts+1 WHERE id=? AND status='PENDING'",(stamp,row['id']))

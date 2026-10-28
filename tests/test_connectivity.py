@@ -124,6 +124,12 @@ class OfflineSchedulingTests(unittest.TestCase):
         self.assertNotIn('cycle', submitted);self.assertNotIn('portfolio_strategy', submitted)
         self.assertEqual(self.store.db.execute("SELECT status FROM jobs WHERE id='cycle:test'").fetchone()[0], 'PENDING')
         with self.store.db:runtime.put(self.store, 'offline_since', None)
+        submitted = self.tick()
+        self.assertIn('portfolio_strategy', submitted)
+        self.assertNotIn('cycle', submitted)
+        # The fake pool never executes work, so record its completion explicitly.
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET status='DONE',finished_at=? WHERE id='portfolio_strategy:test'", (self.stamp,))
         self.assertIn('cycle', self.tick())
 
     def test_a_long_gap_between_ticks_is_logged_as_a_pause(self):
