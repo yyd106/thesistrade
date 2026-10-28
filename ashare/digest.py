@@ -35,6 +35,13 @@ CHECK_NAMES = {'CHECK_BUY_OUTSIDE_PLAN_BAND': '买入价超出计划区间', 'CH
 DOCUMENT_NAMES = {'announcement': '公告', 'announcement_metadata': '公告目录', 'company_report': '公司报告', 'report': '研报',
                   'financial_data': '财务数据', 'news': '新闻', 'news_brief': '新闻摘要', 'news_index': '新闻索引', 'official_news': '官方新闻'}
 JOB_KIND_NAMES = {'dynamic_cycle': '动态新闻', 'global_research': '全球资产研究', 'portfolio_strategy': '组合决策'}
+INDUSTRY_OUTCOME_NAMES = {'COMPLETE': '完成并有成果', 'NO_FINDINGS': '未发现合格假设', 'EVIDENCE_GAPS': '已记录资料缺口',
+                          'NO_EVIDENCE': '无可用证据', 'PARTIAL': '部分完成', 'VALIDATION_FAILED': '校验未通过',
+                          'DEFERRED': '推迟', 'FAILED': '失败', 'LEGACY': '旧版未分类'}
+INDUSTRY_FAILURE_NAMES = {'VALIDATION': '校验错误', 'MODEL_TIMEOUT': '模型超时', 'STOPPED': '服务停止',
+                          'BUDGET': '预算不足', 'MODEL_DISABLED': '模型未启用',
+                          'MODEL_DISABLED_OR_BUDGET': '模型未启用或预算不足（旧记录）', 'OTHER': '其他错误'}
+INDUSTRY_REJECTION_NAMES = {'FACT_COUNT': '证据条数', 'REFERENCE': '引用校验', 'OTHER': '其他校验'}
 LONG_CYCLE_MINUTES = 120  # a collection this long keeps portfolio decisions waiting
 NETWORK_ERRORS = ('nodename nor servname', 'Name or service not known', 'Temporary failure in name resolution',
                   'Network is unreachable', 'timed out', 'Connection refused', 'Connection reset')
@@ -119,7 +126,18 @@ def availability(store, a, b):
             'paused_minutes': round(overlap_minutes(a, end, paused)), 'away_minutes': round(overlap_minutes(a, end, spans))}
 
 
-def jobs(store, a, b):
+def _minutes_between(start, end):
+    if not start or not end:
+        return None
+    try:
+        value = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() / 60
+        return value if value >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def jobs(store, a, b, as_of=None):
+    cutoff = min(b, as_of or normalize_time(now()))
     rows = [r for r in _rows(store, 'SELECT id,kind,scheduled_at,started_at,finished_at,status,error FROM jobs WHERE scheduled_at>=? AND scheduled_at<? ORDER BY scheduled_at', (a, b))
             if r['kind'] not in ENGINE_KINDS and r['status'] not in ('MIGRATED', 'LOCAL_ONLY')]
     kinds = {}
@@ -127,20 +145,116 @@ def jobs(store, a, b):
         r['state'] = _state(r)
         kinds.setdefault(r['kind'], Counter())[r['state']] += 1
     longest = {}
+    timings = {}
     long_cycles = []
     for r in rows:
-        if r['started_at'] and r['finished_at']:
-            minutes = round((datetime.fromisoformat(r['finished_at']) - datetime.fromisoformat(r['started_at'])).total_seconds() / 60)
+        timing = timings.setdefault(r['kind'], {'queue_count': 0, 'queue_max_minutes': None,
+                    'completed_count': 0, 'execution_max_minutes': None, 'pending_count': 0, 'pending_max_minutes': None,
+                    'running_count': 0, 'running_max_minutes': None})
+        def add(count_key, max_key, value):
+            if value is not None:
+                timing[count_key] += 1
+                timing[max_key] = round(max(timing[max_key] or 0, value), 2)
+
+        started = r['started_at'] and r['started_at'] <= cutoff
+        finished = r['finished_at'] and r['finished_at'] <= cutoff
+        if started:
+            add('queue_count', 'queue_max_minutes', _minutes_between(r['scheduled_at'], r['started_at']))
+        # An unfinished run, or a finish after the cutoff, is not a completed-duration sample.
+        # Mutable job statuses are reported as stored, never presented as reconstructed history.
+        minutes = _minutes_between(r['started_at'], r['finished_at']) if started and finished else None
+        if minutes is not None and r['status'] not in ('PENDING', 'RUNNING'):
+            add('completed_count', 'execution_max_minutes', minutes)
+            minutes = round(minutes)
             longest[r['kind']] = max(longest.get(r['kind'], 0), minutes)
             if r['kind'] in ('cycle', 'collect', 'research') and minutes >= LONG_CYCLE_MINUTES:
                 online = round(_online_minutes(store, r['started_at'], r['finished_at']))
                 if online >= LONG_CYCLE_MINUTES:
                     long_cycles.append({'kind': r['kind'], 'at': r['scheduled_at'], 'minutes': minutes, 'online_minutes': online})
+        elif started and not finished and (r['finished_at'] or r['status'] == 'RUNNING'):
+            add('running_count', 'running_max_minutes', _minutes_between(r['started_at'], cutoff))
+        elif not started and not finished and (r['status'] in ('PENDING', 'RUNNING') or r['started_at']):
+            add('pending_count', 'pending_max_minutes', _minutes_between(r['scheduled_at'], cutoff))
     failed = [{'kind': r['kind'], 'at': r['scheduled_at'], 'status': r['status'], 'error': (r['error'] or '')[:120]}
               for r in rows if r['state'] in ('FAILED', 'DEFERRED', 'INTERRUPTED')]
     return {'by_kind': {k: dict(v) for k, v in sorted(kinds.items())}, 'longest_minutes': longest, 'failed': failed,
+            'as_of': cutoff, 'timing_by_kind': timings,
             'offline_stopped': [{'kind': r['kind'], 'at': r['scheduled_at']} for r in rows if r['state'] == 'OFFLINE'],
             'long_cycles': long_cycles, 'reconnect_recoveries': sum(1 for r in rows if r['id'].startswith('reconnect:'))}
+
+
+def _industry_failure(payload, status, rejected):
+    kind = payload.get('failure_kind')
+    if kind in INDUSTRY_FAILURE_NAMES:
+        return kind
+    if rejected:
+        return 'VALIDATION'
+    if payload.get('status') in ('NO_EVIDENCE', 'NO_FINDINGS', 'EVIDENCE_GAPS') or status == 'DONE':
+        return None
+    reason = str(payload.get('reason') or '').lower()
+    if 'timeout' in reason or 'timed out' in reason or '超时' in reason:
+        return 'MODEL_TIMEOUT'
+    if '停止' in reason or 'interrupted' in reason or 'cancelled' in reason:
+        return 'STOPPED'
+    if '模型未启用' in reason and '预算' in reason:
+        return 'MODEL_DISABLED_OR_BUDGET'
+    if '预算' in reason or 'budget' in reason:
+        return 'BUDGET'
+    if '模型未启用' in reason:
+        return 'MODEL_DISABLED'
+    if any(word in reason for word in ('校验', '引用', '条数', '假设数量', '方法覆盖')):
+        return 'VALIDATION'
+    return 'OTHER' if status in ('FAILED', 'DEFERRED', 'INTERRUPTED') or reason else None
+
+
+def industry_research(store, a, b, as_of=None):
+    """Count recorded internal outcomes without exporting hypothesis or error text."""
+    cutoff = min(b, as_of or normalize_time(now()))
+    available = bool(_rows(store, "SELECT name FROM sqlite_master WHERE type='table' AND name='industry_steps'"))
+    rows = _rows(store, 'SELECT step,status,updated_at,payload_json FROM industry_steps '
+                       'WHERE updated_at>=? AND updated_at<? AND updated_at<=?', (a, b, cutoff))
+    statuses, outcomes, failures, rejection_kinds = Counter(), Counter(), Counter(), Counter()
+    domains, distinct = {}, set()
+    refs = gaps = rejected_count = partial = reused = no_evidence = technical = 0
+    for row in rows:
+        payload = _json(row['payload_json'], {})
+        payload = payload if isinstance(payload, dict) else {}
+        hypotheses = [h for h in payload.get('hypotheses', []) if isinstance(h, str)] if isinstance(payload.get('hypotheses'), list) else []
+        rejected = payload.get('rejected') if isinstance(payload.get('rejected'), list) else []
+        research_gaps = payload.get('research_gaps') if isinstance(payload.get('research_gaps'), list) else []
+        outcome = payload.get('status') if payload.get('status') in INDUSTRY_OUTCOME_NAMES else 'LEGACY'
+        failure = _industry_failure(payload, row['status'], rejected)
+        has_partial = bool(hypotheses) and (row['status'] != 'DONE' or bool(failure))
+        statuses[row['status']] += 1
+        outcomes[outcome] += 1
+        if failure:
+            failures[failure] += 1
+        technical += bool(failure in ('VALIDATION', 'MODEL_TIMEOUT', 'OTHER'))
+        for rejection in rejected:
+            reason = str(rejection).lower()
+            rejection_kinds['FACT_COUNT' if '证据条数' in reason else 'REFERENCE' if '引用' in reason else 'OTHER'] += 1
+        refs += len(hypotheses)
+        distinct.update(hypotheses)
+        gaps += len(research_gaps)
+        rejected_count += len(rejected)
+        partial += has_partial
+        reused += bool(payload.get('reused'))
+        no_evidence += outcome == 'NO_EVIDENCE'
+        domain = domains.setdefault(row['step'], {'by_status': Counter(), 'hypothesis_references': 0,
+                        'research_gap_count': 0, 'rejected_count': 0, 'failure_kinds': Counter()})
+        domain['by_status'][row['status']] += 1
+        domain['hypothesis_references'] += len(hypotheses)
+        domain['research_gap_count'] += len(research_gaps)
+        domain['rejected_count'] += len(rejected)
+        if failure:
+            domain['failure_kinds'][failure] += 1
+    return {'available': available, 'as_of': cutoff, 'steps': len(rows), 'by_status': dict(statuses),
+            'by_outcome': dict(outcomes), 'hypothesis_references': refs, 'distinct_hypotheses': len(distinct),
+            'research_gap_count': gaps, 'rejected_count': rejected_count, 'partial_steps': partial,
+            'reused_steps': reused, 'no_evidence_steps': no_evidence, 'technical_failure_steps': technical,
+            'failure_kinds': dict(failures), 'rejection_kinds': dict(rejection_kinds),
+            'by_domain': {k: {**v, 'by_status': dict(v['by_status']), 'failure_kinds': dict(v['failure_kinds'])}
+                          for k, v in sorted(domains.items())}}
 
 
 def collection(store, a, b, spans=()):
@@ -157,7 +271,7 @@ def collection(store, a, b, spans=()):
             'new_documents': documents}
 
 
-def research(store, config, a, b, spans=()):
+def research(store, config, a, b, spans=(), as_of=None):
     names = _names(config)
     studies = _rows(store, 'SELECT symbol,model_status,created_at FROM studies WHERE created_at>=? AND created_at<?', (a, b))
     renewed = _rows(store, "SELECT count(*) n FROM plan_events WHERE at>=? AND at<? AND reason LIKE 'RENEWED:%'", (a, b))
@@ -198,7 +312,8 @@ def research(store, config, a, b, spans=()):
             'studies_offline': sum(1 for s in studies if inside(s['created_at'], spans)),
             'unsuccessful_offline': sum(1 for s in studies if s['model_status'] != 'SUCCEEDED' and inside(s['created_at'], spans)),
             'analysis_failures': len(failures), 'analysis_failures_offline': sum(1 for f in failures if inside(f['checked_at'], spans)),
-            'models': dict(models), 'stocks': stocks, 'global': global_plans, 'dynamic_new_cases': dict(cases)}
+            'models': dict(models), 'stocks': stocks, 'global': global_plans, 'dynamic_new_cases': dict(cases),
+            'industry': industry_research(store, a, b, as_of)}
 
 
 def portfolio(store, a, b):
@@ -393,6 +508,11 @@ def flags(d, config, today):
         worst = max(long_cycles, key=lambda j: j['online_minutes'])
         out.append(f"资料研究在联网状态下耗时 {worst['online_minutes']} 分钟（{_hm(worst['at'])} 那轮），超过 {LONG_CYCLE_MINUTES // 60} 小时；运行期间组合决策排队")
     r = d['research']
+    industry = r.get('industry') or {}
+    if industry.get('technical_failure_steps'):
+        details = {k: v for k, v in industry['failure_kinds'].items() if k in ('VALIDATION', 'MODEL_TIMEOUT', 'OTHER')}
+        out.append(f"行业内部步骤有技术错误 {industry['technical_failure_steps']} 次（{_counts(details, INDUSTRY_FAILURE_NAMES)}）；"
+                   f"全部行业步骤中有 {industry['partial_steps']} 次保留了部分成果，顶层任务完成不代表内部全部通过")
     studied = sum(r['model_studies'].values()) - r['studies_offline']
     unsuccessful = studied + r['studies_offline'] - r['model_studies'].get('SUCCEEDED', 0) - r['unsuccessful_offline']
     if unsuccessful >= 5 and unsuccessful * 10 >= studied:
@@ -447,10 +567,11 @@ def flags(d, config, today):
 
 # Neutral values used when a section cannot be built; the page then says so instead of implying nothing happened.
 EMPTY = {'availability': {'spans': [], 'offline_minutes': 0, 'paused_minutes': 0, 'away_minutes': 0},
-         'jobs': {'by_kind': {}, 'longest_minutes': {}, 'failed': [], 'offline_stopped': [], 'long_cycles': [], 'reconnect_recoveries': 0},
+         'jobs': {'by_kind': {}, 'longest_minutes': {}, 'failed': [], 'offline_stopped': [], 'long_cycles': [], 'reconnect_recoveries': 0,
+                  'as_of': None, 'timing_by_kind': {}},
          'collection': {'attempts': 0, 'failed': 0, 'network_errors': 0, 'attempts_offline': 0, 'failed_offline': 0, 'top_failures': [], 'new_documents': {}},
          'research': {'model_studies': {}, 'renewed': 0, 'studies_offline': 0, 'unsuccessful_offline': 0, 'analysis_failures': 0,
-                      'analysis_failures_offline': 0, 'models': {}, 'stocks': [], 'global': [], 'dynamic_new_cases': {}},
+                      'analysis_failures_offline': 0, 'models': {}, 'stocks': [], 'global': [], 'dynamic_new_cases': {}, 'industry': None},
          'portfolio': {'runs': {}, 'decisions_made': 0, 'latest_at': None, 'jobs': {}, 'job_failure_reasons': {}, 'longest_gap': None,
                        'longest_online_gap': None, 'latest_actions': {}, 'latest_target_bps': 0, 'latest_summary': '',
                        'changes': [], 'publications': {}, 'publication_bytes': {'max': None, 'last': None}, 'longest_gap_hours': None},
@@ -488,8 +609,8 @@ def build(store, config, day):
     d['strategy_freshness'] = local_view(store, config, min(b, d['generated_at']))
     d['availability'] = _safe('availability', lambda: availability(store, a, b))
     spans = d['availability']['spans']
-    for name, fn in (('jobs', lambda: jobs(store, a, b)), ('collection', lambda: collection(store, a, b, spans)),
-                     ('research', lambda: research(store, config, a, b, spans)), ('portfolio', lambda: portfolio(store, a, b)),
+    for name, fn in (('jobs', lambda: jobs(store, a, b, d['generated_at'])), ('collection', lambda: collection(store, a, b, spans)),
+                     ('research', lambda: research(store, config, a, b, spans, d['generated_at'])), ('portfolio', lambda: portfolio(store, a, b)),
                      ('execution', lambda: execution(store, config, a, b)), ('quotes', lambda: quotes(store, a, b)),
                      ('review', lambda: review(store, a, b)),
                      ('governance', lambda: governance(store, a, b))):
@@ -651,6 +772,29 @@ def markdown(d):
                                             + ('' if g['updated'] else '（当天未更新）') for g in r['global']) + '。']
     if r['dynamic_new_cases']:
         L.append('- 新闻发现的新候选：' + '、'.join(f'{k} {v}' for k, v in r['dynamic_new_cases'].items()) + '。')
+    industry = r.get('industry')
+    if industry is not None:
+        L.append('')
+        if not industry['available']:
+            L.append('- 历史数据库没有行业步骤表，内部结果统计不可用。')
+        else:
+            L += [f"- 行业内部步骤 {industry['steps']} 次（{_counts(industry['by_status'])}）；结果分类："
+                  f"{_counts(industry['by_outcome'], INDUSTRY_OUTCOME_NAMES)}。",
+                  f"- 行业假设引用 {industry['hypothesis_references']} 条，去重 {industry['distinct_hypotheses']} 条；"
+                  f"部分成果保留 {industry['partial_steps']} 步，沿用结果 {industry['reused_steps']} 步；"
+                  f"资料缺口 {industry['research_gap_count']} 条，校验拒绝 {industry['rejected_count']} 条。引用含沿用，不等于新增假设。",
+                  f"- 行业异常或延后原因（按步骤计）：{_counts(industry['failure_kinds'], INDUSTRY_FAILURE_NAMES)}；"
+                  f"拒绝原因（按假设计）：{_counts(industry['rejection_kinds'], INDUSTRY_REJECTION_NAMES)}。"
+                  '无可用证据、未发现假设和资料缺口不计技术错误。',
+                  f"- 行业步骤按最后更新时间归属当日，统计截至 {_md(industry['as_of'])}；"
+                  '同一步骤后续更新会覆盖旧状态，不据当前状态回放旧结果。']
+            if industry['by_domain']:
+                from .industry import DOMAINS
+                L += ['', '| 行业 | 内部步骤状态 | 假设引用 | 资料缺口 / 拒绝 | 异常或延后原因（步骤） |', '|---|---|---|---|---|']
+                for domain, stats in industry['by_domain'].items():
+                    L.append(f"| {DOMAINS.get(domain, {}).get('name', domain)} | {_counts(stats['by_status'])} | "
+                             f"{stats['hypothesis_references']} | {stats['research_gap_count']} / {stats['rejected_count']} | "
+                             f"{_counts(stats['failure_kinds'], INDUSTRY_FAILURE_NAMES)} |")
     p = d['portfolio']
     gap = p.get('longest_gap')
     L += ['', '## 组合策略', ''] + _failed(p) + [f"- 组合决策运行 {sum(p['runs'].values())} 次（{_counts(p['runs'])}）；组合决策任务：{_counts(p['jobs'])}"
@@ -738,8 +882,24 @@ def markdown(d):
     if g['agent_notes']:
         L.append('- 桌面 agent 笔记：' + '、'.join(g['agent_notes']) + '。')
     j = d['jobs']
-    L += ['', '## 任务运行', ''] + _failed(j) + ['| 任务 | 结果 | 最长耗时（分钟） |', '|---|---|---|']
-    L += [f"| {names.get(k, k)} | {_counts(v)} | {j['longest_minutes'].get(k, '—')} |" for k, v in j['by_kind'].items()] or ['| — | 当天没有任务记录 | — |']
+    cutoff = j.get('as_of') or min(b, d['generated_at'])
+    L += ['', '## 任务运行', ''] + _failed(j) + [
+          f"- 按任务计划时间归属当日；耗时统计截至 {_md(cutoff)}（北京时间）。结果列为生成日报时的存储状态，历史状态无法回放。",
+          '- 排队耗时为计划至实际开始；执行耗时仅统计截至时点已结束的任务。跨截止时点、未开始和进行中任务另列，不混入已完成耗时。', '',
+          '| 任务 | 结果（存储状态） | 已开始排队：次数 / 最长分钟 | 已结束执行：次数 / 最长分钟 |', '|---|---|---|---|']
+    timings = j.get('timing_by_kind', {})
+    for kind, result in j['by_kind'].items():
+        timing = timings.get(kind, {})
+        queue = f"{timing.get('queue_count', 0)} / {timing.get('queue_max_minutes') if timing.get('queue_count') else '—'}"
+        execution = f"{timing.get('completed_count', 0)} / {timing.get('execution_max_minutes') if timing.get('completed_count') else '—'}"
+        L.append(f"| {names.get(kind, kind)} | {_counts(result)} | {queue} | {execution} |")
+    if not j['by_kind']:
+        L.append('| — | 当天没有任务记录 | — | — |')
+    for kind, timing in timings.items():
+        for state, label in (('pending', '截至时点未开始'), ('running', '截至时点未结束')):
+            if timing[state + '_count']:
+                L.append(f"- {names.get(kind, kind)}{label} {timing[state + '_count']} 次，"
+                         f"最长已{'等待' if state == 'pending' else '执行'} {timing[state + '_max_minutes']} 分钟。")
     return '\n'.join(L) + '\n'
 
 
