@@ -8,6 +8,58 @@ from .storage import now, normalize_time, digest, json_write
 VERSION = 'cross_research_v1'
 ACTIONS = ('ALLOW', 'HOLD', 'PAUSE', 'REDUCE', 'EXIT')
 TABLES = {'watchlist': 'paper_orders', 'dynamic': 'dynamic_orders', 'global': 'global_orders'}
+# A level move of more than 0.5% is material; smaller moves are routine reissues.
+MATERIAL_LEVEL_TOLERANCE_BPS = 50
+LEVEL_KEYS = ('buy_low_cents', 'buy_high_cents', 'stop_cents')
+
+
+def material(route, row):
+    """What a portfolio decision depends on in a watchlist plan row; None for other routes or no row."""
+    if route != 'watchlist' or not row:
+        return None
+    r = dict(row)
+    p = json.loads(r['payload_json'])
+    levels = p.get('levels') or {}
+    # Lifecycle, not research: a partial fill (HOLDING) and a supersede+reissue pair
+    # (SUPERSEDED) change a row's status without changing what the decision depends on.
+    if r.get('status') == 'HOLDING':
+        r['status'] = 'READY'
+    elif r.get('status') == 'SUPERSEDED':
+        r['status'] = 'ACTIVE'
+    return {'study_id': r['study_id'], 'status': r['status'], 'strategy_version': r['strategy_version'],
+            'kind': p.get('kind'), 'blockers': sorted(set(p.get('blockers') or [])),
+            'levels': {k: levels.get(k) for k in LEVEL_KEYS},
+            'membership_token': p.get('research_membership_token'), 'max_stock_pct': p.get('max_stock_pct')}
+
+
+def materially_changed(old, new):
+    """True when any non-level field differs, a level appears/disappears, or moves by more than
+    MATERIAL_LEVEL_TOLERANCE_BPS relative to the old level. Exactly the tolerance is not a change."""
+    if old is None or new is None:
+        return old is not new
+    for k in ('study_id', 'status', 'strategy_version', 'kind', 'blockers', 'membership_token', 'max_stock_pct'):
+        if old.get(k) != new.get(k):
+            return True
+    old_levels, new_levels = old.get('levels') or {}, new.get('levels') or {}
+    for k in LEVEL_KEYS:
+        a, b = old_levels.get(k), new_levels.get(k)
+        if a is None or b is None:
+            if a is not b:
+                return True
+        elif type(a) not in (int, float) or type(b) not in (int, float) or a <= 0:
+            if a != b:
+                return True
+        elif abs(b - a) * 10000 > a * MATERIAL_LEVEL_TOLERANCE_BPS:
+            return True
+    return False
+
+
+def source_differs(item, row):
+    """Whether the decision's recorded source no longer matches `row`; decisions written before
+    source_material existed (and non-watchlist routes) keep the whole-row token comparison."""
+    if item['route'] == 'watchlist' and item.get('source_material') is not None:
+        return materially_changed(item['source_material'], material('watchlist', row))
+    return item.get('source_token') != row_token(row)
 
 
 def enabled(config):
@@ -37,6 +89,7 @@ def source(store, route, identity):
 
 
 def snapshot(store, config, at):
+    from .exposure import gross_cap_pct
     from .paper import account, account_inside_transaction
     from .dynamic_paper import case_position
     from .global_market import targets
@@ -49,6 +102,8 @@ def snapshot(store, config, at):
     members={m['symbol']:m for m in membership(store,config,at)}
 
     def add(route, identity, symbol, name, position, row):
+        from .research_only import contains
+        if contains(store,config,symbol):return
         row = dict(row) if row else None
         p = json.loads(row['plan_json'] if route == 'dynamic' else row['payload_json']) if row else {}
         analysis = json.loads(row['analysis_json']) if row and route == 'dynamic' else p.get('analysis', {})
@@ -73,7 +128,17 @@ def snapshot(store, config, at):
             if route=='watchlist' and p.get('research_membership_token')!=(member or {}).get('fingerprint'):ready=False
         cap = min(config['paper_max_stock_pct'], p.get('max_stock_pct', 20) if route == 'watchlist' else p.get('max_position_pct', 5))*100
         key = route+':'+identity
+        near_stop = False
+        if route == 'watchlist' and qty > 0:
+            # Same effective stop as the execution layer: the higher of the plan stop and the cost stop.
+            q = store.latest_quote(symbol, at)
+            plan_stop = (p.get('levels') or {}).get('stop_cents')
+            cost = position.get('cost_cents', 0)
+            cost_stop = cost // qty * (10000 - config['paper_stop_loss_bps']) // 10000 if qty and cost else 0
+            stop = max(x for x in (plan_stop, cost_stop) if x is not None) if any(x is not None for x in (plan_stop, cost_stop)) else 0
+            near_stop = bool(q and stop and q['price_cents'] * 10000 <= stop * 10200)
         candidates.append({'key': key, 'route': route, 'identity': identity, 'symbol': symbol, 'name': name,
+            'source_material': material(route, row), 'near_stop': near_stop,
             'membership_token':member.get('fingerprint') if member else None,
             'source_id': row['id'] if row else None, 'source_token': row_token(row),
             'source_valid_until': row.get('valid_until', row.get('expires_at')) if row else None,
@@ -106,7 +171,7 @@ def snapshot(store, config, at):
     return {'version': VERSION, 'as_of': at, 'guard': guard,
         'account': {k:a[k] for k in ('cash_cents','equity_cents','available_cents','reserved_cents','withdrawal_reserved_cents','market_value_cents')},
         'valuation_ready': valuation_ready(store,a,at), 'halted': state(store)['halted'], 'orders': orders,
-        'gross_cap_bps': config['paper_max_gross_pct']*100, 'symbol_cap_bps': config['paper_max_stock_pct']*100,
+        'gross_cap_bps': gross_cap_pct(store, config, at)[0]*100, 'symbol_cap_bps': config['paper_max_stock_pct']*100,
         'candidates': candidates}
 
 
@@ -198,7 +263,16 @@ def publication_audit(packet, fresh, model_choices, result, published_at, observ
     published = {d['key']:d for d in result['decisions']}
     decisions = []
     for chosen in model_choices:
-        key = chosen['key']; c = after[key]; d = published[key]; codes = []
+        key = chosen['key']; c = after.get(key); d = published.get(key); codes = []
+        if d is None:
+            # A non-actionable candidate vanished mid-inference and was stripped from
+            # the published set; keep its model choice auditable instead of KeyError.
+            decisions.append({'key': key, 'model_action': chosen['action'],
+                              'model_target_bps': chosen['target_bps'],
+                              'analysis_basis': basis(before[key]), 'published_action': 'DROPPED',
+                              'published_target_bps': None, 'publication_basis': None,
+                              'adjustment_codes': ['CANDIDATE_REMOVED']})
+            continue
         if chosen['action']=='ALLOW' and d['action']=='PAUSE':
             if not c['can_increase']:codes.append('ALLOW_ELIGIBILITY_LOST')
             if chosen['target_bps']<=c['current_bps']:codes.append('ALLOW_TARGET_REACHED')
@@ -239,6 +313,41 @@ def active(store, at):
     return {**dict(row),'payload':json.loads(row['payload_json'])} if row else None
 
 
+def forced_reasons(store, config, at):
+    """Position facts a model decision cannot survive silently, compared with a fresh snapshot:
+    a changed quantity or cost, account cash, a withdrawal reservation, a new halt, and a price
+    that has reached a position's stop all force a re-run. Order reservations alone never do:
+    a queued order reserves cash without touching cash_cents or withdrawal_reserved_cents.
+    Missing fields in an old payload skip that comparison instead of forcing a false re-run.
+    They only re-run the model; they never publish an invalidation to the cloud."""
+    current = active(store, at)
+    if not current:
+        return []
+    fresh = snapshot(store, config, at)
+    now_items = {c['key']: c for c in fresh['candidates']}
+    payload = current['payload']
+    reasons = []
+    for d in payload['decisions']:
+        c = now_items.get(d['key'])
+        if not c:
+            continue
+        if c['qty'] != d.get('qty'):
+            reasons.append('POSITION_CHANGED:' + d['key'])
+        if 'cost_cents' in d and c['cost_cents'] != d['cost_cents']:
+            reasons.append('COST_CHANGED:' + d['key'])
+        if c.get('near_stop') and not d.get('near_stop'):
+            reasons.append('NEAR_STOP:' + d['key'])
+    account = payload.get('account') or {}
+    if 'cash_cents' in account and account['cash_cents'] != fresh['account']['cash_cents']:
+        reasons.append('CASH_CHANGED')
+    if 'withdrawal_reserved_cents' in account and account['withdrawal_reserved_cents'] != fresh['account']['withdrawal_reserved_cents']:
+        reasons.append('WITHDRAWAL_CHANGED')
+    constraints = (payload.get('publication_audit') or {}).get('publication_constraints') or {}
+    if 'halted' in constraints and constraints['halted'] != fresh['halted']:
+        reasons.append('HALT_CHANGED')
+    return reasons
+
+
 def request(store, config, at, *, changed=False):
     if config.get('deployment_role')=='cloud' or not enabled(config) or not config.get('scheduler_enabled'):
         return None
@@ -247,6 +356,16 @@ def request(store, config, at, *, changed=False):
     dirty=changed or bool(store.db.execute("SELECT 1 FROM service_state WHERE key='portfolio_dirty'").fetchone())
     if store.db.execute("SELECT 1 FROM jobs WHERE kind='portfolio_strategy' AND status IN ('PENDING','RUNNING')").fetchone():
         return None
+    if not dirty and active(store, at):
+        checked = store.db.execute("SELECT value FROM service_state WHERE key='portfolio_forced_checked_at'").fetchone()
+        if not checked or (datetime.fromisoformat(at)-datetime.fromisoformat(checked[0])).total_seconds() >= 60:
+            reasons = forced_reasons(store, config, at)
+            with store.db:
+                store.db.execute("INSERT OR REPLACE INTO service_state VALUES('portfolio_forced_checked_at',?)",(at,))
+                if reasons:
+                    store.db.execute("INSERT OR REPLACE INTO service_state VALUES('portfolio_dirty',?)",(at,))
+                    store.db.execute("INSERT OR REPLACE INTO service_state VALUES('portfolio_forced_reasons',?)",(encoded(reasons),))
+            dirty = dirty or bool(reasons)
     last = store.db.execute('SELECT * FROM portfolio_runs ORDER BY started_at DESC,rowid DESC LIMIT 1').fetchone()
     refresh = config.get('portfolio_refresh_minutes',55)*60
     if last and (datetime.fromisoformat(at)-datetime.fromisoformat(last['started_at'])).total_seconds() < (300 if last['status']!='SUCCEEDED' else 60 if dirty else refresh):
@@ -255,6 +374,51 @@ def request(store, config, at, *, changed=False):
         return None
     from .scheduler import enqueue
     return enqueue(store,'portfolio_strategy',at,'portfolio:'+at[:16])
+
+
+def publication_changes(packet, fresh):
+    """Decision inputs compared between the analysis packet and the publication snapshot.
+    Every difference is a reason to defer and re-analyze, except a watchlist source row
+    reissued within material tolerance: the published decision then binds to the fresh row.
+    guard/input_guard stay whole-snapshot digests for audit; this list is the publish rule."""
+    before = {c['key']: c for c in packet['candidates']}
+    after = {c['key']: c for c in fresh['candidates']}
+    changes = []
+    added = set(after) - set(before)
+    removed = set(before) - set(after)
+    # A non-actionable add/remove cannot change the model's verdicts: additions get a
+    # synthetic PAUSE, removals are stripped before re-validation. Anything that can
+    # produce a buy still defers the whole publication.
+    if any(_actionable(after[k]) for k in added) or any(_actionable(before[k]) for k in removed):
+        changes.append('CANDIDATE_SET_CHANGED')
+    for key in sorted(set(before) & set(after)):
+        old, new = before[key], after[key]
+        if _actionable(old) or _actionable(new):
+            if old.get('source_material') is not None and new.get('source_material') is not None:
+                if materially_changed(old['source_material'], new['source_material']):
+                    changes.append('SOURCE_MATERIAL_CHANGED:' + key)
+            elif old.get('source_token') != new.get('source_token'):
+                changes.append('SOURCE_CHANGED:' + key)
+            if old.get('membership_token') != new.get('membership_token'):
+                changes.append('MEMBERSHIP_CHANGED:' + key)
+        # Strict only for False->True: the model never considered the candidate buyable
+        # and the published decision would record the fresh True without re-triggering.
+        # True->False is handled by the publish-time tightening (ALLOW -> PAUSE + audit).
+        if not old.get('can_increase') and new.get('can_increase'):
+            changes.append('CAN_INCREASE_CHANGED:' + key)
+        if old.get('qty') != new.get('qty'):
+            changes.append('POSITION_CHANGED:' + key)
+        if old.get('cost_cents') != new.get('cost_cents'):
+            changes.append('COST_CHANGED:' + key)
+    if packet['account'].get('cash_cents') != fresh['account'].get('cash_cents'):
+        changes.append('CASH_CHANGED')
+    if packet['account'].get('withdrawal_reserved_cents') != fresh['account'].get('withdrawal_reserved_cents'):
+        changes.append('WITHDRAWAL_CHANGED')
+    if packet.get('orders') != fresh.get('orders'):
+        changes.append('ORDERS_CHANGED')
+    if packet.get('halted') != fresh.get('halted'):
+        changes.append('HALT_CHANGED')
+    return changes
 
 
 def run(store, config, at=None, model_fn=None, clock=now):
@@ -285,11 +449,37 @@ def run(store, config, at=None, model_fn=None, clock=now):
         from . import portfolio_history
         portfolio_history.ensure(store)
         fresh = snapshot(store,config,completed)
-        if fresh['guard'] != packet['guard']:
-            raise ValueError('分析期间研究、持仓或挂单变化，等待重新判断')
+        changes = publication_changes(packet, fresh)
+        if changes:
+            raise ValueError('分析期间研究、持仓或挂单变化，等待重新判断：' + ','.join(changes)[:200])
         # Normal market moves during inference must not make HOLD fail its equality check.
         # Rebase unchanged positions and only tighten permissions; never enlarge a model target.
         current_items={c['key']:c for c in fresh['candidates']}
+        # A tolerated source renewal rebinds the decision's evidence to the fresh row.
+        packet_items={c['key']:c for c in packet['candidates']}
+        added = [k for k in current_items if k not in packet_items]
+        removed = [k for k in packet_items if k not in current_items]
+        if added or removed:
+            # Only non-actionable set changes reach this point (actionable ones were
+            # deferred by publication_changes). Cover additions with a safe PAUSE and
+            # strip removals, then run the normal full validation on the adjusted payload.
+            rset = set(removed)
+            decisions = [{**d, 'related_keys': [k for k in d['related_keys'] if k not in rset]}
+                         for d in raw['decisions'] if d['key'] not in rset]
+            for k in added:
+                c = current_items[k]
+                decisions.append({'key': k, 'action': 'PAUSE', 'target_bps': c['current_bps'],
+                                  'reason': '本轮组合判断之后新出现的候选，暂不买入，等待下一轮组合判断',
+                                  'evidence_ids': [c['reference_id']], 'related_keys': []})
+            groups = [{**g, 'keys': [k for k in g['keys'] if k not in rset]}
+                      for g in raw['risk_groups']]
+            groups = [g for g in groups if len(g['keys']) >= 2]
+            result = validate({'summary': raw['summary'], 'decisions': decisions, 'risk_groups': groups}, fresh)
+        ref_map={'research:'+str(packet_items[k]['source_id']):'research:'+str(current_items[k]['source_id'])
+                 for k in current_items
+                 if k in packet_items and packet_items[k].get('source_id') is not None
+                 and current_items[k].get('source_id') is not None
+                 and packet_items[k]['source_id']!=current_items[k]['source_id']}
         observed_hits={key:[] for key in current_items}
         def observe_hit(key, condition_id):
             nonlocal observed_hits
@@ -308,6 +498,7 @@ def run(store, config, at=None, model_fn=None, clock=now):
             if d['action'] in ('HOLD','PAUSE'):
                 if d['target_bps']!=c['current_bps']:observe_hit(d['key'],'PUB_PASSIVE_REBASE')
                 d['target_bps']=c['current_bps']
+            d['evidence_ids']=[ref_map.get(e,e) for e in d['evidence_ids']]
         validate(result,fresh)
         candidates = current_items
         payload = {**result,'as_of':at,'input_guard':packet['guard'], 'account':packet['account'],
@@ -323,6 +514,7 @@ def run(store, config, at=None, model_fn=None, clock=now):
         cancelled = cancel_incompatible_buys(store,config,completed,rid) if config.get('deployment_role')!='research' else 0
         store.db.execute("UPDATE portfolio_runs SET finished_at=?,status='SUCCEEDED',payload_json=? WHERE id=?",(completed,encoded({'cancelled_orders':cancelled}),rid))
         store.db.execute("DELETE FROM service_state WHERE key='portfolio_dirty'")
+        store.db.execute("DELETE FROM service_state WHERE key='portfolio_forced_reasons'")
         store.db.commit()
         try:
             portfolio_history.observe(store)
@@ -355,6 +547,8 @@ def decision(store, config, route, identity, at):
     d = next((d for d in current['payload']['decisions'] if d['key']==key),None)
     if not d:
         return None
+    from .research_only import contains
+    if contains(store,config,d['symbol']):return None
     if config.get('industry_enabled') and d['action']=='ALLOW':
         from .universe import membership
         member=next((m for m in membership(store,config,at) if m['symbol']==d['symbol']),None)
@@ -367,7 +561,11 @@ def decision(store, config, route, identity, at):
         # Targeted invalidation from research: only decisions touching a changed candidate lapse.
         changed=value(store,'invalidated_keys') or {}
         if any(changed.get(k,'')>current['created_at'] for k in dependencies):return None
-    if any(x['source_token']!=row_token(source(store,x['route'],x['identity'])) for x in current['payload']['decisions'] if x['key'] in dependencies):
+    # A dependency other than the key itself counts only if it was actionable in the
+    # ACTIVE decision; a non-actionable related candidate's plan reissue must not lapse
+    # an ALLOW authorization that still stands on its own.
+    if any(source_differs(x,source(store,x['route'],x['identity'])) for x in current['payload']['decisions']
+           if x['key'] in dependencies and (x['key'] == d['key'] or _actionable(x))):
         return None
     return {**d,'portfolio_id':current['id'],'groups':current['payload']['risk_groups']}
 
@@ -393,20 +591,56 @@ def candidate_sources(store, config, at):
     return result
 
 
+def _actionable(x):
+    """Whether a decision item or a snapshot candidate can produce anything but PAUSE."""
+    return bool(x.get('qty') or x.get('can_increase'))
+
+
+def _source_differs_snapshot(item, candidate):
+    """source_differs on the snapshot view: watchlist items compare source_material, others
+    compare the recorded source_token."""
+    if item['route'] == 'watchlist' and item.get('source_material') is not None:
+        return materially_changed(item['source_material'], candidate.get('source_material'))
+    return item.get('source_token') != candidate.get('source_token')
+
+
 def changed_keys(store, config, at):
-    """Candidates whose research changed since the active portfolio decision. ['*'] if there is none."""
+    """Candidates whose research changed since the active portfolio decision. ['*'] if there is none.
+
+    Only RELEVANT keys count — actionable in the ACTIVE decision item or in the fresh
+    snapshot candidate. A non-actionable candidate's research reissue cannot change the
+    model's PAUSE verdict, so its changes wait for the regular 240-minute refresh."""
     current = active(store, at)
     if not current:
         return ['*']
-    decided = {d['key']: d['source_token'] for d in current['payload']['decisions']}
-    now_sources = candidate_sources(store, config, at)
-    changed = [k for k, row in now_sources.items() if decided.get(k) != row_token(row)]
+    decided = {d['key']: d for d in current['payload']['decisions']}
+    fresh = {c['key']: c for c in snapshot(store, config, at)['candidates']}
+    changed = []
+    for k, c in fresh.items():
+        d = decided.get(k)
+        if d is None:
+            if c.get('source_token') is not None and _actionable(c):
+                changed.append(k)
+            continue
+        if bool(d.get('can_increase')) != bool(c.get('can_increase')):
+            changed.append(k)
+            continue
+        if not (_actionable(d) or _actionable(c)):
+            continue
+        if _source_differs_snapshot(d, c) or d.get('membership_token') != c.get('membership_token'):
+            changed.append(k)
     # Candidates that disappeared matter too: their authorization must lapse.
-    changed += [k for k in decided if k not in now_sources and decided[k] is not None]
+    changed += [k for k in decided if k not in fresh and decided[k].get('source_token') is not None and _actionable(decided[k])]
     if config.get('industry_enabled'):
         from .universe import membership
-        tokens={m['symbol']:m['fingerprint'] for m in membership(store,config,at)}
-        changed += [d['key'] for d in current['payload']['decisions'] if d.get('membership_token')!=tokens.get(d['symbol'])]
+        tokens = {m['symbol']: m['fingerprint'] for m in membership(store, config, at)}
+        for d in current['payload']['decisions']:
+            c = fresh.get(d['key'])
+            if not (_actionable(d) or (c and _actionable(c))):
+                continue
+            token = c.get('membership_token') if c else tokens.get(d['symbol'])
+            if d.get('membership_token') != token:
+                changed.append(d['key'])
     return sorted(set(changed))
 
 
@@ -516,9 +750,10 @@ def fill_budget(store,config,route,identity,at,a,order):
     from .portfolio_risk import valuation_ready
     if not valuation_ready(store,a,at):
         raise ValueError('组合成交估值缺失')
+    from .exposure import gross_cap_pct
     room = buy_budget(store,config,route,identity,at,a,order['id'])
     available = a['cash_cents']-a['reserved_cents']+order['reserved_cents']-a['withdrawal_reserved_cents']
-    gross_room = a['equity_cents']*config['paper_max_gross_pct']//100-a['market_value_cents']-(a['reserved_cents']-order['reserved_cents'])
+    gross_room = a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-(a['reserved_cents']-order['reserved_cents'])
     symbol = order['symbol']
     held = sum(a[k].get(symbol,{}).get('market_value_cents',0) for k in ('positions','dynamic_positions','global_positions'))
     own_reserved = sum(o['reserved_cents'] for o in a['orders'] if o['side']=='BUY' and o['symbol']==symbol and o['id']!=order['id'])

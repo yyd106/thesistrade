@@ -401,6 +401,12 @@ class Scheduler:
             if role(config)!='research' and time.monotonic()-self.last_settle>=30 and 'settle' not in active_kinds and 'slot' not in active_kinds:
                 if store.db.execute("SELECT 1 FROM paper_orders WHERE status IN ('OPEN','PARTIAL') LIMIT 1").fetchone():
                     enqueue(store,'settle',stamp)
+                elif time.monotonic()-getattr(self,'last_reduce_check',0)>=60 \
+                        and not store.db.execute("SELECT 1 FROM jobs WHERE kind='settle' AND status='PENDING' LIMIT 1").fetchone():
+                    from . import exposure
+                    self.last_reduce_check=time.monotonic()
+                    if exposure.needs_reduction(store,config,stamp):
+                        enqueue(store,'settle',stamp)
                 self.last_settle=time.monotonic()
             # The executing ledger credits verified cash dividends on held shares (the research node never does).
             if role(config)!='research' and time.monotonic()-self.last_dividends>=300:

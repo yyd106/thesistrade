@@ -76,11 +76,17 @@ def parse_feed(raw,source):
  if not rows:raise ValueError(errors[0] if errors else '订阅没有可解析且带发布时间的条目')
  return rows
 
-def collect(store,start,end,at,fetch_fn=None):
+def collect(store,start,end,at,fetch_fn=None,config=None):
  from . import news_polling
- fetch_fn=fetch_fn or data.fetch;result={'added':0,'window_counts':{},'failures':[],'skipped_sources':[]}
+ from .sec_source import Client, HOSTS, SECUnavailable, availability, contact, reject_private_value
+ fetch_fn=fetch_fn or data.fetch;result={'added':0,'window_counts':{},'failures':[],'skipped_sources':[],'paused_sources':{}}
  feeds=[]
  for name,url in FEEDS:
+  if urlsplit(url).hostname in HOSTS and availability(config or {})!='READY':
+   state=availability(config or {});result['skipped_sources'].append(name);result['paused_sources'][name]=state
+   with store.db:store.db.execute('INSERT OR REPLACE INTO dynamic_feed_checks VALUES(?,?,?,?,?)',
+    (name,normalize_time(at),state,0,state+'；未发起网络请求，0不是实际条目计数'))
+   continue
   if news_polling.due(store,name,at):feeds.append((name,url))
   else:
    result['skipped_sources'].append(name)
@@ -88,9 +94,15 @@ def collect(store,start,end,at,fetch_fn=None):
    if failure:result['failures'].append(failure)
  def read(feed):
   name,url=feed
+  is_sec=urlsplit(url).hostname in HOSTS
   try:
-   raw=fetch_fn(url);return name,raw,parse_feed(raw,name),None
-  except Exception as exc:return name,None,[],str(exc)[:180]
+   raw=Client(config or {},store.root).fetch(url,max_bytes=4_000_000) if is_sec else fetch_fn(url)
+   rows=parse_feed(raw,name)
+   if is_sec:reject_private_value(rows,contact(config or {}))
+   return name,raw,rows,None
+  except Exception as exc:
+   detail=str(exc)[:180] if not is_sec or isinstance(exc,SECUnavailable) else 'SEC_PARSE_OR_STORAGE_FAILURE'
+   return name,None,[],detail
  with ThreadPoolExecutor(max_workers=5,thread_name_prefix='macro-feed') as pool:
   for name,raw,rows,error in pool.map(read,feeds):
    available=[r for r in rows if r['published_at']<=at]

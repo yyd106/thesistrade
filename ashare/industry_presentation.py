@@ -36,5 +36,7 @@ def current(data, at, *, signed=None, research_lease=None, revoked=None, revoked
             if (revoked_at or '')>(signed or {}).get('as_of','') or any((revoked or {}).get(k,'')>(signed or {}).get('as_of','') for k in keys):
                 m['entry_allowed']=False;m['entry_reason']='原买入安排已撤销，等待新的研究和组合决定'
         if m.get('protected'):m['entry_reason']+='；继续管理已有持仓和未完成委托'
+        if m.get('research_only'):
+            m.update(buy_eligible=False,entry_allowed=False,entry_reason='参考区间，只研究不交易')
     data['display_at']=at
     return data

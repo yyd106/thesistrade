@@ -394,3 +394,77 @@ class ForwardHistoryTests(SourceFixture):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MaterialHistoryTests(ForwardHistoryTests):
+    """source_material items: a renewal that changes nothing material keeps authorization."""
+
+    def material_decision(self, identity='pd-material'):
+        row = self.store.db.execute("SELECT * FROM plans WHERE symbol='sh600000' AND status='ACTIVE'").fetchone()
+        item = self.item('watchlist', 'sh600000')
+        item['source_material'] = portfolio.material('watchlist', row)
+        at = (self.base + timedelta(seconds=2)).isoformat()
+        with patch.object(history, '_clock', return_value=(self.base + timedelta(seconds=2)).isoformat(timespec='milliseconds')):
+            payload = self.decision([item], at, identity, forward=True)
+        self.observe(self.base + timedelta(seconds=3))
+        return item
+
+    def renew(self, mutate=None):
+        old = dict(self.store.db.execute("SELECT * FROM plans WHERE symbol='sh600000' AND status='ACTIVE'").fetchone())
+        payload = json.loads(old['payload_json'])
+        if mutate:
+            mutate(payload)
+        return self.plan('renewed', 'sh600000', self.base.isoformat(), payload=payload)
+
+    def plan(self, identity='p1', symbol='sh600000', at='2026-09-15T00:00:00+00:00', status='ACTIVE',
+             levels=None, payload=None):
+        with self.store.db:
+            if status == 'ACTIVE':
+                for old in self.store.db.execute("SELECT id FROM plans WHERE symbol=? AND status='ACTIVE'", (symbol,)).fetchall():
+                    self.store.db.execute("UPDATE plans SET status='SUPERSEDED' WHERE id=?", (old[0],))
+                    self.store.db.execute('INSERT INTO plan_events(plan_id,at,status,reason) VALUES(?,?,?,?)',
+                                          (old[0], at, 'SUPERSEDED', identity))
+            self.store.db.execute('INSERT INTO plans VALUES(?,?,?,?,?,?,?,?)', (identity, 'synthetic-study', symbol,
+                at, '2099-01-01T00:00:00+00:00', status, 'synthetic', json.dumps(
+                    payload or {'kind': 'PAPER_TRADE', 'levels': levels or {}, 'blockers': []})))
+            self.store.db.execute('INSERT INTO plan_events(plan_id,at,status,reason) VALUES(?,?,?,?)',
+                                  (identity, at, status, 'synthetic'))
+        return self.item('watchlist', symbol)
+
+    def test_immaterial_renewal_stays_verified(self):
+        self.material_decision()
+        self.renew(lambda p: p.update(note='a routine reissue, same study and levels'))
+        self.observe(datetime.fromisoformat(self.cutoff) - timedelta(seconds=1))
+        self.finish_observation()
+        accepted, checks = self.checks(self.cutoff)
+        self.assertIn('watchlist:sh600000', accepted, checks)
+
+    def test_material_change_invalidates(self):
+        self.material_decision()
+        self.renew(lambda p: p['blockers'].append('X'))
+        self.observe(datetime.fromisoformat(self.cutoff) - timedelta(seconds=1))
+        self.finish_observation()
+        accepted, checks = self.checks(self.cutoff)
+        check = next(x for x in checks if x['key'] == 'watchlist:sh600000')
+        self.assertEqual((check['status'], check['reason']), ('INVALIDATED', 'SOURCE_CHANGED_SINCE_DECISION'))
+
+    def test_material_change_invalidates_legacy_path(self):
+        item = self.item('watchlist', 'sh600000')
+        row = self.store.db.execute("SELECT * FROM plans WHERE symbol='sh600000' AND status='ACTIVE'").fetchone()
+        item['source_material'] = portfolio.material('watchlist', row)
+        self.decision([item], (self.base + timedelta(seconds=2)).isoformat(), 'pd-legacy')
+        self.renew(lambda p: p['blockers'].append('X'))
+        check = self.checks(self.cutoff)[1][0]
+        self.assertEqual((check['status'], check['reason']), ('INVALIDATED', 'SOURCE_MATERIAL_CHANGED'))
+
+    def test_material_level_move_within_tolerance_stays_verified(self):
+        self.material_decision()
+        row = self.store.db.execute("SELECT payload_json FROM plans WHERE id='p1'").fetchone()
+        base = dict(json.loads(row[0]), levels={'buy_low_cents': 1000, 'buy_high_cents': 1100, 'stop_cents': 900})
+        self.plan('leveled', 'sh600000', self.base.isoformat(), payload=base)
+        self.material_decision('pd-leveled')
+        moved = dict(base, levels={'buy_low_cents': 1005, 'buy_high_cents': 1100, 'stop_cents': 900})
+        self.renew(lambda p: p.update(levels=moved['levels']))
+        self.observe(datetime.fromisoformat(self.cutoff) - timedelta(seconds=1))
+        self.finish_observation()
+        self.assertIn('watchlist:sh600000', self.checks(self.cutoff)[0])

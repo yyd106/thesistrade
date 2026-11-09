@@ -132,6 +132,31 @@ class CloudSyncTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.receive(bad,self.later(5))
         self.assertEqual(runtime.value(self.cloud,'last_sequence'),1)
 
+    def test_superseded_source_publication_redrives_portfolio(self):
+        at=self.at;expiry=normalize_time('2099-01-01T00:00:00+08:00')
+        with self.store.db:
+            self.store.db.execute('INSERT OR IGNORE INTO snapshots VALUES(?,?,?,?,?,?,?)',('s1',None,'sh600519',at,at,'fixture','{}'))
+            self.store.db.execute('INSERT OR IGNORE INTO studies VALUES(?,?,?,?,?,?)',('s1','s1','sh600519',at,'SUCCEEDED','{}'))
+            self.store.db.execute('INSERT INTO plans VALUES(?,?,?,?,?,?,?,?)',
+                ('p1','s1','sh600519',at,expiry,'ACTIVE','synthetic',json.dumps({'kind':'PAPER_TRADE','blockers':[],'levels':{}})))
+        result=ps.run(self.store,self.cfg,at,model_fn=lambda p,*a:self.output(json.loads(p.split('<UNTRUSTED_INPUT>')[1].split('</UNTRUSTED_INPUT>')[0])))
+        self.assertEqual(result['status'],'SUCCEEDED',result)
+        with self.store.db:
+            self.store.db.execute("UPDATE plans SET status='SUPERSEDED' WHERE symbol='sh600519' AND status='ACTIVE'")
+        with patch('ashare.cloud_sync.display_packet',return_value={}):
+            with self.assertRaisesRegex(ValueError,'研究版本已更新'):
+                sync.queue_publication(self.store,self.cfg,result['decision_id'])
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM service_state WHERE key='portfolio_dirty'").fetchone())
+        self.assertFalse(self.store.db.execute('SELECT 1 FROM cloud_outbox').fetchone())
+
+    def test_superseded_source_error_marks_outbox_stale_and_redrives(self):
+        body=self.publication()
+        with patch('ashare.cloud_sync.request',side_effect=ValueError('研究版本已更新，等待新的组合策略')), \
+             patch('ashare.cloud_sync.now',return_value=self.at):
+            with self.assertRaisesRegex(ValueError,'研究版本已更新'):sync.flush(self.store,self.cfg)
+        self.assertEqual(self.store.db.execute('SELECT status FROM cloud_outbox').fetchone()[0],'STALE')
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM service_state WHERE key='portfolio_dirty'").fetchone())
+
 class CloudHTTPTests(unittest.TestCase):
     def setUp(self):
         import test_dashboard as fixture

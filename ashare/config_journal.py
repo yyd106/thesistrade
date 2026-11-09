@@ -138,6 +138,18 @@ def _has_publication(log, operation_id):
 def finish(store, path, row):
     """Caller holds the file lock. Resume only the precise before/after bytes in the committed intent."""
     from . import approvals
+    payload = json.loads(row['payload_json'])
+    watch = next((e for e in payload['entries'] if e['key'] == 'watchlist'), None)
+    if watch:
+        # The lock is deliberately committed before any file replacement and is
+        # retained even if publication/audit fails or the old config is restored.
+        with approvals.atomic(store):
+            if payload['approval_id']:
+                approvals.check_receipt(store, payload['approval_id'], kind='CONFIG', subject_id=row['subject_id'],
+                                        action='APPLY', snapshot=payload['snapshot'], operation_id=row['id'])
+            from .research_only import activate_inside, configured
+            from .pipeline import load_config
+            activate_inside(store, configured({'watchlist': watch['after']}), row['id'],config=load_config(path,configure_model=False))
     try:
         # The durable intent is already committed. Hold the DB write lock during validation and
         # publication so concurrent guidance changes cannot invalidate the frozen build mid-write.

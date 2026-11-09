@@ -11,17 +11,23 @@ TAGS={'revenue':('RevenueFromContractWithCustomerExcludingAssessedTax','Revenues
       'capex':('PaymentsToAcquirePropertyPlantAndEquipment',)}
 
 
-def collect(store,symbol,at,fetch_fn=None):
-    fetch=fetch_fn or sources.fetch
+def collect(store,symbol,at,fetch_fn=None,config=None):
+    from .sec_source import Client, SECUnavailable, availability, contact, reject_private_value
+    state=availability(config or {})
+    if state!='READY':raise SECUnavailable(state)
+    fetch=fetch_fn or Client(config,store.root).fetch
+    private_contact=contact(config)
     if not re.fullmatch(r'US:[A-Z][A-Z0-9.-]{0,9}',symbol):raise ValueError('美股身份错误')
     cache=store.root/'cache/sec-tickers.json'
-    if cache.exists() and datetime.fromtimestamp(cache.stat().st_mtime).date()==datetime.fromisoformat(at).date():raw=cache.read_bytes()
-    else:
-        raw=fetch('https://www.sec.gov/files/company_tickers.json',max_bytes=5000000);atomic_write(cache,raw)
-    matches=[v for v in json.loads(raw).values() if v['ticker']==symbol[3:]]
+    cached=cache.exists() and datetime.fromtimestamp(cache.stat().st_mtime).date()==datetime.fromisoformat(at).date()
+    raw=cache.read_bytes() if cached else fetch('https://www.sec.gov/files/company_tickers.json',max_bytes=5000000)
+    tickers=json.loads(raw);reject_private_value(tickers,private_contact)
+    if not cached:atomic_write(cache,raw)
+    matches=[v for v in tickers.values() if v['ticker']==symbol[3:]]
     if len(matches)!=1:raise ValueError('SEC主体无法唯一确认')
     cik=int(matches[0]['cik_str']);url=f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json'
     raw=fetch(url,max_bytes=20000000);data=json.loads(raw)
+    reject_private_value(data,private_contact)
     if data['cik']!=cik:raise ValueError('SEC主体不匹配')
     facts=data.get('facts',{}).get('us-gaap',{});metrics={}
     for key,tags in TAGS.items():
@@ -36,6 +42,7 @@ def collect(store,symbol,at,fetch_fn=None):
         for v in sorted(observations,key=lambda v:v['filed']):unique[(v.get('start'),v['end'],v['unit'],v['tag'])]=v
         metrics[key]=sorted(unique.values(),key=lambda v:(v['end'],v['filed']),reverse=True)[:6]
     suburl=f'https://data.sec.gov/submissions/CIK{cik:010d}.json';subraw=fetch(suburl,max_bytes=5000000);sub=json.loads(subraw)
+    reject_private_value(sub,private_contact)
     if symbol[3:] not in sub.get('tickers',[]):raise ValueError('SEC证券映射变化')
     recent=sub['filings']['recent'];filings=[];texts=[]
     for i,form in enumerate(recent['form']):
@@ -47,6 +54,7 @@ def collect(store,symbol,at,fetch_fn=None):
     for f in filings:
         body=fetch(f['url'],max_bytes=12000000);parser=sources.ArticleParser();parser.feed(body.decode('utf8'))
         text='\n'.join(parser.parts)
+        reject_private_value(text,private_contact)
         if len(text)<200:raise ValueError('SEC正文未解析')
         published=f['filed']+'T00:00:00+00:00'
         doc_id,_=store.add_document(symbol=symbol,kind='company_report',title=sub['name']+' '+f['form'],source='SEC',url=f['url'],published_at=published,time_precision='date',pages=[(None,text)],raw_path=store.raw(body,'.html'),quality='html_text_layout_unverified',cloud_allowed=True)
@@ -61,15 +69,21 @@ def collect(store,symbol,at,fetch_fn=None):
     return packet
 
 
-def dossier(store,symbol,at,refresh=False):
+def dossier(store,symbol,at,refresh=False,config=None):
+    from .sec_source import availability, SECUnavailable
+    state=availability(config or {})
     docs=[d for d in store.documents_as_of(at,symbol) if d['kind']=='us_financial_data']
-    if refresh and (not docs or (datetime.fromisoformat(at)-datetime.fromisoformat(docs[0]['ready_at'])).total_seconds()>86400):
-        try:return collect(store,symbol,at)
+    if state=='READY' and refresh and (not docs or (datetime.fromisoformat(at)-datetime.fromisoformat(docs[0]['ready_at'])).total_seconds()>86400):
+        try:return collect(store,symbol,at,config=config)
         except Exception as exc:
-            store.record_attempt('sec_company',symbol,'FAILED',str(exc),at=at)
+            detail=str(exc) if isinstance(exc,SECUnavailable) else 'SEC_PARSE_OR_STORAGE_FAILURE'
+            store.record_attempt('sec_company',symbol,'FAILED',detail,at=at)
             return {'status':'PARTIAL','gaps':['SEC资料未取得'],'metrics':{},'documents':[]}
-    if not docs:return {'status':'MISSING','gaps':['SEC公司底稿尚未取得'],'metrics':{},'documents':[]}
+    if not docs:return {'status':'MISSING' if state=='READY' else state,'source_status':state,'gaps':['SEC公司底稿尚未取得'] if state=='READY' else [state],'metrics':{},'documents':[]}
     from .storage import CHUNK_SIZE,CHUNK_STEP
     chunks=list(store.db.execute('SELECT text FROM chunks WHERE doc_id=? ORDER BY ordinal',(docs[0]['id'],)))
     body=''.join(r['text'][:CHUNK_STEP] if i<len(chunks)-1 else r['text'] for i,r in enumerate(chunks))
-    return {**json.loads(body),'doc_id':docs[0]['id'],'ready_at':docs[0]['ready_at']}
+    packet={**json.loads(body),'doc_id':docs[0]['id'],'ready_at':docs[0]['ready_at']}
+    if state!='READY':
+        packet.update(status='PARTIAL',source_status=state,gaps=list(packet.get('gaps',[]))+[state+'（保留已有资料；未刷新）'])
+    return packet

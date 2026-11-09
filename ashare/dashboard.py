@@ -83,7 +83,9 @@ def status(config, *, overview=False, page_diagnostics=True):
         from .supervision import view as supervision_view
         from .withdrawals import status as withdrawal_status
         from .freshness_sync import local_view as freshness_view
-        return add_strategy_times(store,{'deployment_role':config.get('deployment_role','standalone'),'version':__version__,'at':at,'mode':config['mode'],'live_execution':False,'model_auth':'CHATGPT_SUBSCRIPTION',
+        from . import market_regime, trader_view
+        from .paper import preview_buy
+        result = add_strategy_times(store,{'deployment_role':config.get('deployment_role','standalone'),'version':__version__,'at':at,'mode':config['mode'],'live_execution':False,'model_auth':'CHATGPT_SUBSCRIPTION',
             'scheduler_enabled':config['scheduler_enabled'],'calendar':CALENDAR_VERSION,
             'market_phase':phase(at),'quote_max_age_seconds':config['quote_max_age_seconds'],'schedule':{'collection':config['collection_times'],'slots':config['slot_times'],'review':config['review_time'],
                                                'execution_mode':config['slot_execution_mode']},
@@ -102,8 +104,11 @@ def status(config, *, overview=False, page_diagnostics=True):
             'state':dict(store.db.execute('SELECT key,value FROM service_state')),
             'documents':store.db.execute('SELECT count(*) FROM documents').fetchone()[0],
             'snapshots':store.db.execute('SELECT count(*) FROM snapshots').fetchone()[0],
+            'market_regime':market_regime.r1(store,at),
             # A research node delivers its notices to the cloud, where Dean answers them.
             'notices':open_notices(store) if config.get('deployment_role','standalone')=='standalone' else []})
+        result['trader_view']=trader_view.build(result,config,buy_check=lambda p,q,t: preview_buy(store,config,p,q,t))
+        return result
     finally:store.close()
 
 

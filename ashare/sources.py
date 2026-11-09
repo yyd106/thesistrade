@@ -7,8 +7,8 @@ import re
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
@@ -17,7 +17,8 @@ from .storage import now, digest, normalize_time
 
 SH = ZoneInfo("Asia/Shanghai")
 ALLOWED_HOSTS = {"qt.gtimg.cn", "web.ifzq.gtimg.cn", "www.cninfo.com.cn", "static.cninfo.com.cn", "www.csrc.gov.cn", "www.sse.com.cn",
-                 "www.sec.gov", "data.sec.gov", "search.ccgp.gov.cn", "www.ccgp.gov.cn", "news.un.org", "www.mofcom.gov.cn", "datacenter-web.eastmoney.com", "data.eastmoney.com"}
+                 "www.sec.gov", "data.sec.gov", "search.ccgp.gov.cn", "www.ccgp.gov.cn", "news.un.org", "www.mofcom.gov.cn", "datacenter-web.eastmoney.com", "data.eastmoney.com",
+                 "push2his.eastmoney.com", "money.finance.sina.com.cn"}
 
 
 def check_url(url):
@@ -29,11 +30,17 @@ def check_url(url):
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         check_url(newurl)
+        from .sec_source import HOSTS
+        if urllib.parse.urlsplit(newurl).hostname in HOSTS:
+            raise ValueError('SEC请求必须使用独立受控客户端')
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def fetch(url, form=None, max_bytes=20_000_000):
     check_url(url)
+    from .sec_source import HOSTS
+    if urllib.parse.urlsplit(url).hostname in HOSTS:
+        raise ValueError('SEC请求必须使用独立受控客户端')
     payload = urllib.parse.urlencode(form).encode() if form is not None else None
     headers = {"User-Agent": "Mozilla/5.0 (personal research prototype)", "Referer": "https://www.cninfo.com.cn/"}
     req = urllib.request.Request(url, data=payload, headers=headers)
@@ -185,15 +192,212 @@ def history_summary(raw, symbol, cutoff_date):
             "notice": "当前前复权快照；不可冒充历史时点已经知道的复权数据；非完整策略评分" if series.get('qfqday') else "来源返回原始历史价格，未声明为前复权序列；非完整策略评分"}
 
 
+def _eastmoney_raw(symbol, fqt=0):
+    """(vendor raw bytes, bars) [date,open,close,high,low,volume(手)] from Eastmoney's kline API."""
+    secid = ('1' if symbol.startswith('sh') else '0') + '.' + symbol[2:]
+    raw = fetch(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&klt=101&fqt={fqt}"
+                "&lmt=90&end=20500101&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56", max_bytes=2000000)
+    klines = (json.loads(raw).get('data') or {}).get('klines')
+    if not isinstance(klines, list) or not klines:
+        raise ValueError('东方财富日线结构变化')
+    bars = [b.split(',')[:6] for b in klines]
+    if any(len(b) < 6 for b in bars):
+        raise ValueError('东方财富日线字段缺失')
+    return raw, bars[-90:]
+
+
+def eastmoney_daily(symbol, fqt=0):
+    """Daily bars [date,open,close,high,low,volume(手)] from Eastmoney's public kline API."""
+    return _eastmoney_raw(symbol, fqt)[1]
+
+
+def _sina_raw(symbol):
+    """(vendor raw bytes, bars) in the same layout; Sina volume is shares, rounded to 手 here."""
+    raw = fetch(f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+                f"?symbol={symbol}&scale=240&ma=no&datalen=90", max_bytes=2000000)
+    rows = json.loads(raw)
+    if not isinstance(rows, list) or not rows:
+        raise ValueError('新浪日线结构变化')
+    bars = sorted([[r['day'], str(r['open']), str(r['close']), str(r['high']), str(r['low']),
+                   str((Decimal(str(r['volume'])) / 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP))]
+                  for r in rows], key=lambda b: b[0])
+    return raw, bars[-90:]
+
+
+def sina_daily(symbol):
+    """Daily bars in the same layout; Sina reports volume in shares, converted to 手 here."""
+    return _sina_raw(symbol)[1]
+
+
+def tencent_wrap(symbol, key, bars):
+    """Tencent-shaped JSON bytes so downstream code never learns which source answered."""
+    return json.dumps({'data': {symbol: {key: bars}}}, ensure_ascii=False).encode()
+
+
+def closes_agreement(a, b):
+    """(shared date count, max close difference in cents) between two bar lists."""
+    ca, cb = {x[0]: cents(x[2]) for x in a}, {x[0]: cents(x[2]) for x in b}
+    shared = sorted(set(ca) & set(cb))
+    return len(shared), (max(abs(ca[d] - cb[d]) for d in shared) if shared else None)
+
+
+def closes_match(a, b, min_overlap=20):
+    """Every shared date's close within one cent, over at least min_overlap dates."""
+    overlap, max_diff = closes_agreement(a, b)
+    return overlap >= min_overlap and max_diff is not None and max_diff <= 1
+
+
+def _bars_problem(bars, cutoff, expected):
+    """Rejection reason or None: the pre-selection validity gate for every candidate.
+
+    Parseable ISO dates, strictly ascending and unique, at least 60 completed bars with
+    positive OHLC, and the newest completed bar reaching the last completed trading day —
+    the same definition research.py uses for STALE_DAILY_BARS."""
+    if not bars:
+        return '空序列'
+    days = []
+    for b in bars:
+        try:
+            days.append(date.fromisoformat(b[0]))
+        except (ValueError, TypeError, IndexError):
+            return '日期无法解析'
+    if len(set(days)) != len(days) or days != sorted(days):
+        return '日期重复或乱序'
+    for b in bars:
+        try:
+            ohlc = [Decimal(str(b[i])) for i in (1, 2, 3, 4)]
+            if not all(v.is_finite() for v in ohlc):
+                return '价格非有限数值'
+            if any(v <= 0 for v in ohlc):
+                return '价格非正'
+        except Exception:
+            return '价格无法解析'
+    completed = [b for b in bars if b[0] < cutoff]
+    if len(completed) < 60:
+        return '完整交易日不足60根'
+    if expected and completed[-1][0] < expected:
+        return '最新完整交易日早于' + expected
+    return None
+
+
+def _attempt_detail(params, **fields):
+    return json.dumps({'params': params, **{k: v for k, v in fields.items() if v is not None}}, ensure_ascii=False)
+
+
+def saved_unadjusted(store, symbol):
+    row = store.db.execute("SELECT payload FROM market_features WHERE symbol=? ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                           (symbol,)).fetchone() if store.db.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='market_features'").fetchone() else None
+    return (json.loads(row[0]).get('unadjusted') or {}).get('bars') if row else None
+
+
+def unadjusted_daily(store, run_id, symbol):
+    """(raw_bytes, source, tencent_error, vendor_raw): the plain series plus its origin bytes.
+
+    Every candidate is validated before selection (ISO dates, ascending unique, >=60
+    completed bars, positive OHLC, newest completed bar reaching the last completed day).
+    With a saved reference sharing >=20 dates a mirror must reproduce it within 1 cent —
+    Eastmoney first, Sina only if Eastmoney fails or is rejected. With no sufficient saved
+    reference both mirrors are fetched and must reproduce each other."""
+    from .calendar import completed_bar_cutoff, last_completed_day
+    cutoff, expected = completed_bar_cutoff(now()), last_completed_day(now())
+    try:
+        raw = fetch("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" + symbol + ",day,,,90,", max_bytes=2000000)
+        bars = json.loads(raw)['data'][symbol]['day']
+        if not isinstance(bars, list):
+            raise ValueError('腾讯日线结构变化')
+        problem = _bars_problem(bars, cutoff, expected)
+        if problem:
+            raise ValueError('腾讯未复权日线不合格：' + problem)
+        return raw, 'tencent_daily', None, raw
+    except Exception as exc:
+        tencent_error = exc
+    saved = saved_unadjusted(store, symbol)
+    mirrors = (('eastmoney_daily', lambda: _eastmoney_raw(symbol, 0), 'klt=101&fqt=0&lmt=90'),
+               ('sina_daily', lambda: _sina_raw(symbol), 'scale=240&ma=no&datalen=90'))
+    held = []
+    for idx, (name, fetcher, params) in enumerate(mirrors):
+        try:
+            vendor_raw, bars = fetcher()
+        except Exception as exc:
+            store.record_attempt(name, symbol, 'FETCH_FAILED', _attempt_detail(params, reason=str(exc)[:200]), run_id=run_id)
+            continue
+        try:
+            reason = _bars_problem(bars, cutoff, expected)
+        except Exception as exc:
+            reason = '序列校验异常：' + str(exc)[:100]
+        if reason:
+            store.record_attempt(name, symbol, 'REJECTED', _attempt_detail(params, bars=len(bars), reason=reason), run_id=run_id)
+            continue
+        overlap = max_diff = None
+        if saved is not None:
+            overlap, max_diff = closes_agreement(bars, saved)
+            if overlap >= 20:
+                if max_diff <= 1:
+                    for hname, hparams, hbars, _hv, hover, hdiff in held:
+                        store.record_attempt(hname, symbol, 'REJECTED',
+                            _attempt_detail(hparams, bars=len(hbars), overlap=hover, max_diff_cents=hdiff,
+                                            reason='已请求但因参照重叠不足未采用，后由其他备用源通过'), run_id=run_id)
+                    for later_name, _, later_params in mirrors[idx + 1:]:
+                        store.record_attempt(later_name, symbol, 'SKIPPED', _attempt_detail(later_params, reason='前序备用源已通过，不再请求'), run_id=run_id)
+                    store.record_attempt(name, symbol, 'ACCEPTED', _attempt_detail(params, bars=len(bars), overlap=overlap, max_diff_cents=max_diff), run_id=run_id)
+                    return tencent_wrap(symbol, 'day', bars), name, tencent_error, vendor_raw
+                store.record_attempt(name, symbol, 'REJECTED', _attempt_detail(params, bars=len(bars), overlap=overlap, max_diff_cents=max_diff, reason='与已保存序列不一致'), run_id=run_id)
+                continue
+        held.append((name, params, bars, vendor_raw, overlap, max_diff))
+    # No sufficient saved reference: the mirrors must reproduce each other.
+    if len(held) >= 2:
+        overlap, max_diff = closes_agreement(held[0][2], held[1][2])
+        agree = overlap >= 20 and max_diff is not None and max_diff <= 1
+        for name, params, bars, vendor_raw, _ov, _md in held:
+            store.record_attempt(name, symbol, 'ACCEPTED' if agree else 'REJECTED',
+                _attempt_detail(params, bars=len(bars), overlap=overlap, max_diff_cents=max_diff,
+                                reason='镜像互验' + ('一致' if agree else '不一致')), run_id=run_id)
+        if agree:
+            return tencent_wrap(symbol, 'day', held[0][2]), held[0][0], tencent_error, held[0][3]
+    else:
+        for name, params, bars, vendor_raw, _ov, _md in held:
+            store.record_attempt(name, symbol, 'REJECTED', _attempt_detail(params, bars=len(bars), reason='无足够参照且镜像不足，无法互验'), run_id=run_id)
+    return None, None, tencent_error, None
+
+
+def qfq_daily(store, run_id, symbol, cutoff):
+    """(raw_bytes, source): Tencent's qfq series, or Eastmoney's fqt=1 as a last resort."""
+    try:
+        raw = fetch("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" + symbol + ",day,,,90,qfq", max_bytes=2000000)
+        history_summary(raw, symbol, cutoff)
+        return raw, 'tencent_daily', None
+    except Exception as exc:
+        tencent_error = exc
+    try:
+        bars = eastmoney_daily(symbol, fqt=1)
+        store.record_attempt('eastmoney_daily', symbol, 'OK', run_id=run_id)
+    except Exception as exc:
+        store.record_attempt('eastmoney_daily', symbol, 'FAILED', str(exc)[:300], run_id=run_id)
+        return None, None, tencent_error
+    return tencent_wrap(symbol, 'qfqday', bars), 'eastmoney_daily', tencent_error
+
+
 def collect_history(store, run_id, symbol,config=None):
     from .calendar import completed_bar_cutoff
     cutoff=completed_bar_cutoff(now())
-    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" + symbol + ",day,,,90,qfq"
-    raw = fetch(url, max_bytes=2000000)
+    raw, qfq_source, qfq_error = qfq_daily(store, run_id, symbol, cutoff)
+    plain_raw, daily_source, daily_error, vendor_raw = unadjusted_daily(store, run_id, symbol)
+    # One monitoring row per stock per round, whichever sources served the bars: ChatGPT's
+    # Tencent failure statistics count a single tencent_daily attempt per collect_history call.
+    if qfq_error is None and daily_error is None:
+        store.record_attempt('tencent_daily', symbol, 'OK', run_id=run_id)
+    else:
+        which = '、'.join(name for name, err in (('复权', qfq_error), ('未复权', daily_error)) if err)
+        err = qfq_error or daily_error
+        store.record_attempt('tencent_daily', symbol, 'FAILED', f'{which}请求失败：{err}', run_id=run_id)
+    if raw is None:
+        raise qfq_error
+    if plain_raw is None:
+        raise daily_error
     path = store.raw(raw, ".json")
     summary = history_summary(raw, symbol, cutoff)
     # Executable price plans use a separate unadjusted sequence; never mix qfq prices into orders.
-    plain_raw = fetch("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" + symbol + ",day,,,90,", max_bytes=2000000)
     plain_path = store.raw(plain_raw, '.json')
     bars = json.loads(plain_raw)['data'][symbol]['day']
     completed = sorted([b for b in bars if b[0] < cutoff], key=lambda b:b[0])
@@ -202,10 +406,15 @@ def collect_history(store, run_id, symbol,config=None):
     prices = [cents(b[2]) for b in completed]
     if any(p <= 0 for p in prices):
         raise ValueError('未复权价格无效')
+    # The vendor's original response bytes are stored apart from the normalized series;
+    # series_hash/vendor_hash link the two for audit.
+    vendor_path = plain_path if vendor_raw == plain_raw else store.raw(vendor_raw, '.json')
     summary['unadjusted'] = {'last_complete_date': completed[-1][0], 'close_cents': prices[-1],
         'ma20_cents': sum(prices[-20:]) // 20, 'ma60_cents': sum(prices[-60:]) // 60,
         'raw_path': plain_path, 'bars': completed, 'basis': 'UNADJUSTED',
-        'series_hash': digest(plain_raw)}
+        'series_hash': digest(plain_raw), 'vendor_path': vendor_path,
+        'vendor_hash': digest(vendor_raw), 'source': daily_source}
+    summary['qfq_source'] = qfq_source
     from . import market_context
     try:
         summary['market_context']=market_context.assemble(store,config or {},run_id,symbol,raw,cutoff)
@@ -217,7 +426,8 @@ def collect_history(store, run_id, symbol,config=None):
     store.db.execute("CREATE TABLE IF NOT EXISTS market_features(run_id TEXT, symbol TEXT, created_at TEXT, raw_path TEXT, payload TEXT, PRIMARY KEY(run_id,symbol))")
     store.db.execute("INSERT OR REPLACE INTO market_features VALUES(?,?,?,?,?)", (run_id, symbol, now(), path, json.dumps(summary, ensure_ascii=False)))
     store.db.commit()
-    store.check(run_id, "tencent_daily", symbol, "OK", "历史日线与原始价格均已核对；排除当日未完成K线；非执行行情")
+    store.check(run_id, "daily_bars", symbol, "OK",
+                f"历史日线与原始价格均已核对（复权序列：{qfq_source}，未复权序列：{daily_source}）；排除当日未完成K线；非执行行情")
 
 
 def stock_catalog(store):

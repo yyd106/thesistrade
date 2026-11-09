@@ -12,6 +12,9 @@ fractional shares, because at CNY 100,000 lot rounding alone can decide whether 
 Daily bars approximate intraday execution: an entry fills when the day's range touches the band,
 exits fill at the stop or target level, or at the open when the price gaps through it. Opening
 events come first, then intraday double touches assume the stop first. No book places orders.
+A remains a pure mechanical counterfactual even for research-only names. B/C/D
+do not enter from RESEARCH_ONLY plans. Historical plans are never reclassified
+using today's watchlist; this does not change the existing evaluation method.
 """
 import json
 from collections import Counter
@@ -127,6 +130,10 @@ def decision_at(store, at, diagnostics=None):
                 if missing:
                     status = 'INVALIDATED' if missing == 'SOURCE_CHANGED_SINCE_DECISION' else 'INSUFFICIENT'
                     reason = missing
+                elif item['route'] == 'watchlist' and item.get('source_material') is not None:
+                    from .portfolio_strategy import material, materially_changed
+                    if materially_changed(item['source_material'], material('watchlist', source)):
+                        status, reason = 'INVALIDATED', 'SOURCE_MATERIAL_CHANGED'
                 elif (source or {}).get('id') != item['source_id']:
                     status, reason = 'INVALIDATED', 'SOURCE_ID_CHANGED'
                 elif row_token(source) != item['source_token']:
@@ -400,6 +407,7 @@ def _run_locked(store, config, at, first, last):
               'through': processed[-1] if processed else None, 'missing': missing, 'days': processed,
               'authorization_checks': authorization,
               'limitations': '日线近似；未模拟盘中授权更新、12小时心跳、账户回撤停机及公司行为，不代表可执行净收益。缺价未确证停牌时等待。'
+                  'A账保留只研究股票的机械反事实；B/C/D不以只研究计划新入场。影子记录不是账户委托，不按今日名单回写历史。'
                   '开盘部分减仓与同日剩余仓位退出的先后仍是独立已知边界。'
                   '授权核验：' + encode(authorization['counts']) + '；原因：' + encode(authorization['reasons']) +
                   '。A/B按历史计划与行情近似；C/D另需来源和发布可见性证明。旧组合缺少提交时间上界，不能仅凭created_at确认开盘前可用。'

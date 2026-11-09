@@ -193,7 +193,8 @@ def source_at(store, history, item, cutoff):
                 records[event['source_id']] = (json.loads(event['record_json']), event['source_order'])
             # An intermediate source change also invalidates the frozen decision;
             # deletion/reinsertion or changing back cannot resurrect permission.
-            if row_token(latest()) != item.get('source_token'):
+            from .portfolio_strategy import source_differs
+            if source_differs(item, latest()):
                 return None, 'SOURCE_CHANGED_SINCE_DECISION'
         return latest(), None
     except (KeyError, TypeError, ValueError):

@@ -29,14 +29,17 @@ def decimal_ratio(value):
     return Decimal(value.numerator) / Decimal(value.denominator)
 
 
-def evaluate_inside(store, config, at, account=None):
-    """Caller owns transaction. Must commit the latch even when rejecting a BUY."""
+def evaluate_inside(store, config, at, account=None, *, persist=True):
+    """Persisting callers own the transaction and commit a new latch even on rejected BUY.
+
+    persist=False computes the same risk result without updating the latch or notices.
+    """
     if not enabled(config):
         return state(store)
-    if not store.db.in_transaction:
+    if persist and not store.db.in_transaction:
         raise RuntimeError('Risk check requires account transaction')
-    from .paper import account_inside_transaction
-    a = account or account_inside_transaction(store, at)
+    from .paper import account_inside_transaction, _account_without_initialize
+    a = account or (account_inside_transaction(store, at) if persist else _account_without_initialize(store, at))
     at = normalize_time(at)
     previous = state(store)
     units = capital_units(previous, a['initial_cents'])
@@ -61,6 +64,8 @@ def evaluate_inside(store, config, at, account=None):
               'threshold_bps': DRAWDOWN_BPS, 'valuation_complete': complete,
               'checked_at': at, 'basis': 'CASHFLOW_UNITIZED_NAV', 'automatic_resume': False,
               'historical_cashflow_gap': uncertainty}
+    if not persist:
+        return result
     if breached and not previous.get('halted'):
         result['triggered_at'] = at
         result['trigger_equity_cents'] = a['equity_cents']

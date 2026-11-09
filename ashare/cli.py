@@ -399,8 +399,9 @@ def extended(args, config):
             from .config_ops import recover
             return recover(config['config_path'])
         if args.action == 'show':
+            from .sec_source import public_config
             raw = json.loads(Path(config['config_path']).read_text())
-            return {k: {'value': v, 'class': classify(k)} for k, v in sorted(raw.items()) if k != 'sync_key_file'}
+            return {k: {'value': v, 'class': classify(k)} for k, v in sorted(public_config(raw).items()) if k != 'sync_key_file'}
         from .config_ops import parse_value
         changes = {}
         for pair in args.pairs:

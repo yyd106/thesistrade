@@ -230,9 +230,11 @@ class Store:
             self.db.backup(dest)
         return path
 
-    def periodic_backup(self,at=None,hourly_keep=6,daily_keep=7):
+    def periodic_backup(self,at=None,hourly_keep=6,daily_keep=7,compressed=False):
         """Minute jobs share one atomic hourly backup; preserve manual backup files.
-        Retention: the newest `hourly_keep` hourly files plus one file per day for `daily_keep` days."""
+        Retention: the newest `hourly_keep` hourly files plus one file per day for `daily_keep` days.
+        With `compressed`, days already copied into backups/daily as .gz drop their
+        uncompressed representative."""
         import fcntl
         stamp=datetime.fromisoformat(normalize_time(at or now()))
         folder=self.root/'backups'/'hourly';folder.mkdir(parents=True,exist_ok=True)
@@ -247,8 +249,12 @@ class Store:
                 with sqlite3.connect(temp) as dest:self.db.backup(dest)
                 temp.replace(path)
             finally:temp.unlink(missing_ok=True)
-            from .maintenance import backup_retention
-            backup_retention(folder,hourly_keep,daily_keep)
+            from .maintenance import backup_retention, verified_compressed_days
+            compressed_days=None
+            if compressed:
+                daily=self.root/'backups'/'daily'
+                compressed_days=verified_compressed_days(folder,daily) if daily.is_dir() else set()
+            backup_retention(folder,hourly_keep,daily_keep,compressed_days)
             return path
 
     def close(self):

@@ -9,7 +9,7 @@ APPEND=('quotes','dynamic_quotes','global_quotes','slots','decisions','paper_ord
 SUPPORT=('snapshots','studies','plans','global_plans','dynamic_news','dynamic_cases')
 BOOT=SUPPORT+APPEND+MUTABLE+('portfolio_runs','portfolio_decisions','reviews','lessons','research_methods','research_improvements','app_users')
 # Advertised by the cloud so a newer research node only uses what the deployed cloud understands.
-FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','cash_dividend_credit','quote_health','notices','supervision_summary','review_news_display_v1','review_news_display_v2','approval_receipts_v1','simulated_withdrawals_v1','strategy_freshness_v1','strategy_export_v1')
+FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','research_only_v1','cash_dividend_credit','quote_health','notices','supervision_summary','review_news_display_v1','review_news_display_v2','approval_receipts_v1','simulated_withdrawals_v1','strategy_freshness_v1','strategy_export_v1','exposure_caps_v1')
 PRIMARY={'latest_trade_checks':'symbol'}
 # Appended rows the cloud later updates in place; their updates travel through the change log.
 UPDATED_APPEND=('slots',)
@@ -55,9 +55,11 @@ def projection(table,record):
 
 
 def bootstrap_packet(store,config):
+    from .research_only import symbols
     tables={t:[projection(t,r) for r in rows(store,t)] for t in BOOT}
     # Only the order-associated quote history and the most recent 48h are necessary.
-    return {'protocol':1,'kind':'bootstrap','tables':tables,'ledger_version':version(store),'created_at':now()}
+    return {'protocol':1,'kind':'bootstrap','tables':tables,'ledger_version':version(store),'created_at':now(),
+            'research_only':sorted(symbols(store,config))}
 
 
 def import_bootstrap(store,config,body,at):
@@ -68,6 +70,9 @@ def import_bootstrap(store,config,body,at):
     for table in BOOT:
         upsert(store,table,body['tables'][table],immutable=table in ('snapshots','studies'))
     if version(store)!=body['ledger_version']:raise ValueError('迁移账本校验失败')
+    from .research_only import symbols, activate_inside
+    if body.get('research_only',[])!=sorted(symbols(store,config)):raise ValueError('迁移只研究名单不一致')
+    activate_inside(store,symbols(store,config),'bootstrap')
     put(store,'initialized',True);put(store,'execution_enabled',False);put(store,'migration_at',at)
     return {'status':'INITIALIZED','ledger_version':version(store),'cursors':{t:store.db.execute('SELECT coalesce(max(rowid),0) FROM '+t).fetchone()[0] for t in APPEND}}
 
@@ -147,6 +152,8 @@ def export_ledger_v2(store,body,at,limit=1500,config=None):
         tables[q]+=[projection(q,r) for r in rows(store,q,'WHERE rowid IN (SELECT max(rowid) FROM '+q+' GROUP BY symbol)') if r['id'] not in existing]
     packet={'protocol':2,'at':at,'ledger_version':version(store),'tables':tables,'updated':changes,'mutable':mutable,'support':support,
             'cursors':updated,'change_cursor':high,'full_mutable':full,'support_since':at,'more':more,'features':list(FEATURES)}
+    from .research_only import locks
+    packet['research_only']=sorted(locks(store))
     extras=body.get('extras')
     if isinstance(extras,dict) and not more:
         # Only asked for by 0.15.6+ research nodes, and only on the last page; older nodes never see the key.
@@ -188,7 +195,8 @@ def export_ledger(store,cursors,at,limit=1500,body=None,config=None):
         result[q]+=[projection(q,r) for r in rows(store,q,'WHERE id IN (SELECT quote_id FROM '+f+')') if r['id'] not in existing]
         # Latest quotes let the local portfolio value holdings immediately.
         result[q]+=[projection(q,r) for r in rows(store,q,'WHERE rowid IN (SELECT max(rowid) FROM '+q+' GROUP BY symbol)') if r['id'] not in existing]
-    return {'protocol':1,'at':at,'ledger_version':version(store),'tables':result,'mutable':{t:rows(store,t) for t in MUTABLE},'support':refs,'cursors':updated,'more':more,'features':list(FEATURES)}
+    from .research_only import locks
+    return {'protocol':1,'at':at,'ledger_version':version(store),'tables':result,'mutable':{t:rows(store,t) for t in MUTABLE},'support':refs,'cursors':updated,'more':more,'features':list(FEATURES),'research_only':sorted(locks(store))}
 
 
 def import_ledger_v2(store,config,packet):
@@ -209,6 +217,8 @@ def import_ledger_v2(store,config,packet):
         put(store,'ledger_support_since',packet['support_since']);put(store,'remote_features',packet.get('features',[]))
         if not packet['more']:
             put(store,'remote_ledger_version',packet['ledger_version']);put(store,'remote_ledger_at',packet['at'])
+            from .research_only import import_remote_preflight
+            import_remote_preflight(store,packet)
         store.db.commit()
     except BaseException:store.db.rollback();raise
 
@@ -274,5 +284,7 @@ def import_ledger(store,config,packet):
         put(store,'ledger_cursors',packet['cursors']);put(store,'remote_features',packet.get('features',[]))
         if not packet['more']:
             put(store,'remote_ledger_version',packet['ledger_version']);put(store,'remote_ledger_at',packet['at'])
+            from .research_only import import_remote_preflight
+            import_remote_preflight(store,packet)
         store.db.commit()
     except BaseException:store.db.rollback();raise

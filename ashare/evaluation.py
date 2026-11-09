@@ -47,10 +47,12 @@ def register_plan(store, config, plan_id, symbol, at, plan, stock_result, *, his
     levels = plan.get('levels') or {}
     ma20, ma60, close = (basis.get(k) for k in ('ma20_cents', 'ma60_cents', 'close_cents'))
     numeric = all(type(v) is int and v > 0 for v in (ma20, ma60, close))
-    trend = bool(ma20 > ma60 and close >= ma60) if numeric else None
+    trend = plan.get('trend_ok') if plan.get('trend_ok') is not None else (bool(ma20 > ma60 and close >= ma60) if numeric else None)
     in_band = bool(levels) and numeric and levels['buy_low_cents'] <= close <= levels['buy_high_cents']
     blockers = list(plan.get('blockers', []))
     judgment = {'model_action': (stock_result or {}).get('action'), 'plan_kind': plan.get('kind'),
+                'research_only':plan.get('research_only') is True or plan.get('kind')=='RESEARCH_ONLY',
+                'research_gaps':list(plan.get('research_gaps', [])),
                 'blockers': blockers, 'trend_ok': trend, 'close_in_band': in_band,
                 'research_blocked': any(b in RESEARCH_BLOCKERS for b in blockers),
                 'data_blocked': any(b not in RESEARCH_BLOCKERS + ('TREND_NOT_CONFIRMED',) for b in blockers),
@@ -83,7 +85,8 @@ def register_global(store, config, plan_id, symbol, at, payload, *, historical=F
     analysis = payload.get('analysis') or {}
     blockers = payload.get('blockers', [])
     judgment = {'stance': analysis.get('stance'), 'plan_kind': payload.get('kind'), 'blockers': blockers,
-                'trend_ok': not any('趋势条件未成立' in b for b in blockers), 'model_status': payload.get('model_status'),
+                'trend_ok': payload.get('trend_ok') if payload.get('trend_ok') is not None else not any('趋势条件未成立' in b for b in blockers),
+                'model_status': payload.get('model_status'),
                 'holding_days': payload.get('holding_days')}
     days = payload.get('holding_days') if analysis.get('stance') == 'LONG' else 5
     _insert(store, 'global:' + plan_id, 'global', symbol, plan_id, normalize_time(at), normalize_time(at)[:10],
@@ -424,6 +427,22 @@ def _comparisons(store, since, *, method, days, at=None):
                       '每日滚动样本另保留全部重叠；跨期限汇总仍合并重叠时间簇。少于30簇不显示区间。'
                       '这是截至检查时点可用评分的观察性采样，不是前向预注册；补到的历史评分可能改变新报告的批次，旧冻结报告不改写。'
                       '时间簇不保证独立，区间为聚类近似，未证明因果或未来盈利。全球组持有期不同且不含费用汇率，不作直接优劣结论。'}
+
+
+def trading_gate_counts(store, start, end):
+    """Plan-row gate denominator; research scoring above still includes every judgment."""
+    from collections import Counter
+    from .research_only import trading_sample
+    counts=Counter();blockers=Counter()
+    for row in store.db.execute('SELECT payload_json FROM plans WHERE activated_at>=? AND activated_at<?',(start,end)):
+        p=json.loads(row[0]);counts['plans_total']+=1
+        if not trading_sample(p):counts['research_only_excluded']+=1;continue
+        if p.get('kind')=='RISK_EXIT_ONLY':counts['protective_plans_excluded']+=1;continue
+        counts['trading_plan_count']+=1
+        blockers.update({b.split(':',1)[0] for b in p.get('blockers',[])})
+    return {'unit':'plan_rows','window_start':start,'window_end':end,
+            **{k:counts[k] for k in ('plans_total','trading_plan_count','research_only_excluded','protective_plans_excluded')},
+            'blocker_counts':dict(blockers),'notice':'按生成时冻结计划分类；续期仍算计划条目，不是独立研究样本。只研究与保护计划不进入交易门槛分母；历史不按当前名单回写。'}
 
 
 def registry_counts(store, *, method=SCORE_METHOD, at=None):

@@ -56,6 +56,8 @@ def parse(ref):
 
 def _valid(action):
     """A published action in the plan's corporate_actions, checked again before money moves."""
+    if action.get('method') not in (None, 'EXACT'):
+        return None  # approximated actions adjust prices only; crediting needs exact verification
     try:
         record, ex = date.fromisoformat(action['record_date']), date.fromisoformat(action['ex_date'])
         cash = Decimal(str(action['cash_per_share']))

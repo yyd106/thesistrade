@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from . import sources
 from .calendar import local, previous_trading_day,last_completed_day
 from .finance import PaperLedger
@@ -196,11 +197,11 @@ def make_snapshot(store,config,symbol,batch_id=None,at=None,persist=True):
         'local_only_required_count':sum(materiality.material_document(d) for d in docs if not d['cloud_allowed']),
         'limitations':['公开来源仅支持研究与模拟','证据检索使用FTS5；自动研究按版本选择增量并沿用有限摘录；未部署语义向量/OCR',
             '公司披露不等于券商研报；授权研报需导入','公开财务仅通过字段与勾稽核验；PDF布局未人工校验；模拟技术策略不使用估值预测']}
+    from .universe import membership
+    packet['research_membership']=next((m for m in membership(store,config,stamp) if m['symbol']==symbol),None)
     if config.get('industry_enabled'):
         from .industry import context
-        from .universe import membership
         packet['industry_hypotheses']=context(store,symbol,stamp)
-        packet['research_membership']=next((m for m in membership(store,config,stamp) if m['symbol']==symbol),None)
         for h in packet['industry_hypotheses']:
             for f in h['facts']:
                 if f['evidence_id'] in {e['evidence_id'] for e in packet['evidence']}:continue
@@ -239,7 +240,6 @@ def persist_snapshot(store,packet):
     with store.db:
         store.db.execute('INSERT INTO snapshots VALUES(?,?,?,?,?,?,?)',(sid,packet['batch_id'],packet['symbol'],packet['as_of'],packet['as_of'],digest(payload),payload))
         store.db.executemany('INSERT INTO snapshot_members VALUES(?,?)',[(sid,m['version_id']) for m in packet['document_manifest']])
-    json_write(store.root/'workflow'/'snapshots'/(sid+'.json'),packet)
 
 
 def sizing(store,config,symbol,stamp):
@@ -252,20 +252,91 @@ def sizing(store,config,symbol,stamp):
             'board':rules['board'] if rules else None,'min_buy_qty':rules['min_buy'] if rules else None}
 
 
-def price_plan(packet,config,analysis,model_status):
+# A close-to-close jump beyond the board's daily price limit cannot be a normal
+# move; it is usually a corporate action and the adjustment must not be guessed.
+DISCONTINUITY_LIMIT = 0.15
+DISCONTINUITY_LIMIT_20PCT = 0.21
+LISTING_DATA = Path(__file__).resolve().parent / 'data' / 'listing_dates.json'
+
+
+def listing_dates(path=LISTING_DATA):
+    """Symbol -> {'listed_on','price_limit_from'} from the maintained listing table.
+
+    An entry is used only when both fields are ISO dates, listed_on is earlier than
+    price_limit_from (the first trading day the daily limit applies, listing day six),
+    and the source is an https URL; anything else is treated as an unknown listing.
+    A missing or unreadable file leaves every symbol unknown — the strict threshold."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for key, value in raw.items():
+        if key.startswith('_') or not isinstance(value, dict):
+            continue
+        try:
+            listed = date.fromisoformat(value['listed_on']); limited = date.fromisoformat(value['price_limit_from'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if listed >= limited or not str(value.get('source', '')).startswith('https://'):
+            continue
+        out[key] = {'listed_on': value['listed_on'], 'price_limit_from': value['price_limit_from']}
+    return out
+
+
+def _discontinuity_limit(symbol, day, listing):
+    """(threshold, basis) for the close-to-close transition ending on `day`.
+
+    ChiNext and STAR carry a 20% daily limit, but only from the sixth trading day after
+    listing; transitions ending earlier — the first five listing days or a bar that
+    predates it — use the strict threshold. A stock with no verified listing entry is
+    the explicit conservative state, identical to the old flat rule for every symbol."""
+    from .paper import board
+    if board(symbol) not in ('CHINEXT', 'STAR'):
+        return DISCONTINUITY_LIMIT, 'MAIN_BOARD'
+    if listing is None:
+        return DISCONTINUITY_LIMIT, 'LISTING_UNKNOWN_STRICT'
+    if day < listing['price_limit_from']:
+        return DISCONTINUITY_LIMIT, 'LISTING_WINDOW'
+    return DISCONTINUITY_LIMIT_20PCT, 'BOARD_LIMIT'
+
+
+def price_discontinuity(symbol, bars, listings=None):
+    """Whether a close-to-close jump exceeds the board's daily price-limit margin.
+
+    ChiNext/STAR flag above 0.21 once their daily limit applies; other boards above
+    0.15. Each transition is judged by its own bar date, so a window that starts at
+    or inside the listing's no-limit days still flags normal-looking moves there,
+    whatever the series length. Tests inject `listings` and never rely on the file."""
+    if listings is None:
+        listings = listing_dates()
+    listing = listings.get(symbol)
+    from decimal import Decimal
+    for i in range(1, len(bars)):
+        threshold, _ = _discontinuity_limit(symbol, bars[i][0], listing)
+        change = abs(Decimal(str(bars[i][2])) / Decimal(str(bars[i - 1][2])) - 1)
+        if change > Decimal(str(threshold)):
+            return True
+    return False
+
+
+def price_plan(packet,config,analysis,model_status,regime_on=False):
     """Integer-cent technical baseline for paper evaluation, not a valuation forecast."""
     s=packet['stocks'][0]; f=s.get('features') or {}; u=f.get('unadjusted') or {}
     gaps=[]
     member=packet.get('research_membership')
-    if config.get('industry_enabled') and (not member or not member['buy_eligible']):gaps.append('RESEARCH_MEMBERSHIP_REVIEW')
+    from .research_only import configured, NOTICE
+    only=bool((member or {}).get('research_only')) or packet['symbol'] in configured(config)
+    if not only and config.get('industry_enabled') and (not member or not member['buy_eligible']):gaps.append('RESEARCH_MEMBERSHIP_REVIEW')
     if model_status!='SUCCEEDED':gaps.append('MODEL_NOT_READY')
     if analysis.get('action')!='WATCH':gaps.append('RESEARCH_VETO')
     if not packet['source_checks']:gaps.append('NO_COLLECTION_COVERAGE')
     policy=packet.get('research_policy')==materiality.POLICY_VERSION
-    for source in (('tencent_daily','cninfo_catalog','financials') if policy else ('tencent_daily','cninfo_catalog','cninfo_pdf')):
-        if not any(c['source']==source and c['status']=='OK' for c in packet['source_checks']):gaps.append('SOURCE_GAP:'+source)
+    for source in (('daily_bars','cninfo_catalog','financials') if policy else ('daily_bars','cninfo_catalog','cninfo_pdf')):
+        names=('daily_bars','tencent_daily') if source=='daily_bars' else (source,)  # legacy batches named it tencent_daily
+        if not any(c['source'] in names and c['status']=='OK' for c in packet['source_checks']):gaps.append('SOURCE_GAP:'+source)
     for m in packet['mandatory_coverage']:
-        verified=any(r['doc_id']==m['doc_id'] and r['status']=='VERIFIED' for r in packet.get('event_reviews',[]))
+        verified=any(r['doc_id']==m['doc_id'] and r['status'] in ('VERIFIED','OUT_OF_WINDOW','APPROXIMATED') for r in packet.get('event_reviews',[]))
         if m['critical'] and not verified:gaps.append(('CORPORATE_ACTION_UNVERIFIED:' if m.get('importance')=='CORPORATE_ACTION' else 'UNRESOLVED_EVENT:')+m['doc_id'])
         accounted=m.get('all_required_chunks_accounted',False) if policy else m.get('all_chunks_accounted',m['all_chunks_in_packet'])
         if (not policy or m.get('required',True)) and (not m['fulltext'] or not accounted):gaps.append('UNREAD_DOCUMENT:'+m['doc_id'])
@@ -284,13 +355,13 @@ def price_plan(packet,config,analysis,model_status):
         levels={'buy_low_cents':ma*(10000-band)//10000,'buy_high_cents':ma*(10000+band)//10000,
             'stop_cents':ma*(10000-config['paper_stop_loss_bps'])//10000,
             'sell_cents':ma*(10000+config['paper_take_profit_bps'])//10000}
-        if not ma>slow or not close>=slow:gaps.append('TREND_NOT_CONFIRMED')
+        if not regime_on and (not ma>slow or not close>=slow):gaps.append('TREND_NOT_CONFIRMED')
         # Large day-to-day discontinuities might be a corporate action; do not guess adjustments.
         bars=u.get('bars',[])
-        if any(abs(float(bars[i][2])/float(bars[i-1][2])-1)>0.15 for i in range(1,len(bars))):gaps.append('PRICE_DISCONTINUITY')
+        if price_discontinuity(packet['symbol'],bars):gaps.append('PRICE_DISCONTINUITY')
     else:gaps.append('UNADJUSTED_SERIES_MISSING')
     size=packet.get('sizing')
-    if size:
+    if size and not only:
         # Research continues for these names; the plan simply cannot open a position.
         if not size.get('board'):gaps.append('UNSUPPORTED_BOARD')
         elif levels and size.get('equity_cents') and size.get('min_buy_qty'):
@@ -298,15 +369,17 @@ def price_plan(packet,config,analysis,model_status):
             lot_cost=levels['buy_high_cents']*size['min_buy_qty']
             if lot_cost+fee(config,'BUY',lot_cost)>size['equity_cents']*min(size['max_stock_pct'],config['paper_max_stock_pct'])//100:
                 gaps.append('LOT_EXCEEDS_CAP')
-    return {'research_membership_token':(member or {}).get('fingerprint'),'holding_unit':'DAYS','recheck_hours':1,'research_method':'days_cash_v1' if config.get('investment_policy') else 'legacy',
-        'kind':'NO_ENTRY' if gaps else 'PAPER_TRADE','strategy_version':config['strategy_version'],
+    return {'research_membership_token':(member or {}).get('fingerprint'),'research_only':only,'holding_unit':'DAYS','recheck_hours':1,'research_method':'days_cash_v1' if config.get('investment_policy') else 'legacy',
+        'kind':'RESEARCH_ONLY' if only else 'NO_ENTRY' if gaps else 'PAPER_TRADE','strategy_version':config['strategy_version'],
         'event_reviews':packet.get('event_reviews',[]),'corporate_actions':u.get('corporate_actions',[]),
-        'basis':basis,'levels':levels,'blockers':list(dict.fromkeys(gaps)),
+        'trend_ok':bool(ma>slow and close>=slow) if all(type(x) is int and x>0 for x in (ma,slow,close)) else None,
+        'basis':basis,'levels':levels,'blockers':[] if only else list(dict.fromkeys(gaps)),
+        'research_gaps':list(dict.fromkeys(gaps)) if only else [],
         'formula':('已核验现金分红调整后的' if u.get('basis')=='CASH_DIVIDEND_ADJUSTED' else '未复权')+f'MA20±{band/100:g}%买入区间；MA20×(1-止损bps)；MA20×(1+止盈bps)；MA20>MA60且昨收>=MA60',
         'max_stock_pct':config['paper_max_stock_pct'],'risk_parameters':{**{k:config[k] for k in ('paper_stop_loss_bps','paper_take_profit_bps')},'paper_entry_band_bps':band},
         'thesis':analysis.get('analysis',''),'counterpoints':analysis.get('counterpoints',[]),
         'evidence_ids':[v['evidence_id'] for v in analysis.get('facts',[])],
-        'notice':'只用于独立模拟，未验证收益；价位不是实际委托或收益承诺'}
+        'notice':NOTICE if only else '只用于独立模拟，未验证收益；价位不是实际委托或收益承诺'}
 
 
 def build_prompt(packet,config):
@@ -376,7 +449,8 @@ def study(store,config,packet,use_model=True,model_fn=None,at=None):
     stamp=normalize_time(at or now())
     if stamp<packet['as_of']:raise ValueError('研究激活早于快照')
     try:
-        plan=price_plan(packet,config,result['stocks'][0],model_status)
+        from .market_regime import regime_active
+        plan=price_plan(packet,config,result['stocks'][0],model_status,regime_on=regime_active(store,config))
         store.record_attempt('price_plan',packet['symbol'],'OK',run_id=rid,at=at)
     except Exception as exc:
         store.record_attempt('price_plan',packet['symbol'],'FAILED',str(exc),run_id=rid,at=at)
@@ -396,6 +470,9 @@ def study(store,config,packet,use_model=True,model_fn=None,at=None):
         if plan.get('research_membership_token')!=(member or {}).get('fingerprint'):
             plan['kind']='NO_ENTRY';plan['blockers'].append('MEMBERSHIP_CHANGED_DURING_RESEARCH')
     with store.db:
+        from .research_only import enforce_plan
+        store.db.execute("UPDATE cloud_state SET value=value WHERE key='research_only_locks_v1'")
+        enforce_plan(store,config,packet['symbol'],plan)
         store.db.execute('INSERT INTO studies VALUES(?,?,?,?,?,?)',(rid,packet['snapshot_id'],packet['symbol'],stamp,model_status,encode(result)))
         if model_status=='SUCCEEDED':learning.commit(store,packet,rid,stamp)
         # A deferred analysis is saved as a DRAFT and does not supersede a still-valid active plan.
@@ -469,13 +546,17 @@ def renew(store,config,packet,reuse,at=None):
     current data. No model call, no new study; the renewal is recorded on the plan itself."""
     stamp=normalize_time(at or now())
     prior=reuse['study'];result=json.loads(prior['result_json'])
-    plan=price_plan(packet,config,result['stocks'][0],'SUCCEEDED')
+    from .market_regime import regime_active
+    plan=price_plan(packet,config,result['stocks'][0],'SUCCEEDED',regime_on=regime_active(store,config))
     plan.update(model=reuse.get('model'),build=record_build(store,config,stamp),
         research_reuse={'study_id':prior['id'],'study_created_at':prior['created_at'],'previous_plan_id':reuse['plan']['id'],
             'reason':'日线、资料、事项核验、财务底稿、采纳规则与版本均未变化，沿用上次成功研究结论，价位与限制按本轮数据重新计算'})
     pid=uuid.uuid4().hex
     expiry=normalize_time((datetime.fromisoformat(stamp)+timedelta(hours=config['plan_max_age_hours'])).isoformat())
     with store.db:
+        from .research_only import enforce_plan
+        store.db.execute("UPDATE cloud_state SET value=value WHERE key='research_only_locks_v1'")
+        enforce_plan(store,config,packet['symbol'],plan)
         for old in store.db.execute("SELECT id FROM plans WHERE symbol=? AND status='ACTIVE'",(packet['symbol'],)).fetchall():
             store.db.execute("UPDATE plans SET status='SUPERSEDED' WHERE id=?",(old['id'],))
             store.db.execute('INSERT INTO plan_events(plan_id,at,status,reason) VALUES(?,?,?,?)',(old['id'],stamp,'SUPERSEDED',pid))

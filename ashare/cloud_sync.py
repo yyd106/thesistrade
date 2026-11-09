@@ -80,7 +80,7 @@ def display_packet(config):
     # page-only observations, including when the peer only understands v1.
     s=status(config,overview=False,page_diagnostics=False)
     # UI summaries only; account, credentials, jobs, raw documents and model files are excluded.
-    keep=('fixed_watchlist','watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds','supervision','industry')
+    keep=('fixed_watchlist','watchlist','observation','dynamic','reviews','followups','schedule','next_runs','calendar','quote_max_age_seconds','supervision','industry','market_regime')
     result={k:s[k] for k in keep};previews={}
     from .storage import Store
     local=Store(config['data_dir'])
@@ -134,7 +134,15 @@ def queue_publication(store,config,decision_id):
     if role(config)!='research':return
     row=store.db.execute('SELECT * FROM portfolio_decisions WHERE id=?',(decision_id,)).fetchone()
     if not row:raise ValueError('缺少已完成的组合版本')
-    decision=json.loads(row['payload_json']);tables,capsules=source_records(store,decision['decisions'])
+    decision=json.loads(row['payload_json'])
+    try:
+        tables,capsules=source_records(store,decision['decisions'])
+    except ValueError as exc:
+        # An immaterial renewal no longer dirties the portfolio; a publication that cannot even be
+        # queued must not wait out the refresh interval for the next decision.
+        if '研究版本已更新' in str(exc):
+            with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('portfolio_dirty','1')")
+        raise
     from .global_market import targets
     selected=targets(store,config,now())
     for k,c in capsules.items():
@@ -144,10 +152,16 @@ def queue_publication(store,config,decision_id):
     payload={'protocol':1,'kind':'strategy','bundle_id':row['id'],'completed_at':row['created_at'],'decision':dict(row),'sources':tables,'contracts':capsules,
              'ledger_version':decision.get('remote_ledger_version'),'news_watermark':watermark[0] if watermark else None,
              'active_assets':list({d['symbol'] for d in decision['decisions']}),'display':display}
-    if config.get('industry_enabled'):
-        if not remote_supports(store,'industry_lists_v1'):raise ValueError('云端尚不支持双名单，等待云端升级')
+    from .research_only import symbols as research_only_symbols, FEATURE
+    if config.get('industry_enabled') or research_only_symbols(store,config):
+        required=FEATURE if research_only_symbols(store,config) else 'industry_lists_v1'
+        if not remote_supports(store,required):raise ValueError('云端尚不支持名单版本，等待云端升级')
         from .universe import publication
         payload['research_membership']=publication(store,config,row['created_at'],row['valid_until'])
+    if remote_supports(store,'exposure_caps_v1'):
+        from .market_regime import r1
+        on=config.get('exposure_regime')=='R1'
+        payload['exposure_caps']={'mode':'R1' if on else 'OFF','regime':r1(store,row['created_at']) if on else None}
     if remote_supports(store,'display_delta'):
         # Send only the parts of the UI summary the cloud does not already hold.
         sections=display_sections(display);hashes=section_hashes(sections);known=value(store,'remote_display_hashes') or {}
@@ -189,7 +203,8 @@ def flush(store,config):
     except Exception as exc:
         with store.db:
             store.db.execute('UPDATE cloud_outbox SET error=? WHERE id=?',(str(exc)[:500],latest['id']))
-            if 'LEDGER_CHANGED' in str(exc):
+            # A superseded source row can never be sent; retrying only stalls a fresh decision.
+            if 'LEDGER_CHANGED' in str(exc) or '研究版本已更新' in str(exc):
                 store.db.execute("UPDATE cloud_outbox SET status='STALE' WHERE id=?",(latest['id'],))
                 store.db.execute("INSERT OR REPLACE INTO service_state VALUES('portfolio_dirty',?)",(now(),))
         raise
@@ -198,6 +213,16 @@ def flush(store,config):
 def receive_strategy(store,config,body,at):
     from .portfolio_strategy import validate,row_token,source,cancel_incompatible_buys
     if not value(store,'initialized',False):raise ValueError('需要先迁移账本')
+    from .exposure import validate_bundle
+    # The incoming package is judged against ITS OWN cap, not the previously stored one:
+    # an upgrade/OFF package with legal targets must not be rejected by the old tighter cap.
+    if 'exposure_caps' in body:
+        incoming_bundle = body['exposure_caps']
+        validate_bundle(incoming_bundle)
+    else:
+        # A research node older than P07 never sends the key; treating the absence as OFF
+        # also restores the configured cap when research is rolled back past the feature.
+        incoming_bundle = {'mode': 'OFF', 'regime': None, 'source': 'LEGACY_PUBLICATION'}
     if body.get('protocol')!=1 or body.get('kind')!='strategy':raise ValueError('同步协议不匹配')
     seq=body.get('sequence');bid=body.get('bundle_id');hashed=digest(canonical(body))
     if type(seq) is not int or seq<1 or not isinstance(bid,str):raise ValueError('无效发布序号')
@@ -217,18 +242,23 @@ def receive_strategy(store,config,body,at):
     if not 1<=len(items)<=60 or len({d['key'] for d in items})!=len(items):raise ValueError('策略资产数量或重复项错误')
     if set(body['sources'])!=set(ledger.SUPPORT) or set(body['contracts'])!={d['key'] for d in items}:raise ValueError('策略与研究引用不完整')
     allowed=set(w['symbol'] for w in config['watchlist'])
-    if config.get('industry_enabled'):
+    from .research_only import symbols as research_only_symbols
+    research_only=research_only_symbols(store,config)
+    if config.get('industry_enabled') or research_only or body.get('research_membership'):
         from .universe import validate_publication
         members=validate_publication(store,config,body.get('research_membership'),items,completed,until)
         allowed.update(members)
     for d in items:
+        if d['symbol'] in research_only:raise ValueError('只研究标的不能进入组合交易候选')
         if d['route'] not in ('watchlist','dynamic','global') or d['key']!=d['route']+':'+d['identity']:raise ValueError('交易线路错误')
         if d['route']=='watchlist' and d['symbol'] not in allowed:raise ValueError('未经配置的自选股')
         cap=min(config['paper_max_stock_pct'],20 if d['route']=='watchlist' else 5)*100
         if d['action']=='ALLOW' and d['target_bps']>cap:raise ValueError('买入目标超过硬上限')
     raw={k:payload[k] for k in ('summary','risk_groups')};raw['decisions']=[{k:d[k] for k in ('key','action','target_bps','reason','evidence_ids','related_keys')} for d in items]
     from .portfolio_risk import state as risk_state
-    validate(raw,{'candidates':items,'halted':risk_state(store)['halted'],'valuation_ready':True,'gross_cap_bps':config['paper_max_gross_pct']*100,'symbol_cap_bps':config['paper_max_stock_pct']*100})
+    from .exposure import bundle_cap_pct
+    incoming_cap = bundle_cap_pct(incoming_bundle, config, at)[0]
+    validate(raw,{'candidates':items,'halted':risk_state(store)['halted'],'valuation_ready':True,'gross_cap_bps':incoming_cap*100,'symbol_cap_bps':config['paper_max_stock_pct']*100})
     store.db.execute('PRAGMA defer_foreign_keys=ON')
     for table,records in body['sources'].items():
         if table=='plans':
@@ -241,7 +271,8 @@ def receive_strategy(store,config,body,at):
     store.db.execute('DELETE FROM cloud_contracts')
     for k,c in body['contracts'].items():store.db.execute('INSERT INTO cloud_contracts VALUES(?,?,?)',(k,completed,canonical(c).decode()))
     put(store,'active_assets',body['active_assets'])
-    if config.get('industry_enabled'):put(store,'research_membership',body['research_membership'])
+    if body.get('research_membership'):put(store,'research_membership',body['research_membership'])
+    put(store,'exposure_caps',incoming_bundle)
     display_hashes=receive_display(store,body)
     # Key invalidations older than this decision no longer apply.
     put(store,'invalidated_keys',{k:v for k,v in (value(store,'invalidated_keys') or {}).items() if v>completed})

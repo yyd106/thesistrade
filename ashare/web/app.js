@@ -112,7 +112,7 @@ const when = s => s ? new Date(s).toLocaleString('zh-CN',{timeZone:'Asia/Shangha
 const shortTime = s => s ? new Date(s).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}) : '待安排';
 function traderText(value){
   let text=String(value??'');
-  const terms={CORE:'固定关注',DYNAMIC:'动态发现',FOCUS:'重点研究',COOLING:'待复核',ARCHIVED:'已归档',deferred:'等待重试',industry_v1:'第一版研究规则',industry_v2:'第二版研究规则',DELTA:'本次新增资料',FULL:'全部资料',UNREAD_DOCUMENT:'关键资料尚未读完',REVIEW_REQUIRED:'需要复核',INSUFFICIENT_DATA:'资料不足',MODEL_DEFERRED:'本次分析尚未完成',NO_ENTRY:'暂不买入',PAPER_TRADE:'满足条件后可模拟交易',ORDERS:'订单',DEMAND:'需求',LEAD_TIME:'交货周期',UNKNOWN:'待核实',MA20:'20日均价',MA60:'60日均价',bps:'基点',cninfo_industry:'巨潮资讯公告',cninfo_catalog:'公司公告目录',cninfo_pdf:'公告正文',cninfo_stock_catalog:'股票公告来源',tencent_quotes:'最新行情',tencent_daily:'历史价格',financials:'财务资料',financial_statement:'财务报表',market_comparison:'市场对照',comparison_series:'参考行情',research_analysis:'公司研究',research_pipeline:'研究结果保存',research_input:'资料整理',price_plan:'买卖参考价',review_analysis:'交易复盘',external_news:'行业与国际消息',external_news_list:'行业消息目录',external_news_article:'行业消息正文',official_news:'市场新闻',news_article:'新闻正文',report_inbox:'导入资料',report_inbox_item:'导入资料',slot_events:'盘中公告检查',ccgp:'中国政府采购网'};
+  const terms={CORE:'固定关注',DYNAMIC:'动态发现',FOCUS:'重点研究',COOLING:'待复核',ARCHIVED:'已归档',deferred:'等待重试',industry_v1:'第一版研究规则',industry_v2:'第二版研究规则',DELTA:'本次新增资料',FULL:'全部资料',UNREAD_DOCUMENT:'关键资料尚未读完',REVIEW_REQUIRED:'需要复核',INSUFFICIENT_DATA:'资料不足',MODEL_DEFERRED:'本次分析尚未完成',RESEARCH_ONLY:'参考区间，只研究不交易',NO_ENTRY:'暂不买入',PAPER_TRADE:'满足条件后可模拟交易',ORDERS:'订单',DEMAND:'需求',LEAD_TIME:'交货周期',UNKNOWN:'待核实',MA20:'20日均价',MA60:'60日均价',bps:'基点',cninfo_industry:'巨潮资讯公告',cninfo_catalog:'公司公告目录',cninfo_pdf:'公告正文',cninfo_stock_catalog:'股票公告来源',tencent_quotes:'最新行情',tencent_daily:'历史价格',daily_bars:'历史价格',financials:'财务资料',financial_statement:'财务报表',market_comparison:'市场对照',comparison_series:'参考行情',research_analysis:'公司研究',research_pipeline:'研究结果保存',research_input:'资料整理',price_plan:'买卖参考价',review_analysis:'交易复盘',external_news:'行业与国际消息',external_news_list:'行业消息目录',external_news_article:'行业消息正文',official_news:'市场新闻',news_article:'新闻正文',report_inbox:'导入资料',report_inbox_item:'导入资料',slot_events:'盘中公告检查',ccgp:'中国政府采购网'};
   text=text.replace(/\b(?:[A-Za-z]+_\w+|CORE|DYNAMIC|FOCUS|COOLING|ARCHIVED|DELTA|FULL|ORDERS|DEMAND|UNKNOWN|MA20|MA60|bps|deferred|financials|ccgp)\b/g,word=>terms[word]||(/_/.test(word)?'相关条件待核实':word));
   for(const [before,after] of Object.entries({'固定 Watchlist':'固定关注','Dynamic List':'动态发现','心跳':'状态更新','组合授权':'组合买入安排','授权租约':'研究有效期','持仓 / 委托保护':'继续管理已有持仓和委托','资料快照':'当时使用的资料','固定资料快照':'当时使用的资料','门禁':'条件核对','契约':'判断依据','归口':'处理安排','硬性闸门':'必须满足的条件','载荷':'资料内容','RAG':'资料检索','增量研究':'根据新增资料继续研究','签名资格':'交易端已确认的名单条件','方法门禁':'研究条件核对','初步准入':'初步研究条件','业务敞口':'相关业务规模','已有敞口':'已有持仓与委托','公司实际敞口':'公司相关业务规模','前向样本':'研究完成后持续观察的样本','前向校准':'事后验证','前向观察':'研究后的观察','前向跟踪':'研究后持续跟踪','元数据':'资料标题和日期','结构化':'整理后的','动态线路':'事件交易','本线路':'此类交易','候选队列':'待研究线索','证券身份':'证券代码与公司对应关系'}))text=text.split(before).join(after);
   return text;
@@ -129,7 +129,7 @@ const el = (tag,text,cls) => {const e=document.createElement(tag);if(text!=null)
 const names = {portfolio_strategy:'更新组合判断',global_research:'更新美股与现货研究',global_slot:'美股与现货盘面检查',dynamic_cycle:'更新新闻研究',dynamic_slot:'动态盘面检查',cycle:'更新研究',collect:'更新资料',research:'重新研究',repair:'补齐单股资料',NOT_NEEDED:'无需模型重复判断',slot:'检查盘面',review:'更新复盘',settle:'模拟撮合',
   PENDING:'等待处理',RUNNING:'正在处理',DONE:'已完成',FAILED:'未完成',INTERRUPTED:'已中断',MISSED:'已错过',SKIPPED_CATCHUP:'已跳过旧批次',
   CLOSED:'休市',CALENDAR_UNKNOWN:'交易日历待更新',DEFERRED:'等待模型可用',SUCCEEDED:'已完成',NOT_RUN:'尚未运行',
-  NO_ENTRY:'暂不买入',PAPER_TRADE:'可按条件模拟交易',ACTIVE:'有效',DRAFT:'尚未完成',EXPIRED:'已过期',SUPERSEDED:'已有新版',RISK_EXIT_ONLY:'仅允许减仓',
+  RESEARCH_ONLY:'参考区间，只研究不交易',NO_ENTRY:'暂不买入',PAPER_TRADE:'可按条件模拟交易',ACTIVE:'有效',DRAFT:'尚未完成',EXPIRED:'已过期',SUPERSEDED:'已有新版',RISK_EXIT_ONLY:'仅允许减仓',
   BUY:'买入',SELL:'卖出',HOLD:'不动',BLOCKED:'未执行',SUBMITTED:'已提交模拟委托',RECORDED:'已记录',OPEN:'等待成交',FILLED:'全部成交',
   OK:'正常',PARTIAL:'覆盖不全',REVIEW_REQUIRED:'有待核实事项',WATCH:'继续观察',INSUFFICIENT_DATA:'资料不足'};
 Object.assign(names,{CORE:'固定关注',DYNAMIC:'动态发现',FOCUS:'重点研究',COOLING:'待复核',ARCHIVED:'已归档',UNKNOWN:'状态待核对',CANCELLED:'已撤销',PARTIALLY_FILLED:'部分成交',REJECTED:'未获通过',WAITING:'等待证据',TRACKING:'持续跟踪',NEEDS_INPUT:'等待补充资料',STALE:'需要更新',PAUSED:'已暂停'});
@@ -382,6 +382,73 @@ function renderStrategyFreshness(s) {
   if(!view){box.replaceChildren();renderingCache.delete('strategy-freshness');return;}
   renderChanged('strategy-freshness',view,root=>drawStrategyFreshness(root,view));
 }
+// Read-only 今日操作清单: one action per stock plus the market-regime banner.
+// Everything shown is computed server-side; this panel only formats it.
+function drawTraderViewRow(row) {
+  const tr=el('tr',null,'trader-view-values');
+  const name=el('td'),act=el('td'),price=el('td'),buy=el('td'),stop=el('td'),target=el('td'),size=el('td'),why=el('td');
+  name.append(pageLink(row.name,stockPath(row.symbol)),el('p',row.symbol,'subtle'));
+  if(row.held_qty)name.append(el('p',row.held_qty+' 股 · '+percent(row.current_pct),'subtle'));
+  act.append(el('strong',row.headline,'trade-action action-'+String(row.action).toLowerCase()));
+  if(row.open_order)act.append(el('p','模拟账户已有'+(row.open_order.side==='SELL'?'卖出':'买入')+'委托 '+row.open_order.qty+' 股','subtle'));
+  if(row.price_cents!=null){
+    price.append(el('strong',money(row.price_cents)));
+    if(row.quote_stale)price.append(el('p','报价过时','caution'));
+    else if(row.quote_at)price.append(el('p',shortTime(row.quote_at),'subtle'));
+  }else price.append(el('p','—'));
+  // WATCH rows never display a buy zone, even when the backend still carries the plan's levels.
+  const zone=row.action!=='WATCH'&&row.zone_actionable&&row.buy_low_cents!=null&&row.buy_high_cents!=null;
+  buy.append(el('strong',zone?money(row.buy_low_cents)+'–'+money(row.buy_high_cents):'—'));
+  if(row.distance_pct!=null)buy.append(el('p','距区间 '+(row.distance_pct>0?'+':'')+row.distance_pct.toFixed(2)+'%','subtle'));
+  stop.append(el('p',row.stop_cents!=null?money(row.stop_cents):'—'));
+  if(row.cost_stop_cents!=null&&row.held_qty)stop.append(el('p','成本止损 '+money(row.cost_stop_cents),'subtle'));
+  target.append(el('p',row.target_cents!=null?money(row.target_cents):'—'));
+  if(row.suggested_pct!=null)size.append(el('strong',percent(row.suggested_pct)));
+  else if(row.held_qty)size.append(el('p','当前 '+percent(row.current_pct)));
+  else size.append(el('p','—'));
+  why.append(el('p',row.reason));
+  if(row.condition)why.append(el('p',row.condition,'subtle'));
+  if(row.portfolio_reason)why.append(el('p','组合：'+row.portfolio_reason,'subtle'));
+  [name,act,price,buy,stop,target,size,why].forEach((cell,i)=>cell.dataset.label=['股票','操作','现价','买入价','止损','目标','建议仓位','理由'][i]);
+  tr.append(name,act,price,buy,stop,target,size,why);
+  return tr;
+}
+function traderViewTable(rows) {
+  const t=el('table',null,'trader-view-table'),thead=el('thead'),hr=el('tr');
+  ['股票','操作','现价','买入价','止损','目标','建议仓位','理由'].forEach(title=>{const th=el('th',title);th.scope='col';hr.append(th);});
+  thead.append(hr);t.append(thead);
+  const body=el('tbody');rows.forEach(r=>body.append(drawTraderViewRow(r)));t.append(body);
+  return t;
+}
+function drawTraderView(box,view) {
+  const regime=view.regime||{},account=view.account||{},fresh=view.freshness||{},counts=view.counts||{};
+  const stance=regime.stale?'stale':({'AGGRESSIVE':'aggressive','NEUTRAL':'neutral','DEFENSIVE':'defensive'}[regime.stance]||'stale');
+  const head=el('div',null,'section-head');
+  head.append(el('h2','今日操作'),el('span',(regime.label||'未知')+' · 建议总仓 ≤ '+(account.suggested_max_pct!=null?account.suggested_max_pct+'%':'—'),'regime-badge regime-'+stance));
+  box.append(head);
+  const gross=el('p','当前模拟仓位 '+(account.gross_pct!=null?account.gross_pct+'%':'—'));
+  if(account.over_cap)gross.append(el('span','（高于市场状态建议上限）','caution'));
+  box.append(gross);
+  if(regime.summary)box.append(el('p',regime.summary));
+  if(regime.pending_change)box.append(el('p',regime.pending_change,'subtle'));
+  if(regime.close!=null&&regime.ma20!=null&&regime.ma60!=null)
+    box.append(el('p','沪深300 收盘 '+Number(regime.close).toFixed(2)+'，20日线 '+Number(regime.ma20).toFixed(2)+'，60日线 '+Number(regime.ma60).toFixed(2)+'（截至 '+(regime.as_of_day||'—')+'）','subtle'));
+  if(regime.enforced_note)box.append(el('p',regime.enforced_note,'subtle'));
+  box.append(el('p','研究更新 '+(fresh.research_at?shortTime(fresh.research_at):'—')+' · 组合判断 '+(fresh.portfolio_at?shortTime(fresh.portfolio_at):'—')+(fresh.portfolio_valid_until?'（有效至 '+shortTime(fresh.portfolio_valid_until)+'）':''),'subtle'));
+  if(fresh.stale)box.append(el('p',((fresh.notes||[]).join(''))+'价格仅供参考。','attention'));
+  box.append(el('p','卖出 '+(counts.SELL||0)+' · 减仓 '+(counts.REDUCE||0)+' · 买入 '+(counts.BUY||0)+' · 等买点 '+(counts.WAIT_PRICE||0)+' · 持有 '+(counts.HOLD||0)+' · 观望 '+(counts.WATCH||0),'subtle'));
+  const actionable=(view.rows||[]).filter(r=>r.action!=='WATCH'),watch=(view.rows||[]).filter(r=>r.action==='WATCH');
+  if(actionable.length)box.append(traderViewTable(actionable));
+  else box.append(el('p','今天没有需要操作的股票。','empty'));
+  if(watch.length){const fold=details('观望（'+watch.length+' 只）','trader-view:watch');fold.append(traderViewTable(watch));box.append(fold);}
+  if(view.notice)box.append(el('p',view.notice,'subtle'));
+}
+function renderTraderView(s) {
+  const box=$('trader-view');if(!box)return;
+  const view=canViewResearch()?s.trader_view:null;box.hidden=!view;
+  if(!view){box.replaceChildren();renderingCache.delete('trader-view');return;}
+  renderChanged('trader-view',view,root=>drawTraderView(root,view));
+}
 function table(id,headers,rows,empty='暂无记录。') {
   renderChanged(id,rows,box=>{if(!rows.length){box.append(el('p',empty,'empty'));return;}
     const t=el('table'),head=el('tr');headers.forEach(h=>head.append(el('th',h)));t.append(head);
@@ -394,6 +461,7 @@ function addList(parent,title,items) {
 }
 function researchDecision(item,marketPhase) {
   const p=item.plan;
+  if(item.research_only||p?.payload?.kind==='RESEARCH_ONLY')return {title:'参考区间，只研究不交易',reason:'继续采集与研究；价位仅作参考，不生成委托。',ready:false};
   const pending=openOrderSummary(item);
   if(pending)return {title:item.open_orders.some(o=>o.status==='UNKNOWN')?'委托状态待核对':'已有委托，等待成交',reason:pending,ready:false};
   if(item.archived||item.research_status==='ARCHIVED')return {title:'已归档，保留历史研究',reason:'不再据此新增买入；已有持仓和未完成委托继续管理。',ready:false};
@@ -529,7 +597,7 @@ function renderRecovery(card,item) {
   if(r.action){const b=el('button','补齐资料并重研');b.dataset.run='repair';b.dataset.symbol=item.symbol;b.dataset.feedback=target;b.dataset.idleLabel=b.textContent;b.addEventListener('click',()=>runAction(b));section.append(b,el('p','仅处理本股票，不下单；已读内容不重复整篇研究。','subtle'));}
   const help=link('查看补资料与接口设置步骤','/help/recovery');help.className='admin-only';section.append(help,box);card.append(section);
   const reviews=item.plan?.payload?.event_reviews||[];
-  if(reviews.length){const checks=details('事项核验记录','event-checks:'+item.symbol);reviews.forEach(r=>{const row=el('section');row.append(el('h4',r.title),el('p',r.status==='VERIFIED'?'证据与规则核验通过；此事项不再单独阻止买入。':'尚未通过：'+r.missing.join('；')));const cash=r.facts?.cash_per_share||(r.facts?.cash_per_share_cents?money(r.facts.cash_per_share_cents):null);if(cash)row.append(el('p','每股税前现金分红 '+cash+' 元 · 登记日 '+(r.facts.record_date||'—')+' · 除息日 '+(r.facts.ex_date||'—')));if(r.facts?.follows)row.append(el('p','随分红实施发布的公告'+(r.facts.ex_date?'（除息日 '+r.facts.ex_date+'）':'')+'：本身不调整价格，随对应的实施公告一并核验。','subtle'));row.append(link('核验原文','/api/document?id='+encodeURIComponent(r.doc_id)));checks.append(row);});checks.append(el('p','通过单个事项不代表可以下单；仍需完整研究、价格、资金及盘面条件同时满足。','subtle'));card.append(checks);}
+  if(reviews.length){const checks=details('事项核验记录','event-checks:'+item.symbol);reviews.forEach(r=>{const row=el('section');row.append(el('h4',r.title),el('p',({'VERIFIED':'证据与规则核验通过；此事项不再单独阻止买入。','OUT_OF_WINDOW':'除息日早于可比均线窗口，无需调整价格；不再单独阻止买入。','APPROXIMATED':'差异化现金分红已按交易所口径近似调整；不再单独阻止买入。'})[r.status]||'尚未通过：'+r.missing.join('；')));const cash=r.facts?.cash_per_share||(r.facts?.cash_per_share_cents?money(r.facts.cash_per_share_cents):null);if(cash)row.append(el('p','每股税前现金分红 '+cash+' 元 · 登记日 '+(r.facts.record_date||'—')+' · 除息日 '+(r.facts.ex_date||'—')));if(r.facts?.follows)row.append(el('p','随分红实施发布的公告'+(r.facts.ex_date?'（除息日 '+r.facts.ex_date+'）':'')+'：本身不调整价格，随对应的实施公告一并核验。','subtle'));row.append(link('核验原文','/api/document?id='+encodeURIComponent(r.doc_id)));checks.append(row);});checks.append(el('p','通过单个事项不代表可以下单；仍需完整研究、价格、资金及盘面条件同时满足。','subtle'));card.append(checks);}
 }
 function drawFollowups(box,data) {
   const items=data.items||[],needs=items.filter(i=>['USER','ENGINEERING'].includes(i.owner));
@@ -1168,7 +1236,7 @@ function render(s) {
   const risk=$('portfolio-risk');if(risk){risk.hidden=!s.account.investment_policy;risk.textContent='无杠杆模拟 · 持有周期按天 · 每小时复核'+(s.account.risk?.drawdown_bps!=null?' · 当前回撤 '+(s.account.risk.drawdown_bps/100).toFixed(2)+'%':'')+' / 风控阈值25%';}
   if(s.research_lease){const r=s.research_lease;attention.append(el('p',r.active?'组合研究已同步 · 最近完成 '+when(r.completed_at):'本地组合研究已过期或尚未就绪：暂停新买入，继续持仓风险检查。',r.active?'subtle':'caution'));}
   attention.hidden=!attention.textContent;
-  renderWatchlist(s);renderAccount(s);renderWithdrawals(s);renderActivity(s);renderFollowups(s);renderDynamic(s);renderPortfolioStrategy(s);renderStrategyFreshness(s);
+  renderWatchlist(s);renderAccount(s);renderWithdrawals(s);renderActivity(s);renderFollowups(s);renderDynamic(s);renderPortfolioStrategy(s);renderStrategyFreshness(s);renderTraderView(s);
   if(!editing)$('watchlist').value=fixedWatchlist(s).map(w=>w.symbol+' '+w.name).join('\n');
   $('settings-summary').textContent=fixedWatchlist(s).length+' 只固定关注股票 · '+(s.scheduler_enabled?'自动运行已开启':'已暂停');
   $('schedule').textContent=scheduleSummary(s.schedule);
@@ -1459,6 +1527,7 @@ function syncResearchAccess(data){
 }
 function resultDecision(item){
   const p=item.plan||item.trade_plan;
+  if(item.research_only||p?.payload?.kind==='RESEARCH_ONLY')return {title:'参考区间，只研究不交易',reason:'',ready:false};
   const expired=p&&(p.effective_status==='EXPIRED'||p.status==='EXPIRED'||(p.valid_until&&Date.parse(p.valid_until)<=Date.parse(state?.at||new Date().toISOString())));
   const title=item.entry_allowed===false?'暂停新增买入':expired?'参考计划已过期':!p?'等待形成参考计划':p.payload?.kind==='PAPER_TRADE'?'按有效计划检查交易条件':'当前暂不新增买入';
   return {title,reason:'',ready:false};
@@ -1468,8 +1537,8 @@ function applyResearchVisibility(){
     for(const id of ['daily-review-panel','score-diagnostics-section','proposal-section','supervision-section','dynamic-tab'])if($(id))$(id).hidden=false;
     return;
   }
-  for(const id of ['industry-research-panel','portfolio-strategy-panel','followup-section','observation-archive','strategy-freshness','daily-review-panel','score-diagnostics-section','proposal-section','supervision-section','dynamic-tab','dynamic-section'])if($(id))$(id).hidden=true;
-  for(const id of ['industry-hypotheses','portfolio-strategy-items','portfolio-strategy-groups','portfolio-strategy-summary','followups','observation-archive-items','reviews','proposals','supervision','score-diagnostics','macro-cases','macro-followup','macro-archive','dynamic-news'])if($(id)){$(id).replaceChildren();renderingCache.delete(id);}
+  for(const id of ['industry-research-panel','portfolio-strategy-panel','followup-section','observation-archive','strategy-freshness','trader-view','daily-review-panel','score-diagnostics-section','proposal-section','supervision-section','dynamic-tab','dynamic-section'])if($(id))$(id).hidden=true;
+  for(const id of ['industry-hypotheses','portfolio-strategy-items','portfolio-strategy-groups','portfolio-strategy-summary','followups','observation-archive-items','reviews','proposals','supervision','score-diagnostics','macro-cases','macro-followup','macro-archive','dynamic-news','trader-view'])if($(id)){$(id).replaceChildren();renderingCache.delete(id);}
   if($('activity-description'))$('activity-description').textContent='查看已提交的模拟交易和成交结果。';
   observationArchiveData=null;observationArchiveOffset=0;
   if($('watchlist-detail-hint'))$('watchlist-detail-hint').textContent='持仓市值从高到低 · 点名称查看行情与成交';
@@ -1801,7 +1870,7 @@ function renderWatchlist(s){
     const t=watchlistTable();
     if(!ordered.length){drawWatchlistEmpty(box);return;}
     for(const item of ordered){const row=el('tr'),name=el('td'),holding=el('td',null,'holding-value'),quote=el('td'),buy=el('td'),sell=el('td'),decision=el('td');
-      const h=holdings.get(item.symbol),p=item.plan,l=p?.payload?.levels,discovery=discoveries.get(item.symbol),v=!canViewResearch()?resultDecision(item):item.entry_allowed===false?{title:item.entry_reason||'暂停新增买入',reason:item.reason||'等待补充证据',ready:false}:item.research_status==='LEAD'?{title:'研究线索，尚不能买入',reason:item.reason,ready:false}:item.discovery?{title:discovery.status==='NEEDS_REVIEW'?'影响待复核':macroDirections[discovery.direction],reason:'动态发现标的，持续观察事件条件与后续证据。',ready:false}:researchDecision(item,s.market_phase);
+      const h=holdings.get(item.symbol),p=item.plan,l=p?.payload?.levels,discovery=discoveries.get(item.symbol),v=item.research_only||p?.payload?.kind==='RESEARCH_ONLY'?researchDecision(item):!canViewResearch()?resultDecision(item):item.entry_allowed===false?{title:item.entry_reason||'暂停新增买入',reason:item.reason||'等待补充证据',ready:false}:item.research_status==='LEAD'?{title:'研究线索，尚不能买入',reason:item.reason,ready:false}:item.discovery?{title:discovery.status==='NEEDS_REVIEW'?'影响待复核':macroDirections[discovery.direction],reason:'动态发现标的，持续观察事件条件与后续证据。',ready:false}:researchDecision(item,s.market_phase);
       name.append(item.discovery&&!s.industry?.enabled?el('strong',item.name):pageLink(item.name,stockPath(item.symbol)),el('p',item.symbol,'subtle'),el('p',h?h.qty+' 股 · '+percent(h.weight_pct):'未持仓','subtle'));
       if(item.discovery)name.append(el('span',poolTierLabels[discovery.pool_tier]||'动态发现','badge'));
       if(item.research_status)name.append(el('p',researchStates[item.research_status],'subtle'));

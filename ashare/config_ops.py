@@ -23,14 +23,14 @@ OPERATIONAL = {'collection_times', 'review_time', 'evaluation_time', 'weekly_rep
                'external_news_lookback_days', 'pdf_downloads_per_stock', 'pdf_revision_checks_per_stock', 'document_recheck_hours',
                'announcement_lookback_days', 'max_announcement_pages', 'quote_poll_seconds', 'announcement_poll_seconds',
                'recovery_interval_seconds', 'recovery_daily_limit', 'research_attempts', 'backup_hourly_keep', 'backup_daily_keep',
-               'disk_free_warn_gb', 'db_size_warn_gb', 'evaluation_enabled', 'shadow_books_enabled', 'model_timeout_seconds',
+               'disk_free_warn_gb', 'db_size_warn_gb', 'storage_budget_gb', 'evaluation_enabled', 'shadow_books_enabled', 'model_timeout_seconds',
                'dynamic_model_timeout_seconds', 'scheduler_enabled', 'quote_fallback_enabled', 'evaluation_min_trading_days',
                'evaluation_auto_trading_days', 'reports_sync_enabled', 'supervision_enabled', 'supervision_timeout_seconds',
                'strategy_freshness_enabled'}
 STRATEGY = {'paper_entry_band_bps', 'paper_stop_loss_bps', 'paper_take_profit_bps', 'plan_max_age_hours', 'model_name',
             'model_reasoning_effort', 'watchlist', 'dynamic_enabled', 'max_packet_chars', 'max_news_packet_pct',
             'evaluation_horizon_days', 'shadow_risk_per_trade_bps', 'shadow_start_date', 'research_topics',
-            'comparison_peers', 'business_keywords', 'model_enabled', 'industry_enabled', 'industry_policy', 'global_macro_context_enabled'}
+            'comparison_peers', 'business_keywords', 'model_enabled', 'industry_enabled', 'industry_policy', 'global_macro_context_enabled', 'sec_enabled', 'exposure_regime'}
 
 # Written only by `./agent reports setup` (where the node's reports go), never by `config set`.
 SETUP = {'reports_remote'}
@@ -170,6 +170,9 @@ def apply(config_path, changes, *, reason, approved_by=None, approval_id=None, d
                     receipt = approvals.check_receipt(store, approval_id, kind='CONFIG', subject_id=_subject(path),
                                                        action='APPLY', snapshot=prepared['snapshot'])
                     approvals.reserve(store, approval_id, operation_id)
+                if 'watchlist' in changes:
+                    from .research_only import activate_inside, configured
+                    activate_inside(store, configured(prepared['checked']), operation_id,config=prepared['checked'])
                 payload = {k: prepared[k] for k in ('entries', 'snapshot', 'before_sha', 'after_sha', 'build_before', 'build_after')}
                 payload.update(at=now(), reason=reason.strip(), actor=receipt.get('actor') if receipt else None,
                                approval_id=approval_id)

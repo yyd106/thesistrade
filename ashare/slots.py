@@ -195,6 +195,8 @@ def run_slot(store,config,scheduled_at=None,use_model=True,refresh_fn=None,model
         symbols=sorted({i['symbol'] for i in company_targets(store,config,cutoff)}|set(a['positions']))
         entries=[]
         for sym in symbols:
+            from .research_only import contains
+            if contains(store,config,sym):continue
             plan=active_plan(store,sym,cutoff);q=store.latest_quote(sym,cutoff)
             if not plan and quote_ok(q,config,cutoff):
                 plan=protective_plan(store,config,sym,a['positions'].get(sym),q,cutoff)

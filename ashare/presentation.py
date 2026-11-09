@@ -6,7 +6,7 @@ SOURCE_NAMES = {
     'financials':'公司财务底稿','financial_statement':'财务报表','market_comparison':'量价与市场对照','comparison_series':'业务参考行情',
     'external_news':'外部新闻采集','external_news_list':'行业与国际消息目录','external_news_article':'行业与国际消息正文',
     'un_news':'联合国国际新闻','mofcom_news':'商务部贸易与产业消息',
-    'tencent_quotes':'最新行情', 'tencent_daily':'历史价格与均线',
+    'tencent_quotes':'最新行情', 'tencent_daily':'历史价格与均线', 'daily_bars':'历史价格与均线',
     'cninfo_stock_catalog':'股票与公告来源匹配', 'cninfo_catalog':'公司公告目录',
     'cninfo_pdf':'公告或报告正文', 'official_news':'市场新闻目录', 'news_article':'市场新闻正文',
     'report_inbox':'本地资料导入', 'report_inbox_item':'本地资料导入',
@@ -21,6 +21,7 @@ IMPACTS = {
     'external_news_article':'尚未核实这条外部消息的完整内容，对公司的影响仍不确定。',
     'tencent_quotes':'无法确认最新价格，等待行情恢复后再检查交易机会。',
     'tencent_daily':'暂时无法可靠判断价格趋势或更新买卖参考价。',
+    'daily_bars':'暂时无法可靠判断价格趋势或更新买卖参考价。',
     'cninfo_stock_catalog':'无法确认该股票的公告来源，可能遗漏最新披露。',
     'cninfo_catalog':'可能遗漏新公告，本轮研究不能视为已覆盖全部披露。',
     'cninfo_pdf':'尚未读到这份资料的完整内容，不能据此确认交易判断。',
@@ -119,7 +120,7 @@ def outstanding_failures(store, symbol,config=None):
              **failure_help(r['source'],r['detail'],r['title'],r['resource_key'],config)} for r in rows]
 
 
-INTERNAL_WORDS = re.compile(r'paper_baseline_\w+|REVIEW_REQUIRED|INSUFFICIENT_DATA|NO_ENTRY|\bWATCH\b|'
+INTERNAL_WORDS = re.compile(r'paper_baseline_\w+|REVIEW_REQUIRED|INSUFFICIENT_DATA|NO_ENTRY|RESEARCH_ONLY|\bWATCH\b|'
     r'\bfeatures\b|\bsource_checks\b|\bmandatory_coverage\b|\bFTS5\b|\bRAG\b|\bJSON\b|'
     r'\b(?:KeyError|TypeError|ValueError|UNADJUSTED|qfqday|cninfo_\w+|tencent_\w+)\b', re.I)
 
@@ -129,7 +130,7 @@ def trader_text(value):
     text=str(value or '')
     replacements={
         'paper_baseline_v1':'当前模拟交易规则', 'REVIEW_REQUIRED':'需要进一步核实',
-        'INSUFFICIENT_DATA':'资料不足', 'NO_ENTRY':'暂不买入', 'WATCH':'继续观察',
+        'INSUFFICIENT_DATA':'资料不足', 'NO_ENTRY':'暂不买入', 'RESEARCH_ONLY':'参考区间，只研究不交易', 'WATCH':'继续观察',
         'features':'价格趋势数据', 'qfqday':'历史价格', 'FTS5':'资料检索', 'RAG':'资料检索',
         'bps':'基点', '类型化核验':'逐项核对', '技术模拟':'模拟交易',
         '技术特征':'价格走势指标', '财务估值未接入':'财务与估值资料不足',

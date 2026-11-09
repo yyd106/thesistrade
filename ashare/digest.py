@@ -21,7 +21,7 @@ BLOCKER_NAMES = {'RESEARCH_VETO': '研究否决', 'TREND_NOT_CONFIRMED': '趋势
                  'FINANCIAL_BASELINE_INCOMPLETE': '财务底稿不全', 'MARKET_CONTEXT_INCOMPLETE': '市场对照不全',
                  'MODEL_NOT_READY': '研究未完成', 'LOT_EXCEEDS_CAP': '单手超单股上限', 'UNSUPPORTED_BOARD': '板块不支持'}
 RESEARCH_NAMES = {'WATCH': '可观察', 'REVIEW_REQUIRED': '需复核', 'INSUFFICIENT_DATA': '资料不足'}
-PLAN_NAMES = {'PAPER_TRADE': '可开仓', 'NO_ENTRY': '不开仓', 'RISK_EXIT_ONLY': '只减仓', 'WAIT': '等待'}
+PLAN_NAMES = {'PAPER_TRADE': '可开仓', 'NO_ENTRY': '不开仓', 'RESEARCH_ONLY':'参考区间，只研究不交易', 'RISK_EXIT_ONLY': '只减仓', 'WAIT': '等待'}
 ACTION_NAMES = {'ALLOW': '放行', 'HOLD': '保持', 'PAUSE': '暂停', 'REDUCE': '减仓', 'EXIT': '退出'}
 STANCE_NAMES = {'LONG': '做多', 'WAIT': '观望'}
 STATUS_NAMES = {'SUCCEEDED': '成功', 'DONE': '完成', 'FAILED': '失败', 'DEFERRED': '推迟', 'INTERRUPTED': '中断', 'PENDING': '排队',
@@ -299,7 +299,7 @@ def research(store, config, a, b, spans=(), as_of=None):
         old_kind = (_json(old['payload_json'], {}) or {}).get('kind') if old else None
         old_action = (((_json(old['result_json'], {}) or {}).get('stocks') or [{}])[0]).get('action') if old else None
         stocks.append({'symbol': symbol, 'name': name, 'research': stock.get('action'), 'plan': payload.get('kind'),
-                       'blockers': _blockers(payload.get('blockers')), 'source': source,
+                       'blockers': _blockers(payload.get('research_gaps') if payload.get('kind')=='RESEARCH_ONLY' else payload.get('blockers')), 'source': source,
                        'changed': bool(old) and (old_kind != payload.get('kind') or old_action != stock.get('action'))})
     global_plans = []
     for r in _rows(store, 'SELECT g.symbol,g.created_at,g.payload_json FROM global_plans g WHERE g.created_at<? AND g.rowid=(SELECT rowid FROM global_plans x '
@@ -308,12 +308,13 @@ def research(store, config, a, b, spans=(), as_of=None):
         global_plans.append({'symbol': r['symbol'], 'stance': (payload.get('analysis') or {}).get('stance'), 'plan': payload.get('kind'),
                              'blockers': _blockers(payload.get('blockers')), 'updated': r['created_at'] >= a})
     cases = Counter(r['status'] for r in _rows(store, 'SELECT status FROM dynamic_cases WHERE created_at>=? AND created_at<?', (a, b)))
+    from .evaluation import trading_gate_counts
     return {'model_studies': Counter(s['model_status'] for s in studies), 'renewed': renewed[0]['n'] if renewed else 0,
             'studies_offline': sum(1 for s in studies if inside(s['created_at'], spans)),
             'unsuccessful_offline': sum(1 for s in studies if s['model_status'] != 'SUCCEEDED' and inside(s['created_at'], spans)),
             'analysis_failures': len(failures), 'analysis_failures_offline': sum(1 for f in failures if inside(f['checked_at'], spans)),
             'models': dict(models), 'stocks': stocks, 'global': global_plans, 'dynamic_new_cases': dict(cases),
-            'industry': industry_research(store, a, b, as_of)}
+            'industry': industry_research(store, a, b, as_of),'trading_gates':trading_gate_counts(store,a,b)}
 
 
 def portfolio(store, a, b):
@@ -603,6 +604,8 @@ def build(store, config, day):
     from .build import info
     d = {'day': day, 'generated_at': normalize_time(now()), 'window': {'from': a, 'to': b}, 'version': __version__,
          'build_id': info(config, store)['build_id']}
+    from .monthly_agenda import collect as monthly_agenda
+    d['monthly_decision_agenda'] = monthly_agenda(store, day, d['generated_at'])
     # A past report ends at that day's boundary; today's report stops at its
     # generation time. Current plan labels cannot be reconstructed historically.
     from .freshness_sync import local_view
@@ -735,8 +738,10 @@ def markdown(d):
     names = _job_names()
     b = d['window']['to']
     L = [f"# 运行日报 {d['day']}（北京时间）", '',
-         f"程序根据原始记录生成，不含模型判断。版本 {d['version']}，build {d['build_id']}，生成于 {local(d['generated_at']).strftime('%m-%d %H:%M')}。", '',
-         '## 需要关注', '']
+         f"程序根据原始记录生成，不含模型判断。版本 {d['version']}，build {d['build_id']}，生成于 {local(d['generated_at']).strftime('%m-%d %H:%M')}。"]
+    from .monthly_agenda import markdown as monthly_agenda_markdown
+    L += monthly_agenda_markdown(d.get('monthly_decision_agenda'))
+    L += ['', '## 需要关注', '']
     L += [f'- {f}' for f in d['flags']] or ['- 无。']
     v = d['availability']
     L += ['', '## 本机在线', ''] + _failed(v)
@@ -767,6 +772,9 @@ def markdown(d):
     for s in r['stocks']:
         L.append(f"| {s['name']} | {RESEARCH_NAMES.get(s['research'], s['research'] or '—')} | {PLAN_NAMES.get(s['plan'], s['plan'] or '—')} | "
                  f"{s['blockers']} | {s['source']} | {'变化' if s['changed'] else '—'} |")
+    if r.get('trading_gates'):
+        g=r['trading_gates']
+        L.append(f"- 交易门槛统计分母 {g['trading_plan_count']} 个计划条目；排除只研究 {g['research_only_excluded']}、保护退出 {g['protective_plans_excluded']}。按当时计划分类，研究评分继续保留。")
     if r['global']:
         L += ['', '- 全球资产：' + '；'.join(f"{g['symbol']} {STANCE_NAMES.get(g['stance'], g['stance'] or '—')}、{PLAN_NAMES.get(g['plan'], g['plan'] or '—')}"
                                             + ('' if g['updated'] else '（当天未更新）') for g in r['global']) + '。']

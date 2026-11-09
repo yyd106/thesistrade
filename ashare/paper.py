@@ -122,7 +122,87 @@ def market_guard(symbol,q,side='BUY'):
     return None
 
 
-def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_input_json=None,portfolio_exit=False):
+def buy_order_terms(store,config,plan,q,at,*,account=None,persist_recheck=False):
+    """Read-only entry eligibility and exact order terms; submit opts into recheck audit.
+
+    Call after execution's risk/withdrawal refresh, or after their read-only forecast.
+    No order, ledger, configuration or model write is performed here.
+    """
+    from .cloud_runtime import execution_allowed
+    from .research_only import contains
+    from . import portfolio_strategy as ps
+    execution_allowed(store,config,at,'BUY')
+    if config['mode']!='paper':raise ValueError('RESEARCH_MODE')
+    at=normalize_time(at);symbol=plan['symbol']
+    if contains(store,config,symbol):raise ValueError('RESEARCH_ONLY')
+    fresh=store.db.execute('SELECT * FROM plans WHERE id=?',(plan['id'],)).fetchone()
+    if fresh and fresh['symbol']!=symbol:raise ValueError('PLAN_SYMBOL_MISMATCH')
+    if not fresh or fresh['status']!='ACTIVE' or not fresh['activated_at']<=at<fresh['valid_until']:
+        raise ValueError('PLAN_INACTIVE')
+    if phase(at)!='CONTINUOUS':raise ValueError('MARKET_CLOSED')
+    if not quote_ok(q,config,at):raise ValueError('STALE_QUOTE')
+    guard=market_guard(symbol,q,'BUY')
+    if guard:raise ValueError(guard)
+    a=account if account is not None else _account_without_initialize(store,at)
+    p=a['positions'].get(symbol,{'qty':0,'sellable_qty':0,'cost_cents':0})
+    params=json.loads(fresh['payload_json']);levels=params.get('levels') or {}
+    price=q['price_cents'];lot=config['paper_lot_size']
+    if any(o['status']=='UNKNOWN' for o in a['orders']):raise ValueError('UNKNOWN_ORDER_RECONCILE_REQUIRED')
+    if any(o['symbol']==symbol for o in a['orders']):raise ValueError('EXISTING_OPEN_ORDER')
+    from .plan_recheck import check
+    blockers=check(store,config,dict(fresh),at,persist=persist_recheck)
+    if blockers:raise ValueError('PLAN_RECHECK: '+','.join(blockers))
+    if params['kind']!='PAPER_TRADE':raise ValueError('NO_ENTRY_PLAN')
+    if not levels['buy_low_cents']<=price<=levels['buy_high_cents']:raise ValueError('OUTSIDE_BUY_ZONE')
+    if a['withdrawal_pending']:raise ValueError('WITHDRAWAL_PENDING')
+    if not a['valuation_complete']:raise ValueError('VALUATION_INCOMPLETE')
+    limit=min(levels['buy_high_cents'],(price*(10000+config['paper_slippage_bps'])+9999)//10000)
+    stock_budget=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100-(p['qty']+a.get('dynamic_positions',{}).get(symbol,{}).get('qty',0))*price
+    from .exposure import gross_cap_pct
+    gross_budget=a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-a['reserved_cents']
+    minimum=lot_rules(symbol)['min_buy']
+    other=min(gross_budget,a['available_cents'],ps.buy_budget(store,config,'watchlist',symbol,at,a))
+    budget=min(stock_budget,other)
+    qty=max(0,budget//limit//lot*lot)
+    while qty>0 and qty*limit+fee(config,'BUY',qty*limit)>budget:qty-=lot
+    if qty<minimum:
+        # Name the binding constraint: a whole minimum lot larger than the per-stock cap is structural.
+        smallest=minimum*limit+fee(config,'BUY',minimum*limit)
+        cap=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100
+        raise ValueError('LOT_EXCEEDS_CAP' if smallest>cap and other>=smallest else 'INSUFFICIENT_BUDGET_OR_TARGET_REACHED')
+    reserve=qty*limit+fee(config,'BUY',qty*limit)
+    return {'qty':qty,'limit_cents':limit,'reserved_cents':reserve}
+
+
+def preview_buy(store,config,plan,q,at):
+    """Conservative read-only forecast for the current authoritative account.
+
+    It does not refresh/latch risk, create withdrawal cycles, cache a plan recheck,
+    or reserve cash. submit still rechecks inside its cash transaction.
+    """
+    from .cloud_runtime import execution_allowed
+    from .portfolio_risk import evaluate_inside, valuation_ready
+    from .withdrawals import pending
+    from .finance import withdrawal_tier
+    try:
+        execution_allowed(store,config,at,'BUY')
+        a=_account_without_initialize(store,at)
+        if evaluate_inside(store,config,at,a,persist=False)['halted']:
+            raise ValueError('ACCOUNT_DRAWDOWN_HALT')
+        if pending(store):raise ValueError('WITHDRAWAL_PENDING')
+        # Forecast refresh_inside's threshold transition without writing its cycle.
+        cycle=store.db.execute('SELECT * FROM withdrawal_cycles WHERE account_id=? AND stage=?',
+                               ('DEMO_PAPER',a['current_stage'])).fetchone()
+        threshold,_=withdrawal_tier(a['current_stage'])
+        if a['equity_cents']>threshold and valuation_ready(store,a,at):
+            if not cycle or (cycle['status']=='CANCELLED' and json.loads(cycle['payload_json']).get('rearm_below')):
+                raise ValueError('WITHDRAWAL_PENDING')
+        return {'status':'READY',**buy_order_terms(store,config,plan,q,at,account=a)}
+    except (ValueError,KeyError,TypeError,ZeroDivisionError) as exc:
+        return {'status':'BLOCKED','reason':str(exc)}
+
+
+def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_input_json=None,portfolio_exit=False,sell_qty=None,exposure_order=None):
     from .cloud_runtime import execution_allowed
     execution_allowed(store,config,at)
     """A single SQLite write transaction serializes cash reservation across all stocks."""
@@ -136,6 +216,8 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
     if side=='BUY' and halted(store):return {'status':'BLOCKED','reason':'ACCOUNT_DRAWDOWN_HALT'}
     store.db.execute('BEGIN IMMEDIATE')
     try:
+        from .research_only import contains
+        if contains(store,config,symbol):raise ValueError('RESEARCH_ONLY')
         refresh_inside(store,config,at)
         if side=='BUY' and pending(store):
             store.db.commit();return {'status':'BLOCKED','reason':'WITHDRAWAL_PENDING'}
@@ -147,9 +229,11 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
         if old:
             store.db.commit();return dict(old)
         fresh=store.db.execute('SELECT * FROM plans WHERE id=?',(pid,)).fetchone()
+        if fresh and fresh['symbol']!=symbol:raise ValueError('PLAN_SYMBOL_MISMATCH')
+        if fresh and json.loads(fresh['payload_json']).get('kind')=='RESEARCH_ONLY':raise ValueError('RESEARCH_ONLY')
         from . import portfolio_strategy as ps
         reduction_qty=ps.exit_quantity(store,config,'watchlist',symbol,at,q) if side=='SELL' and portfolio_exit else 0
-        if not fresh or (not reduction_qty and (fresh['status']!='ACTIVE' or not fresh['activated_at']<=at<fresh['valid_until'])):
+        if not fresh or (not reduction_qty and sell_qty is None and (fresh['status']!='ACTIVE' or not fresh['activated_at']<=at<fresh['valid_until'])):
             raise ValueError('PLAN_INACTIVE')
         if phase(at)!='CONTINUOUS':raise ValueError('MARKET_CLOSED')
         if not quote_ok(q,config,at):raise ValueError('STALE_QUOTE')
@@ -163,30 +247,11 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
         if any(o['status']=='UNKNOWN' for o in a['orders']):raise ValueError('UNKNOWN_ORDER_RECONCILE_REQUIRED')
         if same:raise ValueError('EXISTING_OPEN_ORDER')
         if side=='BUY':
-            from .plan_recheck import check
-            blockers=check(store,config,dict(fresh),at)
-            if blockers:raise ValueError('PLAN_RECHECK: '+','.join(blockers))
-            if params['kind']!='PAPER_TRADE':raise ValueError('NO_ENTRY_PLAN')
-            if not levels['buy_low_cents']<=price<=levels['buy_high_cents']:raise ValueError('OUTSIDE_BUY_ZONE')
-            if a['withdrawal_pending']:raise ValueError('WITHDRAWAL_PENDING')
-            if not a['valuation_complete']:raise ValueError('VALUATION_INCOMPLETE')
-            limit=min(levels['buy_high_cents'],(price*(10000+config['paper_slippage_bps'])+9999)//10000)
-            stock_budget=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100-(p['qty']+a.get('dynamic_positions',{}).get(symbol,{}).get('qty',0))*price
-            gross_budget=a['equity_cents']*config['paper_max_gross_pct']//100-a['market_value_cents']-a['reserved_cents']
-            minimum=lot_rules(symbol)['min_buy']
-            other=min(gross_budget,a['available_cents'],ps.buy_budget(store,config,'watchlist',symbol,at,a))
-            budget=min(stock_budget,other)
-            qty=max(0,budget//limit//lot*lot)
-            while qty>0 and qty*limit+fee(config,'BUY',qty*limit)>budget:qty-=lot
-            if qty<minimum:
-                # Name the binding constraint: a whole minimum lot larger than the per-stock cap is structural.
-                smallest=minimum*limit+fee(config,'BUY',minimum*limit)
-                cap=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100
-                raise ValueError('LOT_EXCEEDS_CAP' if smallest>cap and other>=smallest else 'INSUFFICIENT_BUDGET_OR_TARGET_REACHED')
-            reserve=qty*limit+fee(config,'BUY',qty*limit)
+            terms=buy_order_terms(store,config,dict(fresh),q,at,account=a,persist_recheck=True)
+            qty,limit,reserve=terms['qty'],terms['limit_cents'],terms['reserved_cents']
         else:
-            qty=min(p['sellable_qty'],reduction_qty) if portfolio_exit else p['sellable_qty']
-            qty=sell_quantity(symbol,qty,p['qty'],p['sellable_qty'])
+            wanted=sell_qty if sell_qty is not None else (min(p['sellable_qty'],reduction_qty) if portfolio_exit else p['sellable_qty'])
+            qty=sell_quantity(symbol,wanted,p['qty'],p['sellable_qty'])
             if qty<=0:raise ValueError('T_PLUS_ONE_OR_NO_POSITION')
             limit=max(1,price*(10000-config['paper_slippage_bps'])//10000)
             reserve=0
@@ -203,7 +268,13 @@ def submit(store,config,decision_id,plan,side,q,at,*,decision_record=None,slot_i
                 store.db.execute('UPDATE slots SET input_json=? WHERE id=?',(slot_input_json,decision_record['slot_id']))
         store.db.execute('INSERT INTO paper_orders VALUES(?,?,?,?,?,?,0,?,?,?,?,?)',
             (oid,decision_id,pid,symbol,side,qty,limit,reserve,at,expires,'OPEN'))
-        store.db.execute('INSERT INTO paper_order_terms VALUES(?,?)',(oid,json.dumps({**{k:v for k,v in config.items() if k.startswith('paper_')},'portfolio_strategy':config.get('portfolio_strategy'),'portfolio_decision':ps.order_context(store,config,'watchlist',symbol,at),'portfolio_exit':bool(portfolio_exit)},sort_keys=True)))
+        terms={**{k:v for k,v in config.items() if k.startswith('paper_')},'portfolio_strategy':config.get('portfolio_strategy'),'portfolio_decision':ps.order_context(store,config,'watchlist',symbol,at),'portfolio_exit':bool(portfolio_exit)}
+        if exposure_order:
+            terms['exposure_episode']=exposure_order['episode']
+        store.db.execute('INSERT INTO paper_order_terms VALUES(?,?)',(oid,json.dumps(terms,sort_keys=True)))
+        if exposure_order:
+            from .exposure import register_order_inside
+            register_order_inside(store,exposure_order,oid,qty)
         store.db.commit()
         return dict(store.db.execute('SELECT * FROM paper_orders WHERE id=?',(oid,)).fetchone())
     except ValueError as exc:
@@ -256,8 +327,13 @@ def settle(store,config,at):
         refresh_inside(store,config,at)
         for order in store.db.execute("SELECT * FROM paper_orders WHERE status IN ('OPEN','PARTIAL') ORDER BY created_at,id").fetchall():
             o=dict(order)
+            from .research_only import contains
+            if contains(store,config,o['symbol']):
+                store.db.execute("UPDATE paper_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
             terms=store.db.execute('SELECT config_json FROM paper_order_terms WHERE order_id=?',(o['id'],)).fetchone()
             order_config={**config,**json.loads(terms[0])} if terms else config
+            from .exposure import order_can_settle_inside
+            if not order_can_settle_inside(store,config,at,'watchlist',o,order_config):continue
             plan=store.db.execute('SELECT * FROM plans WHERE id=?',(o['plan_id'],)).fetchone()
             from . import portfolio_strategy as ps
             portfolio_exit=order_config.get('portfolio_exit',False)

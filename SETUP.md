@@ -215,7 +215,9 @@ Dean 于 2026-09-17 更正券商为东方财富证券，随后取得 EMT 仿真�
 
 每阶段支持`--without-model`用于故障诊断；模型未运行不会冒充AI结论或放行新增交易。旧`run`命令保留为0.1兼容入口，新闭环用以上命令；旧`run --kind daily_review`不是本版交易复盘，请用`review`。
 
-主要位置：`agent.sqlite3`保存业务关系；`raw/`保存原始文件；`workflow/snapshots`保存冻结资料包；`workflow/research`保存研究与计划；`workflow/slots`保存输入；`workflow/reviews`保存复盘；`backups/`保存一致性数据库备份。原始文件与workflow也应一并备份，单独SQLite不能恢复原始PDF。
+主要位置：`agent.sqlite3`保存业务关系；`raw/`保存原始文件；`snapshots`表保存冻结资料包（`workflow/snapshots/`下的旧文件是历史副本，不再新增）；`workflow/research`保存研究与计划；`workflow/slots`保存输入；`workflow/reviews`保存复盘；`backups/`保存一致性数据库备份。原始文件与workflow也应一并备份，单独SQLite不能恢复原始PDF。
+
+备份保留：研究节点在`backups/hourly/`保留最近N份未压缩小时备份，并在`backups/daily/`保留最近N天的gzip压缩日备份（每个`YYYYMMDD.sqlite3.gz`配一份`.json`，内含原始文件sha256、字节数和压缩方法）；云端保持原有未压缩保留策略。恢复某天的压缩备份：先停止服务，`gunzip -c backups/daily/YYYYMMDD.sqlite3.gz > restore.sqlite3`，用`shasum -a 256 restore.sqlite3`与对应`.json`里的`source_sha256`比对，再执行`sqlite3 restore.sqlite3 'PRAGMA integrity_check'`确认`ok`，然后按正常恢复流程替换数据库文件。
 
 迁移Mac时先停止服务，复制代码与完整数据目录，在新机用Python3.9+重新创建`.venv`并安装`requirements.lock`，重新登录Codex，然后重装服务。不要复制旧`.venv`或在两台机器上同时写同一个SQLite文件。
 

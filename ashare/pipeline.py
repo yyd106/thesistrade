@@ -77,7 +77,7 @@ def collect(store, run_id, config, on_ready=None):
         # Stop before the next stock once the machine has been offline for a while; research is redone after reconnect.
         online_or_stop(store)
         symbol = item["symbol"]
-        attempt("tencent_daily", symbol, lambda: sources.collect_history(store, run_id, symbol,config))
+        attempt("daily_bars", symbol, lambda: sources.collect_history(store, run_id, symbol,config))
         attempt('financials',symbol,lambda:fundamentals.collect(store,run_id,symbol))
         if catalog is not None:
             attempt("cninfo_catalog", symbol, lambda: sources.collect_announcements(store, run_id, item, config, catalog))
@@ -235,7 +235,8 @@ def run(config, *, kind="manual", job_key=None, use_model=True, collect_data=Tru
         as_of = now()
         packet = build_packet(store, run_id, config, as_of)
         json_write(folder / "packet.json", packet)
-        json_write(folder / "config-snapshot.json", config)
+        from .sec_source import public_config
+        json_write(folder / "config-snapshot.json", public_config(config))
         if use_model and config["model_enabled"]:
             print("资料包已保存，使用ChatGPT订阅运行Codex分析", flush=True)
             try:

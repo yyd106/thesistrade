@@ -12,7 +12,7 @@ def _pick(value, fields):
             and (value[key] is None or isinstance(value[key], (str, int, float, bool)))}
 
 
-IDENTITY = 'symbol asset name category kind unit membership research_status tier pool_tier fixed protected status entry_allowed buy_eligible archived last_research_at last_strategy_updated_at added_at updated_at'
+IDENTITY = 'symbol asset name category kind unit membership research_status research_only tier pool_tier fixed protected status entry_allowed buy_eligible archived last_research_at last_strategy_updated_at added_at updated_at'
 QUOTE = 'symbol asset name price_cents price_micros observed_at first_seen_at source currency unit fx_micros fx_at'
 POSITION = 'symbol name origin qty qty_scale sellable_qty cost_cents market_value_cents mark_cents price_micros quote_at fx_micros fx_at average_cost_cents average_native_cost_micros native_cost_micros first_at weight_pct unrealized_cents unrealized_return_pct quote_same_day quote_source quote_first_seen_at valuation_basis valuation_complete dividend_cents'
 ORDER = 'id symbol side qty qty_scale filled_qty limit_cents limit_micros status created_at updated_at reserved_cents origin'
@@ -32,7 +32,7 @@ def _plan(value):
         return None
     result = _pick(value, 'id study_id symbol created_at activated_at valid_until status effective_status model_status')
     payload = value.get('payload') or {}
-    result['payload'] = _pick(payload, 'kind')
+    result['payload'] = _pick(payload, 'kind research_only notice')
     if isinstance(payload.get('levels'), dict):
         result['payload']['levels'] = _pick(payload['levels'], LEVELS)
     return result

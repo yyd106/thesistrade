@@ -37,10 +37,14 @@ def check_url(url):
 class Redirect(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,req,fp,code,msg,headers,newurl):
   check_url(newurl)
+  from .sec_source import HOSTS
+  if urlsplit(newurl).hostname in HOSTS:raise ValueError('SEC请求必须使用独立受控客户端')
   return super().redirect_request(req,fp,code,msg,headers,newurl)
 
 def fetch(url):
  check_url(url)
+ from .sec_source import HOSTS
+ if urlsplit(url).hostname in HOSTS:raise ValueError('SEC请求必须使用独立受控客户端')
  req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept-Encoding':'identity'})
  try:response=urllib.request.build_opener(Redirect()).open(req,timeout=12)
  except urllib.error.URLError as exc:
@@ -102,7 +106,7 @@ def ingest(store,rows,seen,raw_path):
   added+=1
  return added
 
-def collect(store,start,end,at,fetch_fn=fetch):
+def collect(store,start,end,at,fetch_fn=fetch,config=None):
  from . import news_polling
  counts={};failures=[];coverage={};added=0
  # Revisit the complete rolling discovery horizon; deduplication keeps this
@@ -160,13 +164,14 @@ def collect(store,start,end,at,fetch_fn=fetch):
    error=str(exc)[:180];failures.append(name+'：'+error)
   news_polling.record(store,name,at,n,error,note='已检查；0条表示当前窗口无新条目')
  from .macro_sources import collect as collect_global
- global_result=collect_global(store,start,end,at,fetch_fn)
+ global_result=collect_global(store,start,end,at,fetch_fn,config=config)
  added+=global_result['added'];counts.update(global_result['window_counts']);failures+=global_result['failures']
  for name in ('新浪财经快讯',):
   error=next((f for f in failures if f.startswith(name.split('快讯')[0])),None)
   with store.db:store.db.execute('INSERT OR REPLACE INTO dynamic_feed_checks VALUES(?,?,?,?,?)',
    (name,at,'FAILED' if error else 'OK',counts.get(name,0),error or '已检查；0条表示当前窗口无新条目'))
- return {'added':added,'window_counts':counts,'coverage':coverage,'failures':failures,'catchup_start':lower}
+ return {'added':added,'window_counts':counts,'coverage':coverage,'failures':failures,'catchup_start':lower,
+  'paused_sources':global_result.get('paused_sources',{})}
 
 def themes(text):
  return [k for k,v in THEMES.items() if re.search(v[1],text,re.I)]
