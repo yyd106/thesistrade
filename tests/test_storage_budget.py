@@ -241,10 +241,10 @@ class MaintenanceRunTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def test_non_cloud_run_compresses_and_caches_inventory(self):
+    def test_storage_worker_compresses_and_caches_inventory(self):
         hourly(self.store.root, ['20261105T100000Z.sqlite3'])
-        result = maintenance.run(self.store, self.cfg, AT)
-        self.assertEqual(result['backups_compressed']['compressed'], ['20261105'])
+        result = maintenance.storage_worker(self.cfg, AT)
+        self.assertEqual(result['compressed'], ['20261105'])
         self.assertTrue(result['inventory_refreshed'])
         stored = json.loads(self.store.db.execute(
             "SELECT value FROM service_state WHERE key='storage_inventory'").fetchone()[0])
@@ -256,13 +256,15 @@ class MaintenanceRunTests(unittest.TestCase):
         stored['generated_at'] = now()
         self.store.db.execute("UPDATE service_state SET value=? WHERE key='storage_inventory'",
                               (json.dumps(stored),))
-        result = maintenance.run(self.store, self.cfg, AT)
+        self.store.db.commit()
+        result = maintenance.storage_worker(self.cfg, AT)
         self.assertFalse(result['inventory_refreshed'])
         # Older than 20h: refreshed again.
         stored['generated_at'] = '2026-11-05T00:00:00+00:00'
         self.store.db.execute("UPDATE service_state SET value=? WHERE key='storage_inventory'",
                               (json.dumps(stored),))
-        result = maintenance.run(self.store, self.cfg, AT)
+        self.store.db.commit()
+        result = maintenance.storage_worker(self.cfg, AT)
         self.assertTrue(result['inventory_refreshed'])
 
     def test_cloud_run_keeps_legacy_retention(self):

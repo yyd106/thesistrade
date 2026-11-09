@@ -42,6 +42,12 @@ class LaunchdSequenceTests(unittest.TestCase):
              patch.object(service.time, 'sleep'):
             return service.manage(config, action)
 
+    def test_installed_plist_requests_interactive_io_priority(self):
+        result = self.manage('install')
+        self.assertEqual(result['status'], 'INSTALLED')
+        content = plistlib.loads((Path(self.tmp.name) / 'agent.plist').read_bytes())
+        self.assertEqual(content['ProcessType'], 'Interactive')
+
     def test_install_waits_for_the_old_job_then_loads(self):
         result = self.manage('install', still_loaded=3)
         self.assertEqual(result['status'], 'INSTALLED')

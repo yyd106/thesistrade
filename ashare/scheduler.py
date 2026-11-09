@@ -163,6 +163,10 @@ class Scheduler:
     def __init__(self,config_path):
         self.config_path=config_path;self.stop=Event();self.pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix='ashare')
         self.futures={};self.last_settle=0;self.last_followups=0;self.last_maintenance=0;self.last_dividends=0
+        self.storage_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='storage')
+        # SIGTERM sets stop before the HTTP server joins the scheduler thread.
+        # Storage must observe that signal immediately, not wait for close().
+        self.storage_future=None;self.storage_cancel=self.stop;self.last_storage=0
         self.last_withdrawal_check=None
         self.pending_completions={}
         self.sync_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='cloud-sync');self.sync_future=None;self.last_sync=0
@@ -417,6 +421,16 @@ class Scheduler:
                 except Exception as exc:
                     with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('maintenance_error',?)",(stamp+' '+str(exc)[:300],))
                 self.last_maintenance=time.monotonic()
+            if role(config)!='cloud' and time.monotonic()-getattr(self,'last_storage',10**9)>=3600:
+                if self.storage_future and self.storage_future.done():
+                    try:self.storage_future.result()
+                    except Exception as exc:
+                        with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('storage_worker_error',?)",(str(exc)[:200],))
+                    self.storage_future=None
+                if self.storage_future is None:
+                    from .maintenance import storage_worker
+                    self.storage_future=self.storage_pool.submit(storage_worker,dict(config),stamp,self.storage_cancel)
+                self.last_storage=time.monotonic()
             if role(config)!='cloud' and config.get('reports_sync_enabled'):
                 if self.reports_future and self.reports_future.done():
                     try:self.reports_future.result()
@@ -564,6 +578,8 @@ class Scheduler:
 
     def close(self):
         self.stop.set()
+        if getattr(self,'storage_cancel',None) is not None:
+            self.storage_cancel.set()
         self.experiment_cancel.set()
         self.experiment_pool.shutdown(wait=True,cancel_futures=True)
         self.supervision_cancel.set()
@@ -571,3 +587,5 @@ class Scheduler:
         self.stop.set();self.pool.shutdown(wait=True,cancel_futures=True);self.dynamic_pool.shutdown(wait=True,cancel_futures=True);self.global_pool.shutdown(wait=True,cancel_futures=True);self.monitor.close();self.sync_pool.shutdown(wait=True,cancel_futures=True);self.reports_pool.shutdown(wait=True,cancel_futures=True)
         self.page_display_pool.shutdown(wait=True,cancel_futures=True)
         self.strategy_export_pool.shutdown(wait=True,cancel_futures=True)
+        if getattr(self,'storage_pool',None) is not None:
+            self.storage_pool.shutdown(wait=True,cancel_futures=True)
