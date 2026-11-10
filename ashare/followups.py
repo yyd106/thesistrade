@@ -276,8 +276,11 @@ def build(store,config,at):
             trigger='次年休市安排发布后',done=f"{upcoming['year']}年日历已录入并通过测试",impact='现在不影响交易；若1月1日前未完成，新年起全部交易暂停')
     disk=json.loads((store.db.execute("SELECT value FROM service_state WHERE key='maintenance'").fetchone() or ['{}'])[0]).get('disk')
     if disk and disk.get('warning'):
+        detail = f"可用空间{disk['free_gb']}GB，数据库{disk['db_gb']}GB，备份{disk['backups_gb']}GB。"
+        if disk.get('budget_pct', 0) >= 90:
+            detail += f"程序合计{disk.get('program_gb')}GB已达存储预算{disk.get('budget_gb')}GB的{disk['budget_pct']}%。"
         add('service:disk','MARKET','磁盘空间或数据库体积超过警戒线',
-            f"可用空间{disk['free_gb']}GB，数据库{disk['db_gb']}GB，备份{disk['backups_gb']}GB。",owner='USER',state='ACTION',
+            detail,owner='USER',state='ACTION',
             action='按运维手册“磁盘空间”一节处理：确认备份保留设置、清理旧发布包副本，必要时停服务后整理数据库。',
             trigger='空间释放后自动消失',done='可用空间和数据库体积回到警戒线以内',impact='空间耗尽会导致研究、复盘与备份失败')
     return items,latest

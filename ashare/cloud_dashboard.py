@@ -36,10 +36,15 @@ def status(store,config):
     cache.setdefault('watchlist',[]);cache.setdefault('observation',{'items':[]});cache.setdefault('reviews',[])
     cache['observation'].setdefault('items',[])
     cache['fixed_watchlist']=config['watchlist']
+    from .research_only import contains
+    for member in (cache.get('industry') or {}).get('members',[]):
+        member['research_only']=contains(store,config,member['symbol'])
     from .industry_presentation import current
     cache['industry']=current(cache.get('industry'),at,signed=value(store,'research_membership') or {},
         research_lease=lease(store,config,at),revoked=value(store,'invalidated_keys'),revoked_at=value(store,'invalidated_at'))
     for w in cache['watchlist']:
+        from .research_only import contains
+        w['research_only']=contains(store,config,w['symbol'])
         w['quote']=store.latest_quote(w['symbol'],at)
         w['open_orders']=[{k:o[k] for k in ('id','side','qty','filled_qty','limit_cents','status','created_at')} for o in a['orders'] if o['symbol']==w['symbol'] and not o.get('origin')]
         row=store.latest_trade_check(w['symbol'],at)
@@ -74,4 +79,9 @@ def status(store,config):
       'state':dict(store.db.execute('SELECT key,value FROM service_state')),'source_checks':[],'background_failures':[],'documents':0,'snapshots':0,
       'notices':open_notices(store),'withdrawals':withdrawal_status(store,config,at),
       'strategy_freshness':freshness_view(store,config,at)}
-    return add_strategy_times(store,result)
+    result=add_strategy_times(store,result)
+    # The signed display cache carries market_regime; a missing section yields MISSING (cap 10).
+    from .trader_view import build
+    from .paper import preview_buy
+    result['trader_view']=build(result,config,buy_check=lambda p,q,t: preview_buy(store,config,p,q,t))
+    return result

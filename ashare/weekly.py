@@ -133,7 +133,8 @@ def markdown(report, title=None, period='本周'):
         lines.append(f"- REJECTED（驳回，累计）：{closed['REJECTED']} 条")
         lines.append(f"- SUPERSEDED（被新版替代，累计）：{closed['SUPERSEDED']} 条" + ('' if not replaced else '；旧→新 ' + '；'.join(f"{p['id']}→{p['replaced_by']}" for p in replaced[:8])))
     disk = report['disk']
-    lines += ['', '## 运行健康', '', f"- 磁盘可用 {disk['free_gb']}GB，数据库 {disk['db_gb']}GB，备份 {disk['backups_gb']}GB" + ('（超过警戒线）' if disk['warning'] else '')]
+    budget = f"，程序合计 {disk['program_gb']}GB / 预算 {disk['budget_gb']}GB（{disk['budget_pct']}%）" if disk.get('program_gb') is not None else ''
+    lines += ['', '## 运行健康', '', f"- 磁盘可用 {disk['free_gb']}GB，数据库 {disk['db_gb']}GB，备份 {disk['backups_gb']}GB" + budget + ('（超过警戒线）' if disk['warning'] else '')]
     if report['calendar_warning']:
         lines.append(f"- {report['calendar_warning']['year']}年交易日历尚未录入，距年底 {report['calendar_warning']['days_left']} 天。")
     return '\n'.join(lines) + '\n'

@@ -2,17 +2,38 @@
 import json
 import re
 from .storage import now, digest, normalize_time
+from .research_only import symbols as research_only_symbols
+
+
+def fingerprint(member):
+    fields=('membership','tier','buy_eligible','hypothesis_ids')
+    if member.get('research_only'):fields+=('research_only',)
+    return digest(json.dumps({k:member.get(k) for k in fields},sort_keys=True))
 
 
 def membership(store,config,at=None):
     at=normalize_time(at or now())
+    research_only=research_only_symbols(store,config)
     if config.get('deployment_role')=='cloud':
         from .cloud_runtime import value
         signed=value(store,'research_membership')
-        if signed:return signed['members']
+        if signed:
+            rows=[]
+            for original in signed['members']:
+                m=dict(original)
+                if m['symbol'] in research_only:
+                    m.update(research_only=True,buy_eligible=False)
+                    m['fingerprint']=fingerprint(m)
+                rows.append(m)
+            return rows
     core={i['symbol']:i for i in config['watchlist']}
     if not config.get('industry_enabled'):
-        return [{**i,'membership':'CORE','tier':'CORE','buy_eligible':True,'fingerprint':'legacy'} for i in core.values()]
+        rows=[]
+        for i in core.values():
+            m={**i,'membership':'CORE','tier':'CORE','research_only':i['symbol'] in research_only,
+               'buy_eligible':i['symbol'] not in research_only,'hypothesis_ids':[]}
+            m['fingerprint']=fingerprint(m);rows.append(m)
+        return rows
     from .observation import all_items
     from .observation_pool import allocate,protected_assets
     pool=allocate(store,all_items(store,at),at,config);protected=protected_assets(store)
@@ -23,19 +44,21 @@ def membership(store,config,at=None):
         item=selected.get(symbol,{})
         links=[l for l in item.get('links',[]) if l['status']=='TRACKING' and l.get('review_state')=='CURRENT' and (l.get('materiality') or {}).get('admitted')]
         tier='CORE' if symbol in core else item.get('pool_tier','ARCHIVED')
-        eligible=symbol in core or tier in ('FOCUS','ACTIVE') and bool(links)
+        eligible=(symbol in core or tier in ('FOCUS','ACTIVE') and bool(links)) and symbol not in research_only
         member={'symbol':symbol,'name':core.get(symbol,item).get('name',symbol),'membership':'CORE' if symbol in core else 'DYNAMIC','tier':tier,'buy_eligible':bool(eligible),'protected':symbol in protected,
           'reason':'固定研究名单' if symbol in core else item.get('pool_reason','仅保留已有敞口管理'),
           'review_at':min([t for t in [item.get('review_due_at')]+[l.get('qualification_review_at') for l in links] if t],default=None),'hypothesis_ids':[l['event_id'] for l in links],
           'methods':sorted({l['method'] for l in item.get('links',[]) if l.get('method')}),
           'domains':sorted({l['theme'] for l in item.get('links',[]) if l.get('theme')})}
+        member['research_only']=symbol in research_only
         states={l.get('industry_state') for l in item.get('links',[]) if l.get('industry_state')}
         member['research_status']='TRACKING' if eligible else 'REVIEW' if 'REVIEW' in states else 'LEAD' if states and states<={'WAITING'} else 'REVIEW' if tier=='COOLING' else 'ARCHIVED'
         member['category']='CN' if symbol.startswith(('sh','sz')) else 'US'
         member['rule_version']=__import__('ashare.industry',fromlist=['RULE_VERSION']).RULE_VERSION
         if member['research_status']=='LEAD':member['reason']='已发现相关线索，关键证据仍待补齐'
         elif member['research_status']=='REVIEW':member['reason']='原研究依据需要重新核对，补齐前不新增买入'
-        member['fingerprint']=digest(json.dumps({k:member[k] for k in ('membership','tier','buy_eligible','hypothesis_ids')},sort_keys=True))
+        if member['research_only']:member.update(research_status='TRACKING',reason='参考区间，只研究不交易')
+        member['fingerprint']=fingerprint(member)
         result.append(member)
     return result
 
@@ -43,11 +66,12 @@ def membership(store,config,at=None):
 def company_targets(store,config,at=None):
     at=at or now()
     if not config.get('industry_enabled'):
-        return config['watchlist']
+        return membership(store,config,at)
     return [i for i in membership(store,config,at) if re.fullmatch(r'(sh|sz)\d{6}',i['symbol']) and (i['membership']=='CORE' or i['buy_eligible'] or i.get('protected'))]
 
 
 def permit(store,config,symbol,at):
+    if symbol in research_only_symbols(store,config):return False
     if not config.get('industry_enabled'):return symbol in {w['symbol'] for w in config['watchlist']}
     m=next((m for m in membership(store,config,at) if m['symbol']==symbol),None)
     return bool(m and m['buy_eligible'] and (not m.get('review_at') or at<m['review_at'] or m['membership']=='CORE'))
@@ -61,7 +85,7 @@ def reconcile(store,config,at):
     for symbol,prior in known.items():
         if symbol not in current:
             m={**prior,'membership':'DYNAMIC','tier':'ARCHIVED','research_status':'ARCHIVED','buy_eligible':False,'protected':False,'hypothesis_ids':[],'reason':'已移出固定名单或不再继续跟踪；历史资料仍可查看'}
-            m['fingerprint']=digest(json.dumps({k:m[k] for k in ('membership','tier','buy_eligible','hypothesis_ids')},sort_keys=True));removed.append(m)
+            m['fingerprint']=fingerprint(m);removed.append(m)
     with store.db:
         for m in members+removed:
             old=store.db.execute('SELECT fingerprint,payload_json FROM industry_memberships WHERE symbol=? ORDER BY id DESC LIMIT 1',(m['symbol'],)).fetchone()
@@ -73,11 +97,16 @@ def reconcile(store,config,at):
 
 def publication(store,config,completed,until):
     members=[m for m in membership(store,config,completed) if m['membership']=='CORE' or m['buy_eligible'] or m.get('protected')]
-    return {'version':'industry_v1','as_of':completed,'valid_until':until,'core':sorted(w['symbol'] for w in config['watchlist']),'members':members}
+    only=sorted(research_only_symbols(store,config))
+    return {'version':'research_membership_v2' if only else 'industry_v1','as_of':completed,'valid_until':until,'core':sorted(w['symbol'] for w in config['watchlist']),
+            'research_only':only,'members':members}
 
 
 def validate_publication(store,config,body,items,completed,until):
-    if not isinstance(body,dict) or body.get('version')!='industry_v1' or body.get('as_of')!=completed or body.get('valid_until')!=until:raise ValueError('名单版本或授权时间不匹配')
+    research_only=research_only_symbols(store,config)
+    expected_version='research_membership_v2' if research_only else 'industry_v1'
+    if not isinstance(body,dict) or body.get('version')!=expected_version or body.get('as_of')!=completed or body.get('valid_until')!=until:raise ValueError('名单版本或授权时间不匹配')
+    if body.get('research_only',[])!=sorted(research_only):raise ValueError('只研究名单配置不一致')
     if body.get('core')!=sorted(w['symbol'] for w in config['watchlist']):raise ValueError('固定名单配置不一致')
     rows=body.get('members')
     if not isinstance(rows,list) or len(rows)>100:raise ValueError('名单数量错误')
@@ -88,10 +117,12 @@ def validate_publication(store,config,body,items,completed,until):
     for symbol,m in members.items():
         if not re.fullmatch(r'(sh|sz)\d{6}|US:[A-Z][A-Z0-9.-]{0,9}',symbol):raise ValueError('名单证券身份错误')
         if m['membership']!=('CORE' if symbol in core else 'DYNAMIC') or type(m['buy_eligible']) is not bool:raise ValueError('名单归属或资格错误')
+        if (research_only and 'research_only' not in m or type(m.get('research_only',False)) is not bool
+                or m.get('research_only',False)!=(symbol in research_only) or m.get('research_only') and m['buy_eligible']):raise ValueError('只研究名单资格错误')
         if m.get('protected') and symbol not in protected:raise ValueError('保护对象与云端敞口不一致')
         if m['buy_eligible'] and symbol not in core and (m['tier'] not in ('FOCUS','ACTIVE') or not m.get('hypothesis_ids') or not m.get('review_at') or m['review_at']<=completed):raise ValueError('动态名单缺少有效研究依据')
         if not m['buy_eligible'] and symbol not in core and symbol not in protected:raise ValueError('无资格无敞口的对象不能进入执行名单')
-        expected=digest(json.dumps({k:m[k] for k in ('membership','tier','buy_eligible','hypothesis_ids')},sort_keys=True))
+        expected=fingerprint(m)
         if m.get('fingerprint')!=expected:raise ValueError('名单摘要不一致')
     dynamic=set(members)-core
     capacity=min(policy(config)['active_limit'],40-len(core)-4)

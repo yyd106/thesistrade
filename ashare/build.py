@@ -21,7 +21,8 @@ STRATEGY_KEYS = ('strategy_version', 'paper_entry_band_bps', 'paper_stop_loss_bp
                  'paper_order_ttl_seconds', 'plan_max_age_hours', 'slot_execution_mode', 'portfolio_strategy',
                  'investment_policy', 'portfolio_authorization_hours', 'model_name',
                  'model_reasoning_effort', 'max_packet_chars', 'max_news_packet_pct', 'dynamic_enabled',
-                 'cloud_stale_policy', 'mode', 'industry_enabled', 'industry_policy', 'global_macro_context_enabled')
+                 'cloud_stale_policy', 'mode', 'industry_enabled', 'industry_policy', 'global_macro_context_enabled', 'sec_enabled',
+                 'exposure_regime')
 
 
 def _sha(value):
@@ -42,8 +43,10 @@ def code_fingerprint():
 
 
 def config_fingerprint(config):
+    from .sec_source import availability
     selected = {k: config.get(k) for k in STRATEGY_KEYS}
-    selected['watchlist'] = sorted(i['symbol'] for i in config.get('watchlist', []))
+    selected['sec_source_ready'] = availability(config) == 'READY'
+    selected['watchlist'] = sorted((i['symbol'], i.get('research_only', False)) for i in config.get('watchlist', []))
     return _sha(selected)[:12]
 
 
@@ -215,7 +218,11 @@ def behavior_info(config, store):
     """
     rows = [tuple(r) for r in store.db.execute(
         "SELECT id,route,scope,text FROM strategy_guidance WHERE status='ADOPTED' ORDER BY id")]
-    selected = {k: v for k, v in config.items() if k not in LOCATION_OR_TRANSIENT_KEYS}
+    from .sec_source import CONTACT_KEY, availability
+    selected = {k: v for k, v in config.items() if k not in LOCATION_OR_TRANSIENT_KEYS and k != CONTACT_KEY}
+    selected['sec_source_ready'] = availability(config) == 'READY'
+    from .research_only import symbols as research_only_symbols
+    selected['_effective_research_only_symbols'] = sorted(research_only_symbols(store,config))
     config_raw = json.dumps(selected, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()
     parts = {'version': BEHAVIOR_VERSION, 'code_hash': behavior_code_fingerprint(),
              'config_hash': _sha(config_raw), 'guidance_hash': _sha(rows),

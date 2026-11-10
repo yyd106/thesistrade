@@ -49,7 +49,7 @@ COLUMNS = {
 JSON_KEYS = {
     'portfolio_decisions': set('summary decisions risk_groups as_of account build model publication_audit'.split()),
     'studies': {'summary', 'stocks'},
-    'plans': set('kind strategy_version research_membership_token holding_unit holding_days recheck_hours research_method '
+    'plans': set('kind research_only research_gaps strategy_version research_membership_token holding_unit holding_days recheck_hours research_method '
                  'event_reviews corporate_actions basis levels blockers formula max_stock_pct risk_parameters thesis '
                  'counterpoints evidence_ids notice analysis model build research_reuse previous_plan_id renewed_from'.split()),
     'global_plans': set('analysis_as_of analysis_finished_at research_contract kind blockers analysis thesis holding_days '
@@ -933,7 +933,7 @@ def _stock_reports(data):
                   '- 止损价 / 止盈价：' + exits,
                   '- 计划仓位上限：' + (f'{cap:g}%' if type(cap) in (int, float) else '未记录'), '']
         lines += _report_section('入场触发、限制与退出条件', [
-            ('计划类别、公式及限制', _select_fields(plan, ('kind', 'formula', 'blockers'))),
+            ('计划类别、公式及限制', _select_fields(plan, ('kind', 'research_only', 'notice', 'formula', 'blockers', 'research_gaps'))),
             ('止损止盈参数', _select_fields(plan, ('risk_parameters', 'stop_bps', 'take_profit_bps'))),
             ('持有期、复核与报价基准', _select_fields(plan, ('holding_days', 'holding_unit', 'recheck_hours', 'reference_quote_at')))],
             '未记录程序入场、退出与复核条件，无法从研究观点补齐执行规则。')

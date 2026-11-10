@@ -45,7 +45,7 @@ def exit_reason(case,p,q,at):
  if days>=plan.get('holding_days',3):return '事件持有期结束'
  return None
 
-def submit(store,config,case,side,q,at,reason):
+def submit(store,config,case,side,q,at,reason,sell_qty=None,exposure_order=None):
  from .cloud_runtime import execution_allowed
  execution_allowed(store,config,at)
  from . import portfolio_strategy as ps
@@ -59,6 +59,7 @@ def submit(store,config,case,side,q,at,reason):
  # A BUY is a single intent for the entire case, even after it expires/fills.
  # SELL can retry after an unfilled order expires, using a new minute key.
  intent=cid+':'+side+(':'+at[:16] if side=='SELL' else '')
+ if exposure_order:intent+=':exposure:'+exposure_order['episode']
  if side=='BUY' and ps.enabled(config):
   d=ps.decision(store,config,'dynamic',cid,at)
   intent+=':portfolio:'+(d['portfolio_id'] if d else 'pending')
@@ -67,6 +68,8 @@ def submit(store,config,case,side,q,at,reason):
  if side=='BUY' and halted(store):return {'status':'BLOCKED','reason':'ACCOUNT_DRAWDOWN_HALT'}
  store.db.execute('BEGIN IMMEDIATE')
  try:
+  from .research_only import contains
+  if contains(store,config,sym):raise ValueError('RESEARCH_ONLY')
   refresh_inside(store,config,at)
   if side=='BUY' and pending(store):
    store.db.commit();return {'status':'BLOCKED','reason':'WITHDRAWAL_PENDING'}
@@ -78,6 +81,7 @@ def submit(store,config,case,side,q,at,reason):
   if old:store.db.commit();return dict(old)
   fresh=store.db.execute('SELECT * FROM dynamic_cases WHERE id=?',(cid,)).fetchone()
   if not fresh:raise ValueError('动态计划不存在')
+  if fresh['symbol']!=sym:raise ValueError('PLAN_SYMBOL_MISMATCH')
   plan=json.loads(fresh['plan_json']);p=case_position(store,cid,at)
   if phase(at)!='CONTINUOUS':raise ValueError('当前不在交易时段')
   if not quote_ok(q,config,at):raise ValueError('动态报价过期')
@@ -99,7 +103,8 @@ def submit(store,config,case,side,q,at,reason):
    limit=min(high,(q['price_cents']*(10000+config['paper_slippage_bps'])+9999)//10000)
    own=a['positions'].get(sym,{}).get('qty',0)+a.get('dynamic_positions',{}).get(sym,{}).get('qty',0)
    stock_cap=a['equity_cents']*config['paper_max_stock_pct']//100-own*q['price_cents']
-   gross_cap=a['equity_cents']*config['paper_max_gross_pct']//100-a['market_value_cents']-a['reserved_cents']
+   from .exposure import gross_cap_pct
+   gross_cap=a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-a['reserved_cents']
    if ps.enabled(config) and store.db.execute("SELECT 1 FROM dynamic_orders o JOIN dynamic_fills f ON f.order_id=o.id WHERE o.case_id=? AND f.side='BUY' LIMIT 1",(cid,)).fetchone():raise ValueError('该事件已执行入场')
    budget=min(a['available_cents'],stock_cap,gross_cap,a['equity_cents']*plan.get('max_position_pct',5)//100,ps.buy_budget(store,config,'dynamic',cid,at,a))
    qty=max(0,budget//limit//100*100)
@@ -107,10 +112,10 @@ def submit(store,config,case,side,q,at,reason):
    if not qty:raise ValueError('共用底池额度不足或已达到仓位上限')
    reserve=qty*limit+fee(config,'BUY',qty*limit)
   else:
-   portfolio_exit=not halted(store) and not exit_reason(dict(fresh),p,q,at)
+   portfolio_exit=sell_qty is None and not halted(store) and not exit_reason(dict(fresh),p,q,at)
    reduction_qty=ps.exit_quantity(store,config,'dynamic',cid,at,q) if portfolio_exit else 0
-   if portfolio_exit and not reduction_qty:raise ValueError('动态退出条件未满足')
-   qty=min(p['sellable_qty'],reduction_qty) if portfolio_exit else p['sellable_qty']
+   if portfolio_exit and not reduction_qty and sell_qty is None:raise ValueError('动态退出条件未满足')
+   qty=sell_qty if sell_qty is not None else (min(p['sellable_qty'],reduction_qty) if portfolio_exit else p['sellable_qty'])
    if not qty:raise ValueError('动态持仓受T+1限制或已卖出')
    limit=max(1,q['price_cents']*(10000-config['paper_slippage_bps'])//10000);reserve=0
   expiry=normalize_time((datetime.fromisoformat(at)+timedelta(seconds=config['paper_order_ttl_seconds'])).isoformat())
@@ -122,8 +127,12 @@ def submit(store,config,case,side,q,at,reason):
                               'blockers':blockers if side=='BUY' else []},
                portfolio_decision=ps.order_context(store,config,'dynamic',cid,at),portfolio_exit=side=='SELL' and portfolio_exit,plan=plan,quote=q,source_news_id=fresh['news_id'],analysis=json.loads(fresh['analysis_json']),
                account_at_order={k:a[k] for k in ('cash_cents','equity_cents','available_cents','reserved_cents','market_value_cents')})
+  if exposure_order:terms['exposure_episode']=exposure_order['episode']
   store.db.execute('INSERT INTO dynamic_orders VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?)',
    (oid,intent,cid,sym,side,qty,limit,reserve,at,expiry,'OPEN',reason,json.dumps(terms,ensure_ascii=False)))
+  if exposure_order:
+   from .exposure import register_order_inside
+   register_order_inside(store,exposure_order,oid,qty)
   store.db.commit();return dict(store.db.execute('SELECT * FROM dynamic_orders WHERE id=?',(oid,)).fetchone())
  except ValueError as exc:
   store.db.rollback();return {'status':'BLOCKED','reason':str(exc)}
@@ -146,6 +155,11 @@ def settle(store,config,at):
   refresh_inside(store,config,at)
   for row in store.db.execute("SELECT * FROM dynamic_orders WHERE status IN ('OPEN','PARTIAL') ORDER BY created_at,id").fetchall():
    o=dict(row);terms=json.loads(o['terms_json']);terms={**config,**terms}
+   from .exposure import order_can_settle_inside
+   if not order_can_settle_inside(store,config,at,'dynamic',o,terms):continue
+   from .research_only import contains
+   if contains(store,config,o['symbol']):
+    store.db.execute("UPDATE dynamic_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
    if o['side']=='BUY' and (pending(store) or halted(store)):
     store.db.execute("UPDATE dynamic_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
    case=dict(store.db.execute('SELECT * FROM dynamic_cases WHERE id=?',(o['case_id'],)).fetchone())

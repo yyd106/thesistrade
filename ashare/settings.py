@@ -3,6 +3,7 @@ import re
 DEFAULTS = {
  'strategy_freshness_enabled':True,
  'global_macro_context_enabled':True,
+ 'sec_enabled':False,
  'industry_enabled':False,'industry_policy':{},
  'dynamic_enabled':False,'dynamic_model_timeout_seconds':120,
  'collection_times': ['08:00','20:00'], 'review_time': '19:30',
@@ -31,7 +32,7 @@ DEFAULTS = {
  'research_reuse_hours':0,
  'portfolio_refresh_minutes':55,
  'backup_hourly_keep':6,'backup_daily_keep':7,
- 'disk_free_warn_gb':10,'db_size_warn_gb':5,
+ 'disk_free_warn_gb':10,'db_size_warn_gb':5,'storage_budget_gb':30,
  'evaluation_enabled':True,'evaluation_time':'19:10','evaluation_horizon_days':20,
  'weekly_report_weekday':5,'weekly_report_time':'10:00','digest_time':'23:50',
  'shadow_books_enabled':True,'shadow_risk_per_trade_bps':50,'shadow_start_date':None,
@@ -48,7 +49,11 @@ DEFAULTS = {
 
 
 def validate_settings(config):
+    for item in config.get('watchlist', []):
+        if type(item.get('research_only', False)) is not bool:
+            raise ValueError('research_only必须为布尔值')
     if config.get('deployment_role','standalone') not in ('standalone','cloud','research'):raise ValueError('节点角色无效')
+    if config.get('exposure_regime') not in (None,'R1'):raise ValueError('exposure_regime须为R1或缺省关闭')
     if config.get('cloud_stale_policy','reduce_only') not in ('reduce_only','stop_all'):raise ValueError('研究断联策略无效')
     if config.get('investment_policy') not in (None, 'days_cash_v1'):
         raise ValueError('未知投资政策版本')
@@ -62,6 +67,10 @@ def validate_settings(config):
     from .industry_research import policy as industry_policy
     industry_policy(config)
     if type(config['industry_enabled']) is not bool:raise ValueError('industry_enabled必须为布尔值')
+    if type(config['sec_enabled']) is not bool:raise ValueError('sec_enabled必须为布尔值')
+    from .sec_source import CONTACT_KEY, contact
+    if config.get(CONTACT_KEY) not in (None, '') and contact(config) is None:
+        raise ValueError('SEC联系方式格式无效；未回显私有值')
     for k in ('collection_times','slot_times'):
         v = config[k]
         if not isinstance(v,list) or not v or len(set(v))!=len(v) or any(not isinstance(x,str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',x) for x in v):
@@ -116,6 +125,7 @@ def validate_settings(config):
     if config['model_reasoning_effort'] is not None and config['model_reasoning_effort'] not in EFFORTS:raise ValueError('model_reasoning_effort须为'+'/'.join(EFFORTS))
     for k,lo,hi in (('research_reuse_hours',0,24),('portfolio_refresh_minutes',30,360),('backup_hourly_keep',1,48),
                    ('backup_daily_keep',0,60),('disk_free_warn_gb',1,1000),('db_size_warn_gb',1,1000),
+                   ('storage_budget_gb',5,1000),
                    ('evaluation_horizon_days',5,60),('weekly_report_weekday',0,6),('shadow_risk_per_trade_bps',10,200)):
         if type(config[k]) is not int or not lo<=config[k]<=hi:raise ValueError(f'{k}必须为{lo}到{hi}之间整数')
     for k in ('evaluation_enabled','shadow_books_enabled','strategy_freshness_enabled','global_macro_context_enabled'):

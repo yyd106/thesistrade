@@ -1,5 +1,6 @@
 import json
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 import test_investment_policy as investment_fixtures
 import test_dynamic as dynamic_fixtures
@@ -313,3 +314,439 @@ class PortfolioStrategyTests(unittest.TestCase):
         with self.store.db:self.store.db.execute("UPDATE portfolio_decisions SET valid_until=?",(self.later(1),))
         self.assertEqual(self.fill(i),[])
         self.assertEqual(self.store.db.execute('SELECT status FROM global_orders WHERE id=?',(o['id'],)).fetchone()[0],'CANCELLED')
+
+
+class MaterialTriggerTests(unittest.TestCase):
+    """source_material comparisons and forced re-runs; synthetic rows only, no network."""
+    SYMBOL='sz000333'
+    later=investment_fixtures.InvestmentTests.later
+    quote=investment_fixtures.InvestmentTests.quote
+    plan=investment_fixtures.InvestmentTests.plan
+    output=PortfolioStrategyTests.output
+    approve=PortfolioStrategyTests.approve
+
+    def setUp(self):
+        PortfolioStrategyTests.setUp(self)
+        self.cfg.update(watchlist=[{'symbol':self.SYMBOL,'name':'合成'}],scheduler_enabled=True)
+
+    def tearDown(self):investment_fixtures.InvestmentTests.tearDown(self)
+
+    def wplan(self,symbol=None,study='study-1',plan='plan-1',at=None,status='ACTIVE',payload=None):
+        symbol=symbol or self.SYMBOL;at=at or self.at
+        payload=payload if payload is not None else dict(self.original)
+        expiry=normalize_time((datetime.fromisoformat(at)+timedelta(hours=24)).isoformat())
+        with self.store.db:
+            self.store.db.execute('INSERT OR IGNORE INTO snapshots VALUES(?,?,?,?,?,?,?)',(study,None,symbol,at,at,'fixture','{}'))
+            self.store.db.execute('INSERT OR IGNORE INTO studies VALUES(?,?,?,?,?,?)',(study,study,symbol,at,'SUCCEEDED','{}'))
+            self.store.db.execute("UPDATE plans SET status='SUPERSEDED' WHERE symbol=? AND status='ACTIVE'",(symbol,))
+            self.store.db.execute('INSERT INTO plans VALUES(?,?,?,?,?,?,?,?)',(plan,study,symbol,at,expiry,status,'synthetic',json.dumps(payload)))
+            self.store.db.execute('INSERT INTO plan_events(plan_id,at,status,reason) VALUES(?,?,?,?)',(plan,at,status,'synthetic'))
+        return dict(self.store.db.execute('SELECT * FROM plans WHERE id=?',(plan,)).fetchone())
+
+    original={'kind':'PAPER_TRADE','blockers':[],
+        'levels':{'buy_low_cents':990,'buy_high_cents':1010,'stop_cents':940,'sell_cents':1100},
+        'max_stock_pct':20,'thesis':'synthetic'}
+
+    def renew(self,plan='plan-2',study='study-1',mutate=None,status='ACTIVE'):
+        payload=json.loads(self.store.db.execute('SELECT payload_json FROM plans WHERE id=?',('plan-1',)).fetchone()[0])
+        if mutate:mutate(payload)
+        return self.wplan(study=study,plan=plan,status=status,payload=payload)
+
+    def hold(self,qty=100,cost=94000):
+        self.store.db.execute('PRAGMA foreign_keys=OFF')
+        with self.store.db:
+            self.store.db.execute('INSERT INTO paper_lots VALUES(?,?,?,?,?)',('lot-1',self.SYMBOL,qty,cost,'2026-09-10'))
+        self.store.db.execute('PRAGMA foreign_keys=ON')
+
+    def aquote(self,price=1000,at=None):
+        at=at or self.at;qid=ps.digest(json.dumps({'s':self.SYMBOL,'p':price,'at':at},sort_keys=True))[:24]
+        with self.store.db:
+            self.store.db.execute('INSERT OR IGNORE INTO quotes VALUES(?,?,?,?,?,?,?,?,?)',
+                (qid,self.SYMBOL,'合成',price,1000,at,at,'SYNTHETIC','synthetic'))
+
+    def strip_material(self):
+        payload=ps.active(self.store,self.at)['payload']
+        for d in payload['decisions']:d.pop('source_material',None)
+        with self.store.db:
+            self.store.db.execute("UPDATE portfolio_decisions SET payload_json=? WHERE status='ACTIVE'",(json.dumps(payload),))
+
+    def test_materially_changed_boundaries(self):
+        m=lambda **kw:{'study_id':'s','status':'ACTIVE','strategy_version':'v','kind':'PAPER_TRADE',
+            'blockers':[],'levels':{'buy_low_cents':1000,'buy_high_cents':1100,'stop_cents':900},
+            'membership_token':None,'max_stock_pct':20,**kw}
+        base=m()
+        self.assertFalse(ps.materially_changed(base,dict(base)))
+        self.assertFalse(ps.materially_changed(None,None))
+        self.assertTrue(ps.materially_changed(base,None))
+        self.assertTrue(ps.materially_changed(None,base))
+        moved=m(levels={'buy_low_cents':1005,'buy_high_cents':1100,'stop_cents':900})  # exactly 0.5%: not material
+        self.assertFalse(ps.materially_changed(base,moved))
+        moved['levels']['buy_low_cents']=1006
+        self.assertTrue(ps.materially_changed(base,moved))
+        gone=m(levels={'buy_low_cents':None,'buy_high_cents':1100,'stop_cents':900})
+        self.assertTrue(ps.materially_changed(base,gone))
+        for field,value in (('study_id','s2'),('status','EXPIRED'),('strategy_version','v2'),('kind','NO_ENTRY'),
+                            ('blockers',['X']),('membership_token','t'),('max_stock_pct',10)):
+            self.assertTrue(ps.materially_changed(base,m(**{field:value})),field)
+
+    def test_renewal_keeps_authorization_and_changed_keys(self):
+        self.wplan();self.approve()
+        decided=next(d for d in ps.active(self.store,self.at)['payload']['decisions'] if d['key']=='watchlist:'+self.SYMBOL)
+        self.assertIsNotNone(decided['source_material']);self.assertIn('near_stop',decided)
+        self.renew(mutate=lambda p:p['levels'].update(buy_low_cents=992))  # +0.20%, inside tolerance
+        self.assertEqual(ps.changed_keys(self.store,self.cfg,self.at),[])
+        self.assertIsNotNone(ps.decision(self.store,self.cfg,'watchlist',self.SYMBOL,self.at))
+
+    def test_material_changes_invalidate(self):
+        self.wplan();self.approve()
+        for mutate,why in ((lambda p:p['blockers'].append('X'),'blockers'),(lambda p:p.update(kind='NO_ENTRY'),'kind'),
+                           (lambda p:p['levels'].update(stop_cents=950),'level-move'),(lambda p:p.update(research_membership_token='t'),'membership')):
+            self.renew(plan='changed-'+why,mutate=mutate)
+            self.assertIn('watchlist:'+self.SYMBOL,ps.changed_keys(self.store,self.cfg,self.at),why)
+            self.assertIsNone(ps.decision(self.store,self.cfg,'watchlist',self.SYMBOL,self.at),why)
+            self.renew(plan='restored-'+why)  # back to an immaterial copy of the original
+            self.assertEqual(ps.changed_keys(self.store,self.cfg,self.at),[],why)
+        self.renew(plan='other-study',study='study-2')
+        self.assertIn('watchlist:'+self.SYMBOL,ps.changed_keys(self.store,self.cfg,self.at))
+        self.renew(plan='expired',status='EXPIRED')
+        self.assertIn('watchlist:'+self.SYMBOL,ps.changed_keys(self.store,self.cfg,self.at))
+
+    def test_legacy_decision_without_material_uses_row_token(self):
+        self.wplan();self.approve();self.strip_material()
+        self.renew(mutate=lambda p:p['levels'].update(buy_low_cents=992))
+        self.assertIn('watchlist:'+self.SYMBOL,ps.changed_keys(self.store,self.cfg,self.at))
+        self.assertIsNone(ps.decision(self.store,self.cfg,'watchlist',self.SYMBOL,self.at))
+
+    def test_request_forced_by_position_change(self):
+        self.wplan();self.approve()
+        self.assertIsNone(ps.request(self.store,self.cfg,self.later(30)))
+        self.hold()
+        jid=ps.request(self.store,self.cfg,self.later(95))  # forced check throttled to once per 60s
+        self.assertTrue(jid)
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM service_state WHERE key='portfolio_dirty'").fetchone())
+        reasons=json.loads(self.store.db.execute("SELECT value FROM service_state WHERE key='portfolio_forced_reasons'").fetchone()[0])
+        self.assertEqual(reasons,['POSITION_CHANGED:watchlist:'+self.SYMBOL,'COST_CHANGED:watchlist:'+self.SYMBOL])
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM jobs WHERE kind='portfolio_strategy' AND status='PENDING'").fetchone())
+
+    def test_request_forced_by_near_stop_only(self):
+        self.hold();self.aquote(1000);self.wplan();self.approve()
+        self.aquote(950,at=self.later(30))  # inside 2% above the 940 effective stop
+        jid=ps.request(self.store,self.cfg,self.later(95))
+        self.assertTrue(jid)
+        reasons=json.loads(self.store.db.execute("SELECT value FROM service_state WHERE key='portfolio_forced_reasons'").fetchone()[0])
+        self.assertEqual(reasons,['NEAR_STOP:watchlist:'+self.SYMBOL])
+
+    def test_request_unchanged_and_throttled(self):
+        self.wplan();self.approve()
+        calls=[]
+        with patch('ashare.portfolio_strategy.forced_reasons',side_effect=lambda *a:calls.append(1) or []):
+            self.assertIsNone(ps.request(self.store,self.cfg,self.later(10)))
+            self.assertIsNone(ps.request(self.store,self.cfg,self.later(40)))  # second call inside 60s: no re-check
+            self.assertIsNone(ps.request(self.store,self.cfg,self.later(70)))  # re-checks, still no reasons
+            self.assertIsNone(ps.request(self.store,self.cfg,self.later(80)))
+        self.assertEqual(len(calls),2)
+        self.assertFalse(self.store.db.execute("SELECT 1 FROM service_state WHERE key='portfolio_dirty'").fetchone())
+        self.assertFalse(self.store.db.execute("SELECT 1 FROM jobs WHERE kind='portfolio_strategy'").fetchone())
+
+    def test_request_forced_by_cash_change(self):
+        self.wplan();self.approve()
+        self.assertIsNone(ps.request(self.store,self.cfg,self.later(30)))
+        with self.store.db:self.store.db.execute('UPDATE paper_accounts SET cash_cents=cash_cents-100000')
+        self.assertEqual(ps.forced_reasons(self.store,self.cfg,self.later(95)),['CASH_CHANGED'])
+        jid=ps.request(self.store,self.cfg,self.later(95))
+        self.assertTrue(jid)
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM service_state WHERE key='portfolio_dirty'").fetchone())
+        reasons=json.loads(self.store.db.execute("SELECT value FROM service_state WHERE key='portfolio_forced_reasons'").fetchone()[0])
+        self.assertEqual(reasons,['CASH_CHANGED'])
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM jobs WHERE kind='portfolio_strategy' AND status='PENDING'").fetchone())
+
+    def test_request_forced_by_withdrawal_reservation(self):
+        with self.store.db:self.store.db.execute('UPDATE paper_accounts SET cash_cents=20000000')
+        self.wplan();self.approve()
+        from ashare import withdrawals
+        view=withdrawals.refresh(self.store,self.cfg,self.later(95))  # real reservation entry
+        self.assertGreater(view['reserved_cents'],0,view)
+        self.assertEqual(ps.forced_reasons(self.store,self.cfg,self.later(95)),['WITHDRAWAL_CHANGED'])
+
+    def record_fill(self,qty=100,price=1000,day='2026-09-10'):
+        """A held position entitled to a dividend needs ledger facts at the record date."""
+        self.store.db.execute('PRAGMA foreign_keys=OFF')
+        with self.store.db:
+            self.store.db.execute('INSERT INTO quotes VALUES(?,?,?,?,?,?,?,?,?)',
+                ('q-fill',self.SYMBOL,'合成',price,1000,day+'T15:00:00+08:00',day+'T15:00:00+08:00','SYNTHETIC','synthetic'))
+            self.store.db.execute('INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                ('o-fill','d-fill','plan-1',self.SYMBOL,'BUY',qty,qty,price,0,day+'T10:00:00+08:00',day+'T15:00:00+08:00','FILLED'))
+            self.store.db.execute('INSERT INTO paper_fills VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                ('f-fill','o-fill','q-fill',self.SYMBOL,'BUY',qty,price,0,0,day+'T10:00:00+08:00',day+'T10:00:00+08:00'))
+        self.store.db.execute('PRAGMA foreign_keys=ON')
+
+    def test_request_forced_by_dividend_credit(self):
+        self.hold();self.record_fill()
+        action={'cash_per_share':'0.5','record_date':'2026-09-14','ex_date':'2026-09-15','doc_id':'doc'}
+        self.wplan(payload={**self.original,'corporate_actions':[action]});self.approve()
+        from ashare import dividends
+        done=dividends.credit(self.store,self.cfg,self.later(95))['credited']  # real posting entry
+        self.assertEqual(len(done),1)
+        self.assertEqual(done[0]['amount_cents'],5000)
+        self.assertEqual(ps.forced_reasons(self.store,self.cfg,self.later(95)),['CASH_CHANGED'])
+
+    def test_request_forced_by_cost_and_halt(self):
+        self.hold();self.wplan();self.approve()
+        with self.store.db:
+            self.store.db.execute('UPDATE paper_lots SET cost_cents=cost_cents+1')
+            self.store.db.execute("INSERT OR REPLACE INTO portfolio_risk VALUES('DEMO_PAPER',?,?)",
+                (self.later(30),json.dumps({'halted':True})))
+        self.assertEqual(ps.forced_reasons(self.store,self.cfg,self.later(95)),
+            ['COST_CHANGED:watchlist:'+self.SYMBOL,'HALT_CHANGED'])
+
+    def test_buy_order_reservation_does_not_force_rerun(self):
+        p,i=self.plan('BTC')
+        self.wplan();self.approve({'global:BTC':{'action':'ALLOW','target_bps':100}})
+        q=self.quote('BTC',at=self.later(95))
+        order=global_paper.submit(self.store,self.cfg,'BTC','BUY',q,p,i,self.later(95))
+        self.assertIn('id',order,order);self.assertGreater(order['reserved_cents'],0)
+        self.assertEqual(ps.forced_reasons(self.store,self.cfg,self.later(95)),[])
+        self.assertIsNone(ps.request(self.store,self.cfg,self.later(95)))
+        self.assertFalse(self.store.db.execute("SELECT 1 FROM service_state WHERE key='portfolio_dirty'").fetchone())
+
+    def test_legacy_payload_missing_account_and_audit_skips_new_reasons(self):
+        self.wplan();self.approve()
+        payload=ps.active(self.store,self.at)['payload']
+        payload.pop('account',None);payload.pop('publication_audit',None)
+        for d in payload['decisions']:d.pop('cost_cents',None)
+        with self.store.db:
+            self.store.db.execute("UPDATE portfolio_decisions SET payload_json=? WHERE status='ACTIVE'",(json.dumps(payload),))
+            self.store.db.execute('UPDATE paper_accounts SET cash_cents=cash_cents-100000')
+            self.store.db.execute("INSERT OR REPLACE INTO portfolio_risk VALUES('DEMO_PAPER',?,?)",
+                (self.later(30),json.dumps({'halted':True})))
+        self.assertEqual(ps.forced_reasons(self.store,self.cfg,self.later(95)),[])
+
+    def write(self,sql,args=()):
+        with self.store.db:self.store.db.execute(sql,args)
+
+    def model_with(self,mutate):
+        def model(prompt,*args):
+            packet=json.loads(prompt.split('<UNTRUSTED_INPUT>')[1].split('</UNTRUSTED_INPUT>')[0])
+            mutate()
+            return self.output(packet)
+        return model
+
+    def test_immaterial_renewal_during_model_publishes_on_the_fresh_row(self):
+        self.wplan();self.approve()
+        result=ps.run(self.store,self.cfg,self.later(60),model_fn=self.model_with(self.renew),clock=lambda:self.later(90))
+        self.assertEqual(result['status'],'SUCCEEDED',result)
+        payload=ps.active(self.store,self.later(90))['payload']
+        decision=next(d for d in payload['decisions'] if d['key']=='watchlist:'+self.SYMBOL)
+        self.assertEqual(decision['source_id'],'plan-2')
+        self.assertEqual(ps.changed_keys(self.store,self.cfg,self.later(90)),[])
+        self.assertIsNotNone(ps.decision(self.store,self.cfg,'watchlist',self.SYMBOL,self.later(90)))
+
+    def test_material_change_during_model_defers_with_reason(self):
+        self.wplan();self.approve()
+        cases={'blocker':lambda p:p['blockers'].append('X'),'level':lambda p:p['levels'].update(stop_cents=960)}
+        for name,mutate in cases.items():
+            with self.subTest(name=name):
+                result=ps.run(self.store,self.cfg,self.later(60),
+                    model_fn=self.model_with(lambda:self.renew(plan='plan-'+name,mutate=mutate)),clock=lambda:self.later(90))
+                self.assertEqual(result['status'],'DEFERRED',result)
+                self.assertIn('分析期间研究、持仓或挂单变化，等待重新判断',result['error'])
+                self.assertIn('SOURCE_MATERIAL_CHANGED:watchlist:'+self.SYMBOL,result['error'])
+
+    def test_state_change_during_model_defers_with_reason(self):
+        self.wplan();self.approve()
+        cases={'POSITION_CHANGED':lambda:self.hold(qty=200),
+               'CASH_CHANGED':lambda:self.write('UPDATE paper_accounts SET cash_cents=cash_cents-1'),
+               'ORDERS_CHANGED':lambda:self.write(
+                   "INSERT INTO global_orders VALUES('o-pub','i-pub','p-pub','BTC','BUY',1,0,1,1,?,?,'OPEN','{}')",
+                   (self.later(60),self.later(3600))),
+               'HALT_CHANGED':lambda:self.write(
+                   "INSERT OR REPLACE INTO portfolio_risk VALUES('DEMO_PAPER',?,?)",(self.later(60),json.dumps({'halted':True})))}
+        for code,mutate in cases.items():
+            with self.subTest(code=code):
+                result=ps.run(self.store,self.cfg,self.later(60),model_fn=self.model_with(mutate),clock=lambda:self.later(90))
+                self.assertEqual(result['status'],'DEFERRED',result)
+                self.assertIn(code,result['error'])
+
+    def test_source_token_change_during_model_defers_with_reason(self):
+        self.quote('BTC');p,i=self.plan('BTC')
+        self.wplan();self.approve()
+        def mutate():
+            self.write("UPDATE global_plans SET valid_until=? WHERE id=?",(self.later(7200),p['id']))
+        result=ps.run(self.store,self.cfg,self.later(60),model_fn=self.model_with(mutate),clock=lambda:self.later(90))
+        self.assertEqual(result['status'],'DEFERRED',result)
+        self.assertIn('SOURCE_CHANGED:global:BTC',result['error'])
+
+
+class ActionabilityGatingTests(MaterialTriggerTests):
+    """r3: a non-actionable candidate (qty=0 and can_increase=False) cannot force a re-run."""
+    KEY = 'watchlist:sz000333'
+
+    def blocked(self):
+        return dict(self.original, blockers=['SOURCE_GAP:tencent_daily'])
+
+    def hold_y(self, symbol):
+        self.write('PRAGMA foreign_keys=OFF')
+        self.write("INSERT OR REPLACE INTO paper_lots VALUES(?,?,?,?,?)",
+                   ('lot-' + symbol, symbol, 100, 94000, '2026-09-10'))
+        self.write('INSERT OR IGNORE INTO quotes VALUES(?,?,?,?,?,?,?,?,?)',
+                   (symbol + '-q', symbol, '乙', 1000, 1000, self.at, self.at, 'SYNTHETIC', 'synthetic'))
+
+    def test_non_actionable_changes_do_not_trigger(self):
+        self.wplan(payload=self.blocked()); self.approve()
+        self.renew(plan='plan-b2', mutate=lambda p: p.update(blockers=['STALE_DAILY_BARS']))
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), [])
+        self.renew(plan='plan-s2', study='study-2')
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), [])
+        self.assertIsNone(ps.request(self.store, self.cfg, self.later(95)))
+        self.assertFalse(self.store.db.execute(
+            "SELECT 1 FROM jobs WHERE kind='portfolio_strategy' AND status='PENDING'").fetchone())
+
+    def test_actionable_candidates_still_trigger(self):
+        # can_increase candidate: same blocker flip counts.
+        self.wplan(); self.approve()
+        self.renew(plan='plan-c', mutate=lambda p: p['blockers'].append('X'))
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), [self.KEY])
+        # held candidate: a new study_id counts too.
+        self.hold(); self.aquote(1000); self.wplan(plan='plan-h'); self.approve()
+        self.renew(plan='plan-h2', study='study-2')
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), [self.KEY])
+
+    def test_can_increase_flip_triggers(self):
+        self.wplan(payload=self.blocked()); self.approve()
+        self.renew(plan='plan-clear', mutate=lambda p: p.update(blockers=[]))
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), [self.KEY])
+
+    def test_new_candidate_gating(self):
+        self.wplan(); self.approve()
+        # A new non-actionable dynamic case (RESEARCH, not yet ready) is ignored.
+        self.write('PRAGMA foreign_keys=OFF')
+        self.write("INSERT INTO dynamic_cases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   ('dc-1', 'n-1', 'sz000999', '动态', 't', 'e', 'LONG', self.at,
+                    self.later(7200), 'b', 'RESEARCH', '{}', '{}'))
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), [])
+        # A new actionable watchlist candidate with a source counts.
+        self.cfg['watchlist'].append({'symbol': 'sz000555', 'name': '新'})
+        self.wplan(symbol='sz000555', plan='plan-new')
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), ['watchlist:sz000555'])
+
+    def test_disappearing_candidate_gating(self):
+        self.wplan(payload=self.blocked()); self.approve()
+        self.write("UPDATE plans SET status='EXPIRED' WHERE id='plan-1'")
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), [])
+        self.hold(); self.aquote(1000); self.wplan(plan='plan-h'); self.approve()
+        self.write("UPDATE plans SET status='EXPIRED' WHERE id='plan-h'")
+        self.assertEqual(ps.changed_keys(self.store, self.cfg, self.at), [self.KEY])
+
+    def test_decision_dependency_gated_by_actionability(self):
+        self.wplan()  # X: actionable
+        self.cfg['watchlist'].append({'symbol': 'sz000555', 'name': '乙'})
+        self.wplan(symbol='sz000555', plan='plan-y', payload=self.blocked())  # Y: non-actionable
+        self.approve({self.KEY: {'action': 'ALLOW', 'target_bps': 500, 'related_keys': ['watchlist:sz000555']}})
+        self.assertIsNotNone(ps.decision(self.store, self.cfg, 'watchlist', self.SYMBOL, self.at))
+        # A material reissue of non-actionable Y must not lapse X's ALLOW.
+        self.wplan(symbol='sz000555', plan='plan-y2', payload=dict(self.original, blockers=['X', 'Y']))
+        self.assertIsNotNone(ps.decision(self.store, self.cfg, 'watchlist', self.SYMBOL, self.at))
+    def test_decision_dependency_lapses_when_dependency_was_actionable(self):
+        # Y held at decision time: its material reissue lapses X's ALLOW as before.
+        self.wplan()
+        self.cfg['watchlist'].append({'symbol': 'sz000555', 'name': '乙'})
+        self.hold_y('sz000555')
+        self.wplan(symbol='sz000555', plan='plan-y3')
+        self.approve({self.KEY: {'action': 'ALLOW', 'target_bps': 500, 'related_keys': ['watchlist:sz000555']}})
+        self.wplan(symbol='sz000555', plan='plan-y4', payload=dict(self.original, blockers=['Z']))
+        self.assertIsNone(ps.decision(self.store, self.cfg, 'watchlist', self.SYMBOL, self.at))
+
+    def test_publication_gated_by_relevance_and_can_increase(self):
+        # Non-actionable source change during inference publishes (relevance tolerated).
+        self.wplan(payload=self.blocked()); self.approve()
+        result = ps.run(self.store, self.cfg, self.later(60),
+            model_fn=self.model_with(lambda: self.renew(plan='plan-na', mutate=lambda p: p.update(blockers=['Y']))),
+            clock=lambda: self.later(90))
+        self.assertEqual(result['status'], 'SUCCEEDED', result)
+        # The same change on an actionable candidate defers with the material reason.
+        self.wplan(plan='plan-a'); self.approve()
+        result = ps.run(self.store, self.cfg, self.later(120),
+            model_fn=self.model_with(lambda: self.renew(plan='plan-ma', mutate=lambda p: p['blockers'].append('Z'))),
+            clock=lambda: self.later(150))
+        self.assertEqual(result['status'], 'DEFERRED', result)
+        self.assertIn('SOURCE_MATERIAL_CHANGED:' + self.KEY, result['error'])
+        # A can_increase flip during inference defers with the new code.
+        self.wplan(plan='plan-flip', payload=self.blocked()); self.approve()
+        result = ps.run(self.store, self.cfg, self.later(180),
+            model_fn=self.model_with(lambda: self.renew(plan='plan-clr', mutate=lambda p: p.update(blockers=[]))),
+            clock=lambda: self.later(210))
+        self.assertEqual(result['status'], 'DEFERRED', result)
+        self.assertIn('CAN_INCREASE_CHANGED:' + self.KEY, result['error'])
+
+    def test_can_increase_true_to_false_during_model_publishes_paused(self):
+        # True->False is tolerated: the publish layer tightens ALLOW to PAUSE and audits it.
+        # Expiring a watchlist plan flips can_increase without touching source_material.
+        self.wplan(); self.approve()
+        def model(prompt, *a):
+            packet = json.loads(prompt.split('<UNTRUSTED_INPUT>')[1].split('</UNTRUSTED_INPUT>')[0])
+            self.write('UPDATE plans SET valid_until=? WHERE id=?', (self.later(61), 'plan-1'))
+            return self.output(packet, {self.KEY: {'action': 'ALLOW', 'target_bps': 100}})
+        result = ps.run(self.store, self.cfg, self.later(60), model_fn=model, clock=lambda: self.later(90))
+        self.assertEqual(result['status'], 'SUCCEEDED', result)
+        payload = ps.active(self.store, self.later(90))['payload']
+        item = next(x for x in payload['publication_audit']['decisions'] if x['key'] == self.KEY)
+        self.assertEqual((item['published_action'], item['published_target_bps']), ('PAUSE', 0))
+        self.assertFalse(item['publication_basis']['can_increase'])
+
+
+class PublicationSetChangeTests(ActionabilityGatingTests):
+    """r4: a non-actionable candidate appearing or disappearing during inference no
+    longer defers publication — additions get a synthetic PAUSE, removals are
+    stripped from decisions/risk_groups/related_keys before re-validation."""
+
+    def dcase(self):
+        self.write('PRAGMA foreign_keys=OFF')
+        self.write("INSERT INTO dynamic_cases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   ('dc-1', 'n-1', 'sz000999', '动态', 't', 'e', 'LONG', self.at,
+                    self.later(7200), 'b', 'RESEARCH', '{}', '{}'))
+
+    def test_non_actionable_add_gets_synthetic_pause(self):
+        self.wplan(); self.approve()
+        r = ps.run(self.store, self.cfg, self.later(60),
+                   model_fn=self.model_with(self.dcase), clock=lambda: self.later(90))
+        self.assertEqual(r['status'], 'SUCCEEDED', r)
+        payload = ps.active(self.store, self.later(90))['payload']
+        d = next(x for x in payload['decisions'] if x['key'] == 'dynamic:dc-1')
+        self.assertEqual(d['action'], 'PAUSE')
+        self.assertEqual(d['target_bps'], 0)
+        self.assertIn('新出现的候选', d['reason'])
+        self.assertEqual(d['related_keys'], [])
+
+    def test_non_actionable_remove_is_stripped_and_revalidated(self):
+        self.wplan(); self.dcase()
+        self.approve({self.KEY: {'action': 'PAUSE', 'target_bps': 0,
+                                 'related_keys': ['dynamic:dc-1']}},
+                     groups=[{'name': 'g1', 'keys': [self.KEY, 'dynamic:dc-1'],
+                              'max_bps': 6000, 'reason': 'r'}])
+        r = ps.run(self.store, self.cfg, self.later(60),
+                   model_fn=self.model_with(
+                       lambda: self.write("UPDATE dynamic_cases SET status='EXPIRED' WHERE id='dc-1'")),
+                   clock=lambda: self.later(90))
+        self.assertEqual(r['status'], 'SUCCEEDED', r)
+        payload = ps.active(self.store, self.later(90))['payload']
+        self.assertNotIn('dynamic:dc-1', [d['key'] for d in payload['decisions']])
+        for d in payload['decisions']:
+            self.assertNotIn('dynamic:dc-1', d['related_keys'])
+        self.assertTrue(all(len(g['keys']) >= 2 for g in payload['risk_groups']))
+
+    def test_actionable_add_still_defers(self):
+        self.wplan(); self.approve()
+        def add_buyable():
+            self.cfg['watchlist'].append({'symbol': 'sz000555', 'name': '乙'})
+            self.wplan(symbol='sz000555', plan='plan-new')
+        r = ps.run(self.store, self.cfg, self.later(60),
+                   model_fn=self.model_with(add_buyable), clock=lambda: self.later(90))
+        self.assertEqual(r['status'], 'DEFERRED', r)
+
+    def test_actionable_remove_still_defers(self):
+        self.hold(); self.aquote(1000); self.wplan(plan='plan-h'); self.approve()
+        r = ps.run(self.store, self.cfg, self.later(60),
+                   model_fn=self.model_with(
+                       lambda: self.write("UPDATE plans SET status='EXPIRED' WHERE id='plan-h'")),
+                   clock=lambda: self.later(90))
+        self.assertEqual(r['status'], 'DEFERRED', r)

@@ -94,6 +94,8 @@ def measure(store,config,at):
 
 def eligibility(store,config,c,at,*,execution=True):
  a=json.loads(c['analysis_json']);plan=json.loads(c['plan_json']);block=[]
+ from .research_only import contains
+ if contains(store,config,c['symbol']):block.append('RESEARCH_ONLY')
  from .investment_policy import enabled
  if enabled(config):
   from .observation import all_items
@@ -230,7 +232,7 @@ def cycle(store,config,end=None,model_fn=None,collect_fn=None,impact_model_fn=No
  payload={};failures=[]
  from .connectivity import check as online_or_stop
  try:
-  payload=(collect_fn or data.collect)(store,start,stop,at)
+  payload=collect_fn(store,start,stop,at) if collect_fn else data.collect(store,start,stop,at,config=config)
   failures+=payload.get('failures',[])
   online_or_stop(store)
   from . import macro,macro_sources,macro_impact,impact_history,news_triage

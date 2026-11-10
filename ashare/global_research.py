@@ -150,7 +150,7 @@ def run(store, config, at=None, model_fn=None, fetch_quotes=True):
         if config.get('industry_enabled') and symbol.startswith('US:'):
             from .us_company import dossier
             from .industry import context
-            company={'fundamentals':dossier(store,symbol,at,refresh=fetch_quotes),'industry':context(store,symbol,at)}
+            company={'fundamentals':dossier(store,symbol,at,refresh=fetch_quotes,config=config),'industry':context(store,symbol,at)}
             if fetch_quotes:at=max(at,normalize_time(now()))
             company['evidence']=[e for e in store.search('revenue cash liabilities liquidity risk capital expenditure segment',at,symbol,limit=40,cloud_only=True) if e['symbol']==symbol and e['kind']=='company_report'][:16]
         event_fp = digest(json.dumps(causes, ensure_ascii=False, sort_keys=True))

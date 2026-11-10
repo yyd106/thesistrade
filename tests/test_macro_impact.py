@@ -152,7 +152,8 @@ class ImpactTests(unittest.TestCase):
   from ashare import dynamic
   self.event();calls=[]
   def model(prompt,*args):calls.append(prompt);return reviewer(prompt)
-  with patch('ashare.dynamic.now',return_value=self.at),patch('ashare.macro.select_news',return_value=[]),patch('ashare.macro_sources.refresh_markets',return_value=[]),patch('ashare.sources.stock_catalog',return_value=[]),patch('ashare.dynamic_sources.refresh_market'):
+  # Article retrieval is outside this backlog orchestration test; no live publisher request.
+  with patch('ashare.dynamic.now',return_value=self.at),patch('ashare.macro.select_news',return_value=[]),patch('ashare.macro_sources.refresh_markets',return_value=[]),patch('ashare.sources.stock_catalog',return_value=[]),patch('ashare.dynamic_sources.refresh_market'),patch('ashare.news_evidence.fetch_missing',return_value={'checked':0,'extracted':0,'failures':[]}):
    r=dynamic.cycle(self.s,self.cfg,collect_fn=lambda *args:{'failures':[]},impact_model_fn=model)
   self.assertEqual(r['impact_review']['reviewed'],1);self.assertEqual(len(calls),1);self.assertEqual(r['global_selected'],0)
   self.assertEqual(self.s.db.execute('SELECT count(*) FROM dynamic_orders').fetchone()[0],0)

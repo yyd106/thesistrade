@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta
 from .storage import now, normalize_time, digest
 from .investment_policy import enabled
-from .global_market import SCALE, notional, latest, fresh, session_open, targets, fx_age, FX_BUY_MAX_AGE, FX_SELL_MAX_AGE
+from .global_market import SCALE, notional, quantity_step, quantity_for_notional, latest, fresh, session_open, targets, fx_age, FX_BUY_MAX_AGE, FX_SELL_MAX_AGE
 
 OPEN = "('OPEN','PARTIAL','UNKNOWN')"
 
@@ -54,7 +54,7 @@ def exit_reason(store, config, symbol, p, q, at):
     return None
 
 
-def submit(store, config, symbol, side, q, plan, item, at):
+def submit(store, config, symbol, side, q, plan, item, at, sell_qty=None, exposure_order=None):
     from .cloud_runtime import execution_allowed
     execution_allowed(store,config,at)
     from .paper import account_inside_transaction, fee
@@ -69,11 +69,15 @@ def submit(store, config, symbol, side, q, plan, item, at):
     refresh_withdrawals(store,config,at)
     refresh(store, config, at)
     intent = (plan['id'] if plan else symbol)+':'+side+(':'+at[:16] if side == 'SELL' else '')
+    if exposure_order:
+        intent += ':exposure:' + exposure_order['episode']
     if side=='BUY' and ps.enabled(config):
         d=ps.decision(store,config,'global',symbol,at)
         intent+=':portfolio:'+(d['portfolio_id'] if d else 'pending')
     store.db.execute('BEGIN IMMEDIATE')
     try:
+        from .research_only import contains
+        if contains(store,config,symbol):raise ValueError('RESEARCH_ONLY')
         refresh_inside(store,config,at)
         if side=='BUY' and pending(store):
             store.db.commit();return {'status':'BLOCKED','reason':'WITHDRAWAL_PENDING'}
@@ -110,12 +114,13 @@ def submit(store, config, symbol, side, q, plan, item, at):
             limit = min(levels['buy_high_micros'], (q['price_micros']*(10000+config['paper_slippage_bps'])+9999)//10000)
             # Include a 1% FX buffer, but settlement still checks actual reserved funds.
             reserve_fx = (q['fx_micros']*101+99)//100
+            from .exposure import gross_cap_pct
             budget = min(a['available_cents'], a['equity_cents']*min(5, config['paper_max_stock_pct'])//100,
-                         a['equity_cents']*config['paper_max_gross_pct']//100-a['market_value_cents']-a['reserved_cents'])
+                         a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-a['reserved_cents'])
             if ps.enabled(config) and store.db.execute("SELECT 1 FROM global_orders o JOIN global_fills f ON f.order_id=o.id WHERE o.plan_id=? AND f.side='BUY' LIMIT 1",(plan['id'],)).fetchone():raise ValueError('该研究已执行入场')
             budget=min(budget,ps.buy_budget(store,config,'global',symbol,at,a))
-            step = SCALE if symbol.startswith('US:') else 10_000
-            qty = max(0, (budget-config['paper_min_fee_cents'])*SCALE*10**12//(limit*reserve_fx*100)//step*step)
+            step = quantity_step(symbol)
+            qty = quantity_for_notional(symbol, budget-config['paper_min_fee_cents'], limit, reserve_fx)
             while qty > 0:
                 gross = notional(qty, limit, reserve_fx)
                 if gross+fee(terms, 'BUY', gross) <= budget:
@@ -127,8 +132,8 @@ def submit(store, config, symbol, side, q, plan, item, at):
             reason = 'DAY_PLAN_ENTRY'
         else:
             reason = exit_reason(store, config, symbol, p, q, at)
-            portfolio_exit=not reason
-            qty=ps.exit_quantity(store,config,'global',symbol,at,q) if portfolio_exit else p['qty']
+            portfolio_exit=not reason and sell_qty is None
+            qty=sell_qty if sell_qty is not None else (ps.exit_quantity(store,config,'global',symbol,at,q) if portfolio_exit else p['qty'])
             if not qty:
                 raise ValueError('退出条件未满足')
             if portfolio_exit:reason='PORTFOLIO_REDUCE'
@@ -140,8 +145,13 @@ def submit(store, config, symbol, side, q, plan, item, at):
             expiry = min(expiry, plan['valid_until'])
         terms.update(portfolio_strategy=config.get('portfolio_strategy'),portfolio_decision=ps.order_context(store,config,'global',symbol,at),portfolio_exit=side=='SELL' and portfolio_exit,reason=reason, currency='USD', qty_scale=SCALE, quote_id=q['id'], plan_id=plan['id'] if plan else None,
                      fx_age_seconds=round(fx_age(q, at)), fx_stale=fx_age(q, at) > FX_BUY_MAX_AGE)
+        if exposure_order:
+            terms['exposure_episode'] = exposure_order['episode']
         store.db.execute('INSERT INTO global_orders VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?)',
                          (oid, intent, plan['id'] if plan else None, symbol, side, qty, limit, reserved, at, expiry, 'OPEN', json.dumps(terms)))
+        if exposure_order:
+            from .exposure import register_order_inside
+            register_order_inside(store, exposure_order, oid, qty)
         store.db.commit()
         return dict(store.db.execute('SELECT * FROM global_orders WHERE id=?', (oid,)).fetchone())
     except ValueError as exc:
@@ -167,8 +177,13 @@ def settle(store, config, at, selected):
         refresh_inside(store,config,at)
         for row in store.db.execute("SELECT * FROM global_orders WHERE status IN ('OPEN','PARTIAL') ORDER BY created_at,id").fetchall():
             o = dict(row)
+            from .exposure import order_can_settle_inside
+            if not order_can_settle_inside(store, config, at, 'global', o, json.loads(o['payload_json'])):
+                continue
             def cancel(status='CANCELLED'):
                 store.db.execute('UPDATE global_orders SET status=?,reserved_cents=0 WHERE id=?', (status, o['id']))
+            from .research_only import contains
+            if contains(store,config,o['symbol']):cancel();continue
             if o['expires_at'] <= at:
                 cancel('EXPIRED');continue
             plan = store.db.execute('SELECT * FROM global_plans WHERE id=?', (o['plan_id'],)).fetchone()
@@ -188,9 +203,9 @@ def settle(store, config, at, selected):
             price = (q['price_micros']*(10000+terms['paper_slippage_bps'])+9999)//10000 if o['side'] == 'BUY' else q['price_micros']*(10000-terms['paper_slippage_bps'])//10000
             if o['side'] == 'BUY' and price > o['limit_micros'] or o['side'] == 'SELL' and price < o['limit_micros']:
                 continue
-            step = SCALE if o['symbol'].startswith('US:') else 10_000
+            step = quantity_step(o['symbol'])
             # At most CNY 5,000 per new observation; one whole share allowed above that.
-            max_qty = max(step, 500_000*SCALE*10**12//(price*q['fx_micros']*100)//step*step)
+            max_qty = max(step, quantity_for_notional(o['symbol'], 500_000, price, q['fx_micros']))
             qty = min(o['qty']-o['filled_qty'], max_qty)
             if terms.get('portfolio_exit'):
                 qty=min(qty,ps.exit_quantity(store,config,'global',o['symbol'],at,q))
@@ -201,9 +216,10 @@ def settle(store, config, at, selected):
             costs = fee(terms, o['side'], prior[0]+gross)-prior[1]
             a = account_inside_transaction(store, at)
             realized = 0
+            from .exposure import gross_cap_pct
             if o['side'] == 'BUY':
                 available = a['cash_cents']-a['reserved_cents']+o['reserved_cents']-a['withdrawal_reserved_cents']
-                gross_room = a['equity_cents']*config['paper_max_gross_pct']//100-a['market_value_cents']-(a['reserved_cents']-o['reserved_cents'])
+                gross_room = a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-(a['reserved_cents']-o['reserved_cents'])
                 own = a['global_positions'].get(o['symbol'], {}).get('market_value_cents', 0)
                 stock_room = a['equity_cents']*min(5, config['paper_max_stock_pct'])//100-own
                 portfolio_room=o['reserved_cents']

@@ -39,7 +39,9 @@ from .calendar import local, trading_day, previous_trading_day
 from .materiality import DIVIDEND_IMPLEMENTATION_ADDED
 from .dividends import held_at_record
 
-RULE_VERSION='cash_dividend_review_v2.2'
+RULE_VERSION='cash_dividend_review_v2.3'
+# New review statuses a buy gate may treat as resolved; they are never exact verifications.
+RESOLVED_STATUSES=('VERIFIED','OUT_OF_WINDOW','APPROXIMATED')
 RESOLUTIONS=('UNSUPPORTED','EVIDENCE','LINKED','WAIT')  # when several apply, the first listed is reported
 
 # PDF fonts sometimes yield Kangxi radicals (⽇ for 日) or full-width digits; fold only those.
@@ -252,12 +254,15 @@ def differentiated(t,follow=False):
 def content_problems(t,follow=False):
     """What in the text rules out a pure cash dividend, as (resolution, message) pairs."""
     problems=[];firm=sentences(t)
-    if any(STOCK.search(s) for s in firm):problems.append(('UNSUPPORTED','本次分配包含送股或资本公积金转增；当前核验规则只支持纯现金分红，送转未支持'))
-    if any(RIGHTS.search(s) for s in firm):problems.append(('UNSUPPORTED','公告写有配股安排；当前核验规则未支持配股'))
-    if any('外币' in s and not re.search('[HB]股',s) for s in firm):problems.append(('UNSUPPORTED','涉及外币派发；当前核验规则未支持'))
-    if any(CANCELLED.search(s) for s in firm):problems.append(('EVIDENCE','公告涉及取消、终止、暂缓或延期本次分红，需核对最新公告'))
+    if any(STOCK.search(s) for s in firm):problems.append(problem('UNSUPPORTED','STOCK_DISTRIBUTION','本次分配包含送股或资本公积金转增；当前核验规则只支持纯现金分红，送转未支持'))
+    if any(RIGHTS.search(s) for s in firm):problems.append(problem('UNSUPPORTED','RIGHTS','公告写有配股安排；当前核验规则未支持配股'))
+    if any('外币' in s and not re.search('[HB]股',s) for s in firm):problems.append(problem('UNSUPPORTED','FOREIGN_CURRENCY','涉及外币派发；当前核验规则未支持'))
+    if any(CANCELLED.search(s) for s in firm):problems.append(problem('EVIDENCE','CANCELLED','公告涉及取消、终止、暂缓或延期本次分红，需核对最新公告'))
     diff=differentiated(t,follow)
-    if diff:problems.append(('UNSUPPORTED',diff))
+    if diff:problems.append(problem('UNSUPPORTED','DIFFERENTIATED',diff))
+    vstate,found=virtual_cash(t)
+    if vstate=='CONFLICT':
+        problems.append(problem('EVIDENCE','VIRTUAL_DISTRIBUTION_CONFLICT','VIRTUAL_DISTRIBUTION_CONFLICT：公告写出多个不同的虚拟分派每股现金（'+'、'.join(_yuan(v) for v in found)+' 元），需核对以哪一处为准；当前核验规则未支持'))
     return problems
 
 
@@ -285,23 +290,23 @@ def cash_terms(text,symbol):
     """Facts of a pure cash dividend, and the problems that stop automatic verification as
     (resolution, message) pairs."""
     t=tight(text);problems=[]
-    if not code_matches(t,symbol):problems.append(('EVIDENCE','公告正文中的证券代码须与本股票一致'))
+    if not code_matches(t,symbol):problems.append(problem('EVIDENCE','CODE_MISMATCH','公告正文中的证券代码须与本股票一致'))
     problems+=content_problems(t)
     cash,seen=per_share_cash(t)
     if cash is None:
-        problems.append(('UNSUPPORTED',('读到多个不同的税前每股现金分红：'+'、'.join(sorted(_yuan(v) for v in seen))+' 元' if len(seen)>1 else
+        problems.append(problem('UNSUPPORTED','CASH_PARSE',('读到多个不同的税前每股现金分红：'+'、'.join(sorted(_yuan(v) for v in seen))+' 元' if len(seen)>1 else
              '未读出税前每股现金分红')+'；支持“每股派发现金红利X元（含税）”“A股每股现金红利X元”“每10股派X元（含税）”，正文已取得时属于解析规则未支持'))
     else:
         other=other_amounts(t,cash)
         if other:
-            problems.append(('UNSUPPORTED','正文还写有其他每股派现金额（'+'、'.join(_yuan(v) for v in other)+
+            problems.append(problem('UNSUPPORTED','CASH_OTHER_AMOUNT','正文还写有其他每股派现金额（'+'、'.join(_yuan(v) for v in other)+
                              ' 元），可能是特别分红或调整后的金额；当前核验规则未支持'))
     record,ex=dividend_dates(t)
-    if not record:problems.append(('UNSUPPORTED','未读出唯一的股权登记日；支持“股权登记日为X年X月X日”及上交所“相关日期”表格，正文已取得时属于解析规则未支持'))
-    if not ex:problems.append(('UNSUPPORTED','未读出唯一的除权除息日；支持“除权除息日为X年X月X日”及上交所“相关日期”表格，正文已取得时属于解析规则未支持'))
+    if not record:problems.append(problem('UNSUPPORTED','RECORD_DATE','未读出唯一的股权登记日；支持“股权登记日为X年X月X日”及上交所“相关日期”表格，正文已取得时属于解析规则未支持'))
+    if not ex:problems.append(problem('UNSUPPORTED','EX_DATE','未读出唯一的除权除息日；支持“除权除息日为X年X月X日”及上交所“相关日期”表格，正文已取得时属于解析规则未支持'))
     if record and ex:
-        problem=calendar_problem(record,ex)
-        if problem:problems.append(('UNSUPPORTED',problem))
+        cal=calendar_problem(record,ex)
+        if cal:problems.append(problem('UNSUPPORTED','CALENDAR',cal))
     fen=cash*100 if cash is not None else None
     terms={'cash_per_share':_yuan(cash) if cash is not None else None,
            'cash_per_share_cents':int(fen) if fen is not None and fen==fen.to_integral_value() else None,
@@ -342,6 +347,23 @@ def same_distribution(a,b,halt=False):
     return pa[:4]==pb[:4] and annual(pa)==annual(pb)
 
 
+class Problem(tuple):
+    """A (resolution, message) pair carrying a machine-readable kind, so filters never have to
+    read the Chinese text. Equality, hashing and 2-tuple unpacking are unchanged."""
+    def __new__(cls, resolution, kind, message):
+        self = super().__new__(cls, (resolution, message))
+        self.kind = kind
+        return self
+
+
+def problem(resolution, kind, message):
+    return Problem(resolution, kind, message)
+
+
+def kind_of(pair):
+    return getattr(pair, 'kind', None)
+
+
 def _close(result,problems):
     result['missing']=[m for _,m in problems]
     kinds={k for k,_ in problems}
@@ -354,9 +376,11 @@ def _block(result,kind,message):
     result['resolution']=next(k for k in RESOLUTIONS if k in kinds)
 
 
-def reference_problem(store,symbol,terms,bars,at):
+def reference_problem(store,symbol,terms,bars,at,amount=None):
     """The exchange publishes the ex-date's reference price (the quote's previous close that day).
-    It must equal the prior close minus the cash, unless the source did not adjust it at all."""
+    It must equal the prior close minus the cash, unless the source did not adjust it at all.
+    An approximated differentiated dividend prices from its smaller virtual amount, so a wider
+    tolerance applies: max(0.5 cent, 0.1% of the prior close)."""
     ex=terms['ex_date'];prior=[b for b in bars if b[0]==terms['record_date']]
     if not prior:return None
     try:
@@ -365,32 +389,104 @@ def reference_problem(store,symbol,terms,bars,at):
     except Exception:
         return None
     if not row:return None
-    before=Decimal(cents(prior[-1][2]));expected=before-Decimal(terms['cash_per_share'])*100;reference=Decimal(row[0])
+    before=Decimal(cents(prior[-1][2]));expected=before-Decimal(amount if amount is not None else terms['cash_per_share'])*100;reference=Decimal(row[0])
+    tolerance=max(Decimal('0.5'),before*Decimal('0.001')) if amount is not None else Decimal('0.5')
     # The exchange rounds prior close minus cash to the cent; a differentiated dividend uses a smaller virtual amount.
-    if abs(reference-expected)<=Decimal('0.5') or reference==before:return None
+    if abs(reference-expected)<=tolerance or reference==before:return None
     return (f'除息日交易所参考价 {_yuan(reference/100)} 元，与前收盘 {_yuan(before/100)} 元减去每股现金 {terms["cash_per_share"]} 元不符，'
             '可能另有送转、特别分红或日期读错；当前核验规则未支持')
 
 
-def _timing(store,symbol,terms,u,today,at,credits=False):
+def _timing(store,symbol,terms,u,today,at,credits=False,amount=None):
     """Conditions outside the announcement: the date has passed, bars exist, the market priced the
     ex-date as announced, and shares held at the record date can be accounted for: only a ledger
     that credits cash dividends (0.15.5 cloud, or a standalone install) can hold them."""
     problems=[];ex=terms['ex_date'];record=terms['record_date'];bars=u.get('bars',[])
-    if ex>today:problems.append(('WAIT','除息日尚未到达，不提前确认未来实施结果'))
+    if ex>today:problems.append(problem('WAIT','EX_FUTURE','除息日尚未到达，不提前确认未来实施结果'))
     if not u.get('last_complete_date') or u['last_complete_date']<ex:
-        problems.append(('WAIT','等待除息日完成后的完整日线；不提前使用尚未发生的除息调整'))
+        problems.append(problem('WAIT','EX_BARS_PENDING','等待除息日完成后的完整日线；不提前使用尚未发生的除息调整'))
     elif not any(b[0]==ex for b in bars) and not (len(bars)>=60 and bars[0][0]>ex):
         # Only once the ex-date's bar is due; before that its absence is the wait above.
-        problems.append(('EVIDENCE','日线中尚无除息日记录，需核对停牌、日期与价格来源'))
-    if held_at_record(store,symbol,record)>0 and not credits:problems.append(('UNSUPPORTED','策略在登记日持有股票；需先完成现金分红入账和成本核对，当前尚未实现该账务处理'))
-    if len(bars)<60 or u.get('basis')!='UNADJUSTED':problems.append(('EVIDENCE','需要至少60个完整交易日的原始价格记录'))
+        problems.append(problem('EVIDENCE','EX_BAR_MISSING','日线中尚无除息日记录，需核对停牌、日期与价格来源'))
+    if held_at_record(store,symbol,record)>0 and not credits:problems.append(problem('UNSUPPORTED','HELD_AT_RECORD','策略在登记日持有股票；需先完成现金分红入账和成本核对，当前尚未实现该账务处理'))
+    if len(bars)<60 or u.get('basis')!='UNADJUSTED':problems.append(problem('EVIDENCE','BARS_BASIS','需要至少60个完整交易日的原始价格记录'))
     if (trading_day(ex) is None or trading_day(record) is None) and bars and ex>=bars[0][0]:
-        problems.append(('UNSUPPORTED','交易日历未覆盖登记日或除息日所在年份，不能核对日期后调整价格'))
+        problems.append(problem('UNSUPPORTED','CALENDAR_UNKNOWN','交易日历未覆盖登记日或除息日所在年份，不能核对日期后调整价格'))
     if not problems:
-        mismatch=reference_problem(store,symbol,terms,bars,at)
-        if mismatch:problems.append(('UNSUPPORTED',mismatch))
+        mismatch=reference_problem(store,symbol,terms,bars,at,amount=amount)
+        if mismatch:problems.append(problem('UNSUPPORTED','REFERENCE_MISMATCH',mismatch))
     return problems
+
+
+# SSE announces the exchange-adjusted amount as a formula ending ≈X（元/股）; SZSE as
+# “按(公司)总股本折算(的)(每10)?股现金分红(比例)(为|=|≈)X元(/股)”.
+VIRTUAL_SSE=re.compile(r'虚拟分派(?:的|所得)?现金红利[^。；;]{0,80}?[≈=]([0-9]+\.[0-9]+)（?元/股?）?')
+VIRTUAL_SZSE=re.compile(r'按(?:公司)?总股本(?:折算|摊薄)的?每(?:(10)\s*)?股现金(?:分红|红利)(?:比例)?[^，,。；;0-9]{0,15}(?:为|约|≈|=)([0-9]+\.[0-9]+)元(?:/股)?')
+# Only these problem kinds may remain for a relaxed review; everything else stays blocking.
+RELAXABLE={'DIFFERENTIATED','CASH_OTHER_AMOUNT','CASH_PARSE'}
+
+
+def virtual_cash(text):
+    """The stated virtual cash per share for a differentiated dividend, as a tri-state:
+    ('NOT_FOUND', None), ('UNIQUE', Decimal) or ('CONFLICT', sorted values). CONFLICT is a
+    content problem; the share-count fallback never rescues it."""
+    values={Decimal(m.group(1)) for m in VIRTUAL_SSE.finditer(text)}
+    for m in VIRTUAL_SZSE.finditer(text):
+        values.add(Decimal(m.group(2)) / (10 if m.group(1) else 1))
+    if not values:return 'NOT_FOUND',None
+    if len(values)==1:return 'UNIQUE',next(iter(values))
+    return 'CONFLICT',sorted(values)
+
+
+def virtual_ratio(text):
+    """The unique base/total share ratio that computes the virtual amount; None otherwise."""
+    bases={Decimal(b.replace(',','')) for b in BASE.findall(text)};totals={Decimal(x.replace(',','')) for x in TOTAL.findall(text)}
+    if len(bases)==1 and len(totals)==1 and next(iter(totals))>0:
+        return next(iter(bases))/next(iter(totals))
+    return None
+
+
+def relaxed_review(store,symbol,text,terms,problems,u,today,at,credits):
+    """The two deterministic fail-soft rules for cash dividends that cannot be exactly verified.
+    Returns (status, facts_update, adjustment_amount) or None to keep blocking."""
+    if any(kind_of(p) not in RELAXABLE for p in problems):return None
+    record,ex=terms['record_date'],terms['ex_date']
+    if not record or not ex or calendar_problem(record,ex):return None
+    if held_at_record(store,symbol,record)!=0:return None  # accounting must be exact
+    bars=u.get('bars',[])
+    if ex>today or not u.get('last_complete_date') or u['last_complete_date']<ex:return None
+    # Rule 1: the ex-date precedes the whole MA60 window; no price shift is needed at all.
+    if len(bars)>=60 and ex<bars[-60][0]:
+        return 'OUT_OF_WINDOW',{'method':'OUT_OF_WINDOW'},None
+    diff=differentiated(text)
+    if diff not in (DIFFERENTIATED,DIFFERENTIATED_BASE) or terms.get('cash_per_share') is None:return None
+    actual=Decimal(terms['cash_per_share'])
+    prior=[b for b in bars if b[0]==record]
+    vstate,found=virtual_cash(text)
+    if vstate=='CONFLICT':return None  # already a content problem; defensive
+    parsed=found
+    ratio=virtual_ratio(text)
+    # A base equal to the total share capital leaves nothing to approximate.
+    computed=(actual*ratio) if ratio is not None and ratio<1 else None
+    if parsed is not None and computed is not None:
+        # A stated virtual amount is only written to its announced precision: 0.42 vs a computed
+        # 0.41653 is the same amount rounded for disclosure, not a disagreement.
+        decimals=max(0,-parsed.as_tuple().exponent)
+        if abs(parsed-computed)>max(Decimal(10)**-decimals/2,parsed*Decimal('0.005')):return None
+    virtual=parsed if parsed is not None else computed
+    if virtual is None or not 0<virtual<=actual:return None
+    if len(stated_amounts(text)-{actual,virtual}):return None
+    error=(actual-virtual)/(Decimal(cents(prior[-1][2]))/100) if prior else None
+    if parsed is None:
+        if not prior or not (actual-computed)<Decimal(cents(prior[-1][2]))/Decimal(100000):return None
+        amount=actual
+    else:amount=parsed
+    tproblems=_timing(store,symbol,terms,u,today,at,credits,amount=str(amount))
+    if tproblems:return None
+    return 'APPROXIMATED',{'method':'APPROXIMATED','actual_cash_per_share':_yuan(actual),
+        'virtual_cash_per_share':_yuan(virtual),'virtual_source':'PARSED' if parsed is not None else 'COMPUTED',
+        'adjustment_cash_per_share':_yuan(amount),
+        'approximation_error_pct':str((error*100).quantize(Decimal('0.0001'))) if error is not None else None},amount
 
 
 def _floor(value):
@@ -417,22 +513,30 @@ def evaluate(store,symbol,documents,chunks,features,at,credits=False):
             'evidence_ids':[c['id'] for c in chunks.get(doc['id'],[])],'facts':{}}
         results[doc['id']]=result
         if policy['level']=='RISK':
-            problems=[('UNSUPPORTED','需取得此事项的最新进展或正式结论原文，并确认是否仍有赔偿、冻结、处罚或经营影响；当前通用风险事项不能仅凭标题或已读状态自动解除')]
+            problems=[problem('UNSUPPORTED','GENERIC_RISK','需取得此事项的最新进展或正式结论原文，并确认是否仍有赔偿、冻结、处罚或经营影响；当前通用风险事项不能仅凭标题或已读状态自动解除')]
         elif doc['source']!='cninfo' or doc['kind']!='company_report' or not doc['cloud_allowed']:
-            problems=[('EVIDENCE','需要成功取得巨潮原始公告正文；标题、摘要或未经来源核对的导入文本不能自动核验')]
+            problems=[problem('EVIDENCE','NO_FULLTEXT','需要成功取得巨潮原始公告正文；标题、摘要或未经来源核对的导入文本不能自动核验')]
         elif PREFERRED.search(title) and not re.search(r'权益分派|分红派息|除权|除息',title):
-            problems=[('EVIDENCE','优先股股息公告不影响普通股价格，但当前规则不自动核验，需确认与本股票的关系')]
+            problems=[problem('EVIDENCE','PREFERRED','优先股股息公告不影响普通股价格，但当前规则不自动核验，需确认与本股票的关系')]
         elif follow_on(title):
             attached.append(doc);continue
         elif not FINAL.search(title) or NOT_FINAL.search(title):
-            problems=[('EVIDENCE','需要最终实施公告；方案、预案、更正、补充或取消公告还需核对版本关系')]
+            problems=[problem('EVIDENCE','NOT_FINAL','需要最终实施公告；方案、预案、更正、补充或取消公告还需核对版本关系')]
             if CANCEL_TITLE.search(title) or REVISION.search(title):revised.append(doc['title'])
         else:
-            terms,problems=cash_terms(document_text(chunks.get(doc['id'],[])),symbol);result['facts']=terms
+            text=document_text(chunks.get(doc['id'],[]))
+            terms,problems=cash_terms(text,symbol);result['facts']=terms
             mains[doc['id']]=doc
             if not problems:
                 problems=_timing(store,symbol,terms,u,today,at,credits)
                 if not problems:result['status']='VERIFIED'
+            else:
+                relaxed=relaxed_review(store,symbol,tight(text),terms,problems,u,today,at,credits)
+                if relaxed:
+                    result['status'],extra,amount=relaxed
+                    result['facts'].update(extra)
+                    if amount is not None:result['facts']['adjustment_cash_per_share']=_yuan(amount)
+                    problems=[]
         _close(result,problems)
     main_results=[results[i] for i in mains]
     # Follow-on announcements: link each to its dividend. A problem in its own text blocks both.
@@ -448,16 +552,39 @@ def evaluate(store,symbol,documents,chunks,features,at,credits=False):
             linked=[results[i] for i,d in mains.items() if same_distribution(d['title'],doc['title'])
                     and _after(doc.get('published_at'),d.get('published_at'),-2,LINK_DAYS)]
         content=content_problems(t,follow=True)
-        own=([] if code_matches(t,symbol) or re.search(r'英文|English',doc['title']) else [('EVIDENCE','公告正文中的证券代码须与本股票一致')])+content
+        own=([] if code_matches(t,symbol) or re.search(r'英文|English',doc['title']) else [problem('EVIDENCE','CODE_MISMATCH','公告正文中的证券代码须与本股票一致')])+content
         if len(linked)==1:
             main=linked[0];links[doc['id']]=main;result['facts']['linked_doc_id']=main['doc_id']
             cash=Decimal(main['facts']['cash_per_share']) if main['facts'].get('cash_per_share') else None
-            differs=sorted(v for v in stated_amounts(t) if cash is not None and v!=cash)
-            reveal=list(content)
+            # A follow-on typically reveals the same differentiation the main approximated: the
+            # treasury holding and the virtual amount. That does not re-block a relaxed main.
+            relaxed=main['status'] in ('OUT_OF_WINDOW','APPROXIMATED')
+            virtual=Decimal(main['facts']['virtual_cash_per_share']) if relaxed and main['facts'].get('virtual_cash_per_share') else None
+            allowed={x for x in (cash,virtual) if x is not None}
+            differs=sorted(v for v in stated_amounts(t) if cash is not None and v not in allowed)
+            reveal=[p for p in content if not (relaxed and kind_of(p)=='DIFFERENTIATED')]
             if differs:
-                reveal.append(('UNSUPPORTED','本公告写明的每股现金（'+'、'.join(_yuan(v) for v in differs)+
+                reveal.append(problem('UNSUPPORTED','CASH_OTHER_AMOUNT','本公告写明的每股现金（'+'、'.join(_yuan(v) for v in differs)+
                                f" 元）与实施公告的 {main['facts']['cash_per_share']} 元不一致，可能是差异化分红或金额调整；当前核验规则未支持"))
                 own.append(reveal[-1])
+            # The follow-on's own stated virtual amount must agree with the main's virtual
+            # basis alone; stating the actual cash as the virtual amount contradicts an
+            # approximated main. At PARSED precision only half a unit of the coarser of the
+            # two values is tolerated; a COMPUTED basis keeps the 0.5% slack as in relaxed_review.
+            vstate,found=virtual_cash(t)
+            if vstate=='UNIQUE':
+                basis=virtual if virtual is not None else cash
+                if basis is not None:
+                    decimals=min(max(0,-found.as_tuple().exponent),max(0,-basis.as_tuple().exponent))
+                    tolerance=Decimal(10)**-decimals/2
+                    if main['facts'].get('virtual_source')!='PARSED':
+                        tolerance=max(tolerance,found*Decimal('0.005'))
+                    mismatch=abs(found-basis)>tolerance or (virtual is not None and found==cash)
+                    if mismatch:
+                        conflict=problem('EVIDENCE','VIRTUAL_DISTRIBUTION_CONFLICT',
+                            f"VIRTUAL_DISTRIBUTION_CONFLICT：本公告写明的虚拟分派每股现金 {_yuan(found)} 元与实施公告的口径不一致，需核对两份公告；当前核验规则未支持")
+                        reveal.append(conflict);own.append(conflict)
+            if relaxed:own=[p for p in own if kind_of(p)!='DIFFERENTIATED']
             for kind,message in reveal[:1]:  # what the follow-on reveals about the dividend blocks it too
                 _block(main,kind,f"随附公告《{doc['title']}》：{message}")
         _close(result,own)
@@ -467,7 +594,7 @@ def evaluate(store,symbol,documents,chunks,features,at,credits=False):
         for r in main_results:
             if same_distribution(title,r['title'],halt=True):
                 _block(r,'EVIDENCE',f'存在同一次分配的取消、暂缓、更正或补充公告《{title}》，需核对最新版本')
-    verified=[r for r in main_results if r['status']=='VERIFIED']
+    verified=[r for r in main_results if r['status'] in RESOLVED_STATUSES]
     repeated=set()
     for i,a in enumerate(verified):
         for b in verified[i+1:]:
@@ -476,7 +603,9 @@ def evaluate(store,symbol,documents,chunks,features,at,credits=False):
     for r in verified:
         # Two announcements for one distribution: a revision or a duplicate, never two adjustments.
         if r['doc_id'] in repeated:_block(r,'EVIDENCE','同一次分配可能存在多份实施公告（分配期相同，或除息日相隔不到30天），需核对是否重复或修订')
-    adjustments=[{**r['facts'],'doc_id':r['doc_id']} for r in main_results if r['status']=='VERIFIED']
+    adjustments=[{**r['facts'],'doc_id':r['doc_id']} if r['status']=='VERIFIED' else
+                 {**r['facts'],'doc_id':r['doc_id'],'cash_per_share':r['facts'].get('adjustment_cash_per_share')}
+                 for r in main_results if r['status'] in ('VERIFIED','APPROXIMATED')]
     if adjustments:
         original=copy.deepcopy(u)
         try:
@@ -492,7 +621,7 @@ def evaluate(store,symbol,documents,chunks,features,at,credits=False):
         except (ValueError,KeyError,TypeError,ArithmeticError):
             u=original
             for r in main_results:
-                if r['status']=='VERIFIED':_block(r,'EVIDENCE','现金分红后的可比价格计算未通过，需核对日线')
+                if r['status'] in ('VERIFIED','APPROXIMATED'):_block(r,'EVIDENCE','ADJUSTMENT_INVALID：现金分红后的可比价格计算未通过，需核对日线')
     # A follow-on takes the final state of its dividend.
     for doc in attached:
         result=results[doc['id']]
@@ -501,20 +630,20 @@ def evaluate(store,symbol,documents,chunks,features,at,credits=False):
         facts=result['facts']
         if not main:
             if not facts['record_date'] and not facts['ex_date']:
-                _close(result,[('UNSUPPORTED',f'本公告随分红实施而发布（如调整回购价格上限、暂停转股），但没有读出对应的股权登记日或除息日，{LINK_DAYS}天内也没有唯一一份实施公告可以关联；当前核验规则未支持')])
+                _close(result,[problem('UNSUPPORTED','LINK_UNRESOLVED',f'本公告随分红实施而发布（如调整回购价格上限、暂停转股），但没有读出对应的股权登记日或除息日，{LINK_DAYS}天内也没有唯一一份实施公告可以关联；当前核验规则未支持')])
             else:
-                _close(result,[('EVIDENCE',f"本公告随分红实施而发布，需先取得除息日{facts['ex_date'] or '（未读出）'}、登记日{facts['record_date'] or '（未读出）'}对应的唯一一份权益分派实施公告")])
-        elif main['status']=='VERIFIED':
-            result['status']='VERIFIED'
+                _close(result,[problem('EVIDENCE','LINK_MISSING',f"本公告随分红实施而发布，需先取得除息日{facts['ex_date'] or '（未读出）'}、登记日{facts['record_date'] or '（未读出）'}对应的唯一一份权益分派实施公告")])
+        elif main['status'] in RESOLVED_STATUSES:
+            result['status']=main['status']
         else:
-            _close(result,[('LINKED',f"本公告随分红实施而发布，本身不改变股价序列；随除息日{main['facts'].get('ex_date') or '（未读出）'}的实施公告一并核验，该实施公告尚未通过")])
+            _close(result,[problem('LINKED','LINK_WAIT',f"本公告随分红实施而发布，本身不改变股价序列；随除息日{main['facts'].get('ex_date') or '（未读出）'}的实施公告一并核验，该实施公告尚未通过")])
     return [results[d['id']] for d in documents if d['id'] in results],u
 
 
 def resolution(review):
     """How an unverified review is resolved. Reviews written before rule v2 carry no resolution and
     are classified from their wording, as the follow-up list did before."""
-    if not review or review.get('status')=='VERIFIED':return None
+    if not review or review.get('status') in RESOLVED_STATUSES:return None
     if review.get('resolution'):return review['resolution']
     missing='；'.join(review.get('missing',[]))
     if re.search(r'尚未实现|未支持|处理规则|账务|通用风险事项',missing):return 'UNSUPPORTED'
@@ -568,13 +697,13 @@ def check(store,config,symbols=None,at=None):
                 qty=held_at_record(store,symbol,facts['record_date'])
                 if qty>0:entry['held_at_record']={'qty':qty,'cash_cents':amount_cents(qty,facts['cash_per_share'])}
             listed.append(entry)
-        stocks.append({**item,'blocks_buying':any(r['status']!='VERIFIED' for r in reviews),'reviews':listed,
+        stocks.append({**item,'blocks_buying':any(r['status'] not in RESOLVED_STATUSES for r in reviews),'reviews':listed,
             'unrecognised':unrecognised(store,symbol,packet['mandatory_coverage']),
             'risk_items':sum(1 for m in coverage.values() if m.get('importance')=='RISK')})
     kinds={}
     for s in stocks:
         for r in s.get('reviews',[]):
-            key=r['resolution'] or 'VERIFIED';kinds[key]=kinds.get(key,0)+1
+            key=r['resolution'] or r['status'];kinds[key]=kinds.get(key,0)+1
     return {'rule_version':RULE_VERSION,'at':stamp,'dividend_credit':credits,
             'summary':{'stocks':len(stocks),'blocked_by_corporate_actions':sum(1 for s in stocks if s.get('blocks_buying')),
                        'reviews':kinds,'errors':sum(1 for s in stocks if 'error' in s),

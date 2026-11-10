@@ -5,7 +5,9 @@ from .storage import digest, normalize_time
 from .investment_policy import enabled, RECHECK_SECONDS
 
 
-def check(store, config, plan, at, *, extra_blockers=()):
+def check(store, config, plan, at, *, extra_blockers=(), persist=True):
+    from .research_only import contains
+    if contains(store,config,plan['symbol']):return ['RESEARCH_ONLY']
     if not enabled(config):
         return []
     from .slots import unreviewed_events
@@ -22,7 +24,7 @@ def check(store, config, plan, at, *, extra_blockers=()):
         blockers.append('STALE_QUOTE')
     fingerprint = digest(json.dumps([plan['id'], changed, sorted(blockers)]))
     old = store.db.execute('SELECT * FROM plan_rechecks WHERE plan_id=?', (plan['id'],)).fetchone()
-    if not old or old['valid_until'] <= at or old['fingerprint'] != fingerprint:
+    if persist and (not old or old['valid_until'] <= at or old['fingerprint'] != fingerprint):
         expiry = min(plan['valid_until'], normalize_time((datetime.fromisoformat(at)+timedelta(seconds=RECHECK_SECONDS)).isoformat()))
         # Do not commit the surrounding cash reservation transaction.
         store.db.execute('INSERT OR REPLACE INTO plan_rechecks VALUES(?,?,?,?,?)',

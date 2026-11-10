@@ -1,0 +1,28 @@
+{
+  "_说明": "沪深A股上市日期（listed_on）及上市第6个市场交易日（price_limit_from，P01e当前滚动研究窗口的阈值切换数据）。上市日按交易所官方股票列表或公告核实；第6日按交易所休市日历与周末逐日推算，具体证据另附。对2020年前上市的创业板，本字段不是历史20%法定涨跌幅限制生效日；不能用于复原当时交易制度。未收录或无效条目保持严格阈值。数据来源与逐日推导证据见本轮P01e审阅回执；变更随代码版本留痕。",
+  "sz301563": {
+    "listed_on": "2025-09-30",
+    "price_limit_from": "2025-10-15",
+    "source": "https://www.szse.cn/api/report/ShowReport/data?SHOWTYPE=JSON&CATALOGID=1110&TABKEY=tab1&txtDMorJC=301563"
+  },
+  "sz301682": {
+    "listed_on": "2026-03-25",
+    "price_limit_from": "2026-04-01",
+    "source": "https://www.szse.cn/api/report/ShowReport/data?SHOWTYPE=JSON&CATALOGID=1110&TABKEY=tab1&txtDMorJC=301682"
+  },
+  "sz300499": {
+    "listed_on": "2016-02-02",
+    "price_limit_from": "2016-02-16",
+    "source": "https://www.szse.cn/api/report/ShowReport/data?SHOWTYPE=JSON&CATALOGID=1110&TABKEY=tab1&txtDMorJC=300499"
+  },
+  "sz300760": {
+    "listed_on": "2018-10-16",
+    "price_limit_from": "2018-10-23",
+    "source": "https://www.szse.cn/api/report/ShowReport/data?SHOWTYPE=JSON&CATALOGID=1110&TABKEY=tab1&txtDMorJC=300760"
+  },
+  "sh688062": {
+    "listed_on": "2022-01-18",
+    "price_limit_from": "2022-01-25",
+    "source": "https://www.sse.com.cn/disclosure/announcement/listing/ipo/c/c_20220117_84107477.shtml"
+  }
+}

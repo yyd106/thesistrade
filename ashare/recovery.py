@@ -15,7 +15,7 @@ def recovery_need(store,config,symbol,at):
     plan=store.db.execute("SELECT * FROM plans WHERE symbol=? AND status='ACTIVE' ORDER BY activated_at DESC LIMIT 1",(symbol,)).fetchone()
     if not plan:
         return {'action':'collect' if not last else 'research','why':'缺少有效研究'}
-    payload=json.loads(plan['payload_json']);codes=payload.get('blockers',[])
+    payload=json.loads(plan['payload_json']);codes=payload.get('research_gaps',[]) if payload.get('kind')=='RESEARCH_ONLY' else payload.get('blockers',[])
     if any(c.startswith(('SOURCE_GAP:','FINANCIAL_BASELINE_INCOMPLETE','MARKET_CONTEXT_INCOMPLETE','STALE_DAILY_BARS','UNADJUSTED_SERIES_MISSING','NO_COLLECTION_COVERAGE')) for c in codes):
         return {'action':'collect','why':'关键行情或财务底稿需要补取'}
     missing=False;unread=False

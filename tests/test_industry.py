@@ -275,14 +275,15 @@ class USCompanyDossierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store=Store(tmp)
             try:
-                p=collect(store,'US:TEST',at,fetch_fn=fetch)
+                sec_config={'sec_enabled':True,'sec_contact_email':'research@example.invalid'}
+                p=collect(store,'US:TEST',at,fetch_fn=fetch,config=sec_config)
                 self.assertEqual(p['status'],'READY');self.assertEqual(len(p['documents']),1)
                 observed=p['metrics']['operating_cashflow'][0]
                 self.assertEqual((observed['start'],observed['end'],observed['val']),(day[:4]+'-01-01',day,100))
                 self.assertEqual(dossier(store,'US:TEST',now())['metrics'],p['metrics'])
                 facts['facts']['us-gaap']['Assets']['units']={'shares':[{'end':day,'filed':day,'form':'10-Q','val':100}]}
-                p=collect(store,'US:TEST',now(),fetch_fn=fetch)
+                p=collect(store,'US:TEST',now(),fetch_fn=fetch,config=sec_config)
                 self.assertEqual(p['status'],'PARTIAL');self.assertIn('assets',p['gaps'])
                 facts['cik']=2
-                with self.assertRaisesRegex(ValueError,'主体不匹配'):collect(store,'US:TEST',now(),fetch_fn=fetch)
+                with self.assertRaisesRegex(ValueError,'主体不匹配'):collect(store,'US:TEST',now(),fetch_fn=fetch,config=sec_config)
             finally:store.close()

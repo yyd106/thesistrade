@@ -31,7 +31,7 @@ def seed(store,config,stamp='2026-09-15T09:00:00+08:00'):
         'status':'READY','gaps':[],'latest_period':'2026-06-30','periods':[],'provider':'SYNTHETIC_FIXTURE'})))
     batch,_=begin_batch(store,config)
     checks=[{'source':s,'symbol':SYMBOL,'status':'OK','detail':'SYNTHETIC_FIXTURE','checked_at':stamp}
-        for s in ('tencent_daily','cninfo_catalog','cninfo_pdf','financials','market_comparison')]
+        for s in ('daily_bars','tencent_daily','cninfo_catalog','cninfo_pdf','financials','market_comparison')]
     with store.db:
         store.db.execute('INSERT INTO batch_stocks VALUES(?,?,?,?,?)',(batch['id'],SYMBOL,stamp,'READY',encode(checks)))
         store.db.execute("UPDATE batches SET status='READY',finished_at=? WHERE id=?",(stamp,batch['id']))

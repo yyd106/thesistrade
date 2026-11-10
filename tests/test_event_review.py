@@ -680,3 +680,319 @@ class GovernanceToolTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RelaxedRuleTests(unittest.TestCase):
+    """v2.3: OUT_OF_WINDOW and APPROXIMATED for differentiated cash dividends that pass every other check."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.store = Store(self.tmp.name)
+
+    def tearDown(self):
+        self.store.close(); self.tmp.cleanup()
+
+    def doc(self, doc_id, text, title='2026年半年度权益分派实施公告', symbol=SZSE_CODE, stamp='2026-09-01T09:00:00+08:00'):
+        return EvaluateTests.doc(self, doc_id, text, title, symbol, stamp)
+
+    def features(self, first='2026-07-01', last='2026-09-17'):
+        return EvaluateTests.features(self, first, last)
+
+    def test_approximated_with_parsed_virtual(self):
+        # SZSE wording: a treasury-excluded dividend whose per-share virtual cash is stated.
+        doc, chunks = self.doc('v', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司现有总股本剔除已回购股份30,000,000股后的1,170,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.2975元。'))
+        reviews, u = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        r = reviews[0]
+        self.assertEqual(r['status'], 'APPROXIMATED', r)
+        self.assertEqual(r['resolution'], None)
+        f = r['facts']
+        self.assertEqual((f['actual_cash_per_share'], f['virtual_cash_per_share']), ('1.33', '1.2975'))
+        self.assertEqual((f['virtual_source'], f['adjustment_cash_per_share']), ('PARSED', '1.2975'))
+        a = u['corporate_actions'][0]
+        self.assertEqual((u['basis'], a['method']), ('CASH_DIVIDEND_ADJUSTED', 'APPROXIMATED'))
+        self.assertEqual(a['cash_per_share'], '1.2975')
+
+    def test_computed_virtual_uses_actual(self):
+        # No stated virtual; unique base/total implies the virtual amount, tiny residual -> use actual.
+        doc, chunks = self.doc('w', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'))
+        reviews, u = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        r = reviews[0]
+        self.assertEqual(r['status'], 'APPROXIMATED', r)
+        self.assertEqual((r['facts']['virtual_source'], r['facts']['adjustment_cash_per_share']), ('COMPUTED', '1.33'))
+        self.assertEqual(u['corporate_actions'][0]['cash_per_share'], '1.33')
+
+    def test_held_at_record_still_blocks(self):
+        text = szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。')
+        doc, chunks = self.doc('h', text)
+        self.store.db.execute('PRAGMA foreign_keys=OFF')
+        self.store.db.execute('INSERT INTO paper_fills VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            ('f1','o1','q1',SZSE_CODE,'BUY',100,9000,0,0,'2026-06-01T09:31:00+08:00','2026-06-01T09:31:00+08:00'))
+        self.store.db.commit()
+        reviews, _ = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        self.assertEqual(reviews[0]['status'], 'NEEDS_EVIDENCE')
+
+    def test_past_window_out_of_scope(self):
+        # Ex-date before the whole MA60 window: no adjustment needed at all.
+        doc, chunks = self.doc('o', szse(record='2026年6月2日', ex='2026年6月3日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'))
+        reviews, u = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        r = reviews[0]
+        self.assertEqual(r['status'], 'OUT_OF_WINDOW', r)
+        self.assertEqual(r['facts']['method'], 'OUT_OF_WINDOW')
+        self.assertEqual(u.get('corporate_actions', []), [])
+        self.assertEqual(u.get('basis'), 'UNADJUSTED')
+
+    def test_conflicting_stated_amounts_still_block(self):
+        # A third stated amount beyond {actual, virtual} keeps blocking.
+        doc, chunks = self.doc('c', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司现有总股本剔除已回购股份30,000,000股后的1,170,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.2975元。'
+                  '另向全体股东每股派发特别现金红利0.5元。'))
+        reviews, _ = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        self.assertEqual(reviews[0]['status'], 'NEEDS_EVIDENCE')
+
+    def test_conflicting_virtual_amounts_block_instead_of_computing(self):
+        # Independent-review counterexample: two different stated virtual amounts in one
+        # announcement were treated as "not found" and fell back to the share-count ratio.
+        doc, chunks = self.doc('v', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '虚拟分派的现金红利=0.8000（元/股）。虚拟分派的现金红利=0.9000（元/股）。'))
+        reviews, u = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        self.assertEqual(reviews[0]['status'], 'NEEDS_EVIDENCE')
+        self.assertTrue(any('VIRTUAL_DISTRIBUTION_CONFLICT' in m for m in reviews[0]['missing']))
+        self.assertEqual(u['basis'], 'UNADJUSTED')
+        self.assertEqual(u.get('corporate_actions', []), [])
+
+    def test_adjustment_failure_reblocks_the_approximated_main(self):
+        # Independent-review counterexample: a damaged early bar makes the adjusted series
+        # invalid; the resolved review must not stay APPROXIMATED on the unadjusted basis.
+        doc, chunks = self.doc('x', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.3288917元。'))
+        features = self.features(); features['unadjusted']['bars'][0][2] = '0.50'
+        reviews, u = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks}, features,
+                              normalize_time('2026-09-18T10:00:00+08:00'))
+        self.assertEqual(reviews[0]['status'], 'NEEDS_EVIDENCE')
+        self.assertTrue(any('ADJUSTMENT_INVALID' in m for m in reviews[0]['missing']))
+        self.assertEqual(u['basis'], 'UNADJUSTED')
+        self.assertEqual(u.get('corporate_actions', []), [])
+
+
+class RelaxedFollowOnTests(unittest.TestCase):
+    """v2.3 follow-on and duplicate rules around relaxed mains."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.store = Store(self.tmp.name)
+
+    def tearDown(self):
+        self.store.close(); self.tmp.cleanup()
+
+    def doc(self, doc_id, text, title='2026年半年度权益分派实施公告', symbol=SZSE_CODE, stamp='2026-09-01T09:00:00+08:00'):
+        return EvaluateTests.doc(self, doc_id, text, title, symbol, stamp)
+
+    def features(self, first='2026-07-01', last='2026-09-17'):
+        return EvaluateTests.features(self, first, last)
+
+    def diff_main(self, doc_id='m'):
+        return self.doc(doc_id, szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司现有总股本剔除已回购股份30,000,000股后的1,170,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.2975元。'))
+
+    def test_follow_on_revealing_differentiation_does_not_reblock(self):
+        main, mc = self.diff_main()
+        follow_text = ('证券代码：000001 证券简称：示例科技 公司2026年半年度权益分派的股权登记日为2026年8月18日，除权除息日为2026年8月19日。'
+                       '因公司回购专用证券账户中的股份不参与本次权益分派，按总股本折算的每股现金红利=1.2975元。'
+                       '自除权除息之日起调整回购股份价格上限。' + BUYBACK_CLAUSE)
+        follow, fc = self.doc('f', follow_text, title='关于2026年半年度权益分派实施后调整回购股份价格上限的公告')
+        at = normalize_time('2026-09-18T10:00:00+08:00')
+        reviews, u = evaluate(self.store, SZSE_CODE, [main, follow], {main['id']: mc, follow['id']: fc}, self.features(), at)
+        self.assertEqual([r['status'] for r in reviews], ['APPROXIMATED', 'APPROXIMATED'])
+        self.assertEqual(reviews[1]['facts']['linked_doc_id'], main['id'])
+        self.assertEqual(len(u['corporate_actions']), 1)
+
+    def test_follow_on_conflicting_virtual_blocks_both(self):
+        # Independent-review counterexample: the follow-on states a virtual amount the
+        # approximated main does not share; both must block.
+        main, mc = self.doc('m', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.3288917元。'))
+        follow, fc = self.doc('f',
+            '证券代码：000001。股权登记日为2026年8月18日，除权除息日为2026年8月19日。'
+            '虚拟分派的现金红利=0.5000（元/股）。',
+            title='2026年半年度权益分派实施后调整回购价格上限的公告')
+        at = normalize_time('2026-09-18T10:00:00+08:00')
+        reviews, u = evaluate(self.store, SZSE_CODE, [main, follow], {main['id']: mc, follow['id']: fc}, self.features(), at)
+        self.assertEqual([r['status'] for r in reviews], ['NEEDS_EVIDENCE', 'NEEDS_EVIDENCE'])
+        self.assertTrue(any('VIRTUAL_DISTRIBUTION_CONFLICT' in m for m in reviews[1]['missing']))
+        self.assertTrue(any('VIRTUAL_DISTRIBUTION_CONFLICT' in m for m in reviews[0]['missing']))
+        self.assertEqual(u['basis'], 'UNADJUSTED')
+        self.assertEqual(u.get('corporate_actions', []), [])
+
+    def test_adjustment_failure_reblocks_the_linked_follow_on(self):
+        main, mc = self.doc('m', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.3288917元。'))
+        follow, fc = self.doc('f',
+            '证券代码：000001 公司2026年半年度权益分派的股权登记日为2026年8月18日，除权除息日为2026年8月19日。'
+            '根据回购方案，自除权除息之日起调整回购股份价格上限。' + BUYBACK_CLAUSE,
+            title='关于2026年半年度权益分派实施后调整回购股份价格上限的公告')
+        features = self.features(); features['unadjusted']['bars'][0][2] = '0.50'
+        reviews, u = evaluate(self.store, SZSE_CODE, [main, follow], {main['id']: mc, follow['id']: fc}, features,
+                              normalize_time('2026-09-18T10:00:00+08:00'))
+        self.assertEqual([r['status'] for r in reviews], ['NEEDS_EVIDENCE', 'NEEDS_EVIDENCE'])
+        self.assertTrue(any('ADJUSTMENT_INVALID' in m for m in reviews[0]['missing']))
+        self.assertEqual(u['basis'], 'UNADJUSTED')
+
+    def test_follow_on_virtual_checked_only_against_main_virtual(self):
+        at = normalize_time('2026-09-18T10:00:00+08:00')
+        # PARSED main 1.3288917 vs follow-on 1.3250: a 0.29% gap beyond the stated precision.
+        main, mc = self.doc('m', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.3288917元。'))
+        body = '证券代码：000001。股权登记日为2026年8月18日，除权除息日为2026年8月19日。虚拟分派的现金红利=%s（元/股）。'
+        title = '2026年半年度权益分派实施后调整回购价格上限的公告'
+        follow, fc = self.doc('f', body % '1.3250', title=title)
+        reviews, u = evaluate(self.store, SZSE_CODE, [main, follow], {main['id']: mc, follow['id']: fc}, self.features(), at)
+        self.assertEqual([r['status'] for r in reviews], ['NEEDS_EVIDENCE', 'NEEDS_EVIDENCE'])
+        self.assertEqual(u['basis'], 'UNADJUSTED')
+        # The follow-on stating the actual cash as its virtual amount contradicts an approximated main.
+        main2, mc2 = self.doc('n', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份1,000,000股后的1,199,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.3288917元。'))
+        follow2, fc2 = self.doc('g', body % '1.33', title=title)
+        reviews, u = evaluate(self.store, SZSE_CODE, [main2, follow2], {main2['id']: mc2, follow2['id']: fc2}, self.features(), at)
+        self.assertEqual([r['status'] for r in reviews], ['NEEDS_EVIDENCE', 'NEEDS_EVIDENCE'])
+        self.assertTrue(any('VIRTUAL_DISTRIBUTION_CONFLICT' in m for m in reviews[0]['missing']))
+
+    def test_follow_on_virtual_within_stated_precision_passes(self):
+        # PARSED main 0.42 vs follow-on 0.4165: inside half a unit of the coarser precision.
+        main, mc = self.doc('m', szse(record='2026年8月18日', ex='2026年8月19日', per_ten='4.200000',
+            base='以公司总股本7,333,360,000股剔除已回购股份60,597,200股后的7,272,762,800股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=0.42元。'))
+        follow, fc = self.doc('f',
+            '证券代码：000001。股权登记日为2026年8月18日，除权除息日为2026年8月19日。'
+            '虚拟分派的现金红利=0.4165（元/股）。',
+            title='2026年半年度权益分派实施后调整回购价格上限的公告')
+        reviews, u = evaluate(self.store, SZSE_CODE, [main, follow], {main['id']: mc, follow['id']: fc},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        self.assertEqual([r['status'] for r in reviews], ['APPROXIMATED', 'APPROXIMATED'])
+
+    def test_follow_on_other_amount_still_blocks_both(self):
+        main, mc = self.diff_main()
+        follow_text = ('证券代码：000001 公司2026年半年度权益分派的股权登记日为2026年8月18日，除权除息日为2026年8月19日。'
+                       '本次权益分派实施后每股现金红利为1.11元。' + BUYBACK_CLAUSE)
+        follow, fc = self.doc('f', follow_text, title='关于2026年半年度权益分派实施后调整回购股份价格上限的公告')
+        at = normalize_time('2026-09-18T10:00:00+08:00')
+        reviews, u = evaluate(self.store, SZSE_CODE, [main, follow], {main['id']: mc, follow['id']: fc}, self.features(), at)
+        self.assertEqual([r['status'] for r in reviews], ['NEEDS_EVIDENCE', 'NEEDS_EVIDENCE'])
+        self.assertEqual(u.get('corporate_actions', []), [])
+
+    def test_duplicate_approximated_mains_block(self):
+        main, mc = self.diff_main('m1')
+        other, oc = self.doc('m2', szse(record='2026年8月18日', ex='2026年8月19日',
+            base='以公司总股本1,200,000,000股剔除已回购股份30,000,000股后的1,170,000,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=1.2975元。'), stamp='2026-09-02T09:00:00+08:00')
+        at = normalize_time('2026-09-18T10:00:00+08:00')
+        reviews, u = evaluate(self.store, SZSE_CODE, [main, other], {main['id']: mc, other['id']: oc}, self.features(), at)
+        self.assertEqual([r['status'] for r in reviews], ['NEEDS_EVIDENCE', 'NEEDS_EVIDENCE'])
+        self.assertEqual(u.get('corporate_actions', []), [])
+
+
+class RealAnnouncementTests(unittest.TestCase):
+    """Real public cninfo implementation announcements through the full evaluate() path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.store = Store(self.tmp.name)
+
+    def tearDown(self):
+        self.store.close(); self.tmp.cleanup()
+
+    def doc(self, doc_id, text, title, symbol, stamp):
+        return EvaluateTests.doc(self, doc_id, text, title, symbol, stamp)
+
+    def features(self, first='2026-07-01', last='2026-10-30'):
+        return EvaluateTests.features(self, first, last)
+
+    def test_gree_approximated_and_follow_on_inherits(self):
+        from cninfo_dividend_fixtures import GL_MAIN, GL_FOLLOW
+        main, mc = self.doc('gl1', GL_MAIN, '2025年年度权益分派实施公告', 'sz000651', '2026-08-21T09:00:00+08:00')
+        follow, fc = self.doc('gl2', GL_FOLLOW, '关于2025年年度权益分派实施后调整股份回购价格上限的公告', 'sz000651', '2026-08-21T09:00:00+08:00')
+        at = normalize_time('2026-09-18T10:00:00+08:00')
+        reviews, u = evaluate(self.store, 'sz000651', [main, follow], {main['id']: mc, follow['id']: fc},
+                              self.features(last='2026-09-18'), at)
+        self.assertEqual([(r['status'], r['resolution']) for r in reviews], [('APPROXIMATED', None), ('APPROXIMATED', None)], reviews)
+        f = reviews[0]['facts']
+        self.assertEqual((f['actual_cash_per_share'], f['virtual_cash_per_share']), ('2', '1.999823'), f)
+        self.assertEqual(f['virtual_source'], 'PARSED')
+        self.assertEqual(u['corporate_actions'][0]['cash_per_share'], '1.999823')
+
+    def test_baofeng_approximated_with_stated_virtual(self):
+        from cninfo_dividend_fixtures import BF_MAIN
+        doc, chunks = self.doc('bf1', BF_MAIN, '2026年半年度权益分派实施公告', 'sh600989', '2026-08-26T09:00:00+08:00')
+        at = normalize_time('2026-10-10T10:00:00+08:00')
+        reviews, u = evaluate(self.store, 'sh600989', [doc], {doc['id']: chunks}, self.features(), at)
+        r = reviews[0]
+        self.assertEqual(r['status'], 'APPROXIMATED', r)
+        self.assertEqual((r['facts']['actual_cash_per_share'], r['facts']['virtual_cash_per_share']), ('0.42', '0.42'))
+
+
+class ParsedComputedAgreementTests(unittest.TestCase):
+    """v2.3: parsed virtual agrees with computed within the stated precision."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.store = Store(self.tmp.name)
+
+    def tearDown(self):
+        self.store.close(); self.tmp.cleanup()
+
+    def doc(self, doc_id, text, title='2026年半年度权益分派实施公告', symbol=SZSE_CODE, stamp='2026-09-01T09:00:00+08:00'):
+        return EvaluateTests.doc(self, doc_id, text, title, symbol, stamp)
+
+    def features(self, first='2026-07-01', last='2026-09-17'):
+        return EvaluateTests.features(self, first, last)
+
+    def test_rounded_virtual_agrees_with_computed(self):
+        # 宝丰-style: stated ≈0.42 while base/total implies 0.41653 — same amount at stated precision.
+        doc, chunks = self.doc('r', szse(record='2026年8月18日', ex='2026年8月19日', per_ten='4.200000',
+            base='以公司总股本7,333,360,000股剔除已回购股份60,597,200股后的7,272,762,800股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=0.42元。'))
+        reviews, u = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        r = reviews[0]
+        self.assertEqual(r['status'], 'APPROXIMATED', r)
+        self.assertEqual((r['facts']['virtual_source'], r['facts']['virtual_cash_per_share']), ('PARSED', '0.42'))
+        self.assertEqual(u['corporate_actions'][0]['cash_per_share'], '0.42')
+
+    def test_misparsed_virtual_still_blocks(self):
+        # parsed 0.42 vs computed 0.30: beyond both the stated precision and 0.5% — not the same amount.
+        doc, chunks = self.doc('b', szse(record='2026年8月18日', ex='2026年8月19日', per_ten='4.200000',
+            base='以公司总股本7,333,360,000股剔除已回购股份后的5,233,360,000股为基数',
+            extra='公司回购专用证券账户中的股份不参与本次权益分派。'
+                  '按总股本折算的每股现金红利=0.42元。'))
+        reviews, _ = evaluate(self.store, SZSE_CODE, [doc], {doc['id']: chunks},
+                              self.features(), normalize_time('2026-09-18T10:00:00+08:00'))
+        self.assertEqual(reviews[0]['status'], 'NEEDS_EVIDENCE')

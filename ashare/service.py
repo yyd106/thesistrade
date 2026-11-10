@@ -48,7 +48,7 @@ def manage(config,action):
             'WorkingDirectory':str(project),'RunAtLoad':True,'KeepAlive':True,'ThrottleInterval':30,
             'StandardOutPath':str(logs/'service.log'),'StandardErrorPath':str(logs/'service-error.log'),
             'EnvironmentVariables':{'PATH':'/Applications/ChatGPT.app/Contents/Resources:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin','PYTHONUNBUFFERED':'1'},
-            'ProcessType':'Background','ExitTimeOut':20}
+            'ProcessType':'Interactive','ExitTimeOut':20}
         path.parent.mkdir(parents=True,exist_ok=True)
         if path.exists():
             existing=plistlib.loads(path.read_bytes())

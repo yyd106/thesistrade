@@ -133,7 +133,7 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                         from .inbox import import_inbox
                         collect_one('report_inbox',lambda:import_inbox(store,config,bid))
                         collect_one('market_comparison',lambda:market_context.collect_comparisons(store,bid,{**config,'industry_enabled':False,'watchlist':[i for i in company_targets(store,config) if i['symbol']==symbol]}))
-                        collect_one('tencent_daily',lambda:sources.collect_history(store,bid,symbol,config))
+                        collect_one('daily_bars',lambda:sources.collect_history(store,bid,symbol,config))
                         collect_one('financials',lambda:fundamentals.collect(store,bid,symbol))
                         collect_one('cninfo_catalog',lambda:sources.collect_announcements(store,bid,{'symbol':symbol},config,sources.stock_catalog(store)))
                         finish_stock(store,bid,{'symbol':symbol},None)
@@ -198,6 +198,8 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
             elif command=='settle':
                 refresh_market(store,config,False)
                 result={'fills':settle(store,config,now()),'account':mark_equity(store,now(),config)}
+                from .exposure import reduce_to_cap
+                result['cap_reduction']=reduce_to_cap(store,config,now())
             else:raise ValueError('未知阶段')
             if config.get('industry_enabled'):
                 from .universe import reconcile
@@ -232,6 +234,6 @@ def execute(config,command,*,use_model=True,key=None,batch_id=None,symbol=None,s
                         with store.db:put(store,'review_sync_cursors',latest)
                 except Exception as exc:
                     with store.db:put(store,'last_upload_error',{'at':now(),'error':str(exc)[:500]})
-            store.periodic_backup(hourly_keep=config.get('backup_hourly_keep',6),daily_keep=config.get('backup_daily_keep',7))
+            store.periodic_backup(hourly_keep=config.get('backup_hourly_keep',6),daily_keep=config.get('backup_daily_keep',7),compressed=config.get('deployment_role','standalone')!='cloud')
             return result
     finally:store.close()

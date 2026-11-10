@@ -25,6 +25,16 @@ def notional(qty, price, fx):
     return (qty*price*fx*100 + SCALE*MICRO*MICRO//2)//(SCALE*MICRO*MICRO)
 
 
+def quantity_step(symbol):
+    return SCALE if symbol.startswith('US:') else 10_000
+
+
+def quantity_for_notional(symbol, cents, price, fx):
+    """Whole US shares / spot steps within a CNY budget, in ledger units."""
+    step = quantity_step(symbol)
+    return max(0, cents*SCALE*MICRO*MICRO//(price*fx*100)//step*step)
+
+
 def stamp(unix):
     return normalize_time(datetime.fromtimestamp(unix, timezone.utc).isoformat())
 
