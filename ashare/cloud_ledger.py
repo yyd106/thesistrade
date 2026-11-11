@@ -9,7 +9,7 @@ APPEND=('quotes','dynamic_quotes','global_quotes','slots','decisions','paper_ord
 SUPPORT=('snapshots','studies','plans','global_plans','dynamic_news','dynamic_cases')
 BOOT=SUPPORT+APPEND+MUTABLE+('portfolio_runs','portfolio_decisions','reviews','lessons','research_methods','research_improvements','app_users')
 # Advertised by the cloud so a newer research node only uses what the deployed cloud understands.
-FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','research_only_v1','cash_dividend_credit','quote_health','notices','supervision_summary','review_news_display_v1','review_news_display_v2','approval_receipts_v1','simulated_withdrawals_v1','strategy_freshness_v1','strategy_export_v1','exposure_caps_v1')
+FEATURES=('ledger_v2','targeted_invalidation','display_delta','industry_lists_v1','research_only_v1','cash_dividend_credit','quote_health','notices','supervision_summary','review_news_display_v1','review_news_display_v2','approval_receipts_v1','simulated_withdrawals_v1','strategy_freshness_v1','strategy_export_v1','exposure_caps_v1','exposure_caps_v2','cost_budget_v1')
 PRIMARY={'latest_trade_checks':'symbol'}
 # Appended rows the cloud later updates in place; their updates travel through the change log.
 UPDATED_APPEND=('slots',)
@@ -41,7 +41,11 @@ def version(store):
     # Quotes do not invalidate the portfolio analysis. Fills, orders, cash and risk do.
     state={t:rows(store,t,'ORDER BY '+','.join('"'+r['name']+'"' for r in store.db.execute('PRAGMA table_info('+t+')') if r['pk'])) for t in MUTABLE if t not in ('latest_trade_checks','portfolio_risk')}
     from .portfolio_risk import state as risk_state
-    state['risk_halted']=bool(risk_state(store)['halted'])
+    risk=risk_state(store)
+    state['risk_halted']=bool(risk['halted'])
+    if 'cost_basis' in risk:
+        from .cost_budget import semantic_state
+        state['risk_cost']=semantic_state(risk)
     return digest(canonical(state))
 
 

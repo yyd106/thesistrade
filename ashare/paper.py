@@ -1,5 +1,7 @@
 """Local-only paper execution. No broker client, account secret or live order endpoint exists."""
 from __future__ import annotations
+from .exposure import symbol_cap_pct, buy_blocker, risk_caps_active
+
 import json
 import re
 from datetime import datetime, timedelta
@@ -146,6 +148,8 @@ def buy_order_terms(store,config,plan,q,at,*,account=None,persist_recheck=False)
     a=account if account is not None else _account_without_initialize(store,at)
     p=a['positions'].get(symbol,{'qty':0,'sellable_qty':0,'cost_cents':0})
     params=json.loads(fresh['payload_json']);levels=params.get('levels') or {}
+    blocker=buy_blocker(store,config,at,params)
+    if blocker:raise ValueError(blocker)
     price=q['price_cents'];lot=config['paper_lot_size']
     if any(o['status']=='UNKNOWN' for o in a['orders']):raise ValueError('UNKNOWN_ORDER_RECONCILE_REQUIRED')
     if any(o['symbol']==symbol for o in a['orders']):raise ValueError('EXISTING_OPEN_ORDER')
@@ -157,18 +161,18 @@ def buy_order_terms(store,config,plan,q,at,*,account=None,persist_recheck=False)
     if a['withdrawal_pending']:raise ValueError('WITHDRAWAL_PENDING')
     if not a['valuation_complete']:raise ValueError('VALUATION_INCOMPLETE')
     limit=min(levels['buy_high_cents'],(price*(10000+config['paper_slippage_bps'])+9999)//10000)
-    stock_budget=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100-(p['qty']+a.get('dynamic_positions',{}).get(symbol,{}).get('qty',0))*price
+    stock_budget=a['equity_cents']*min(params['max_stock_pct'],symbol_cap_pct(store,config,at))//100-(p['qty']+a.get('dynamic_positions',{}).get(symbol,{}).get('qty',0))*price
     from .exposure import gross_cap_pct
     gross_budget=a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-a['reserved_cents']
     minimum=lot_rules(symbol)['min_buy']
     other=min(gross_budget,a['available_cents'],ps.buy_budget(store,config,'watchlist',symbol,at,a))
-    budget=min(stock_budget,other)
+    budget=int(min(stock_budget,other))
     qty=max(0,budget//limit//lot*lot)
     while qty>0 and qty*limit+fee(config,'BUY',qty*limit)>budget:qty-=lot
     if qty<minimum:
         # Name the binding constraint: a whole minimum lot larger than the per-stock cap is structural.
         smallest=minimum*limit+fee(config,'BUY',minimum*limit)
-        cap=a['equity_cents']*min(params['max_stock_pct'],config['paper_max_stock_pct'])//100
+        cap=a['equity_cents']*min(params['max_stock_pct'],symbol_cap_pct(store,config,at))//100
         raise ValueError('LOT_EXCEEDS_CAP' if smallest>cap and other>=smallest else 'INSUFFICIENT_BUDGET_OR_TARGET_REACHED')
     reserve=qty*limit+fee(config,'BUY',qty*limit)
     return {'qty':qty,'limit_cents':limit,'reserved_cents':reserve}
@@ -343,7 +347,7 @@ def settle(store,config,at):
             if o['side']=='BUY':
                 from .portfolio_risk import halted
                 from .plan_recheck import check
-                if pending(store) or halted(store) or check(store,config,dict(plan),at):
+                if pending(store) or halted(store) or buy_blocker(store,config,at,json.loads(plan['payload_json'])) or check(store,config,dict(plan),at):
                     store.db.execute("UPDATE paper_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
                 if quote_ok(q,config,at):
                     from .slots import hard_reason
@@ -369,7 +373,7 @@ def settle(store,config,at):
             realized=0
             fid=digest(o['id']+':'+q['id'])[:24]
             if o['side']=='BUY':
-                if ps.enabled(config):
+                if ps.enabled(config) or risk_caps_active(store,config):
                     try:
                         if gross+costs>ps.fill_budget(store,config,'watchlist',o['symbol'],at,account_inside_transaction(store,at),o):raise ValueError('组合成交额度不足')
                     except ValueError:

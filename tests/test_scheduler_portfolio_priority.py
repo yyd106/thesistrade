@@ -35,12 +35,14 @@ class PortfolioPriorityTests(unittest.TestCase):
             setattr(self.worker, name, {})
         for name in ('pool', 'dynamic_pool', 'global_pool'):
             setattr(self.worker, name, RecordingPool())
-        for name in ('last_sync', 'last_followups', 'last_maintenance'):
+        for name in ('last_sync', 'last_followups', 'last_maintenance', 'last_storage'):
             setattr(self.worker, name, time.monotonic())
         for name in ('withdrawal_tick', 'page_display_tick', 'strategy_export_tick',
                      'supervision_tick', 'experiment_tick'):
             setattr(self.worker, name, Mock())
         self.worker.sync_future = None
+        # This fixture isolates research dispatch; keep storage maintenance idle.
+        self.worker.storage_future = None
         self.worker.supervision_cancel = Event()
         self.worker.experiment_cancel = Event()
 

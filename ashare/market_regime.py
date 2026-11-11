@@ -99,8 +99,8 @@ def regime_active(store, config):
     Standalone and unpaired nodes stay off."""
     if config.get('deployment_role') == 'cloud':
         from .cloud_runtime import value
-        return ((value(store, 'exposure_caps') or {}).get('mode') == 'R1')
-    if config.get('exposure_regime') != 'R1':
+        return ((value(store, 'exposure_caps') or {}).get('mode') in ('R1', 'D14'))
+    if config.get('exposure_regime') not in ('R1', 'D14'):
         return False
     from .cloud_sync import remote_supports
-    return remote_supports(store, FEATURE)
+    return remote_supports(store, 'exposure_caps_v2' if config.get('exposure_regime') == 'D14' else FEATURE)

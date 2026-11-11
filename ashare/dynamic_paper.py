@@ -1,5 +1,7 @@
 """News-strategy paper orders and lots; the only shared mutation is account cash."""
 from __future__ import annotations
+from .exposure import symbol_cap_pct, buy_blocker, risk_caps_active
+
 import json
 from datetime import datetime,timedelta
 from .calendar import local,phase,trading_day
@@ -91,6 +93,8 @@ def submit(store,config,case,side,q,at,reason,sell_qty=None,exposure_order=None)
   if any(o['status']=='UNKNOWN' for o in a['orders']):raise ValueError('共用账户有待核对委托')
   if any(o['symbol']==sym for o in a['orders']):raise ValueError('共用账户该股票已有挂单')
   if side=='BUY':
+   blocker=buy_blocker(store,config,at,plan)
+   if blocker:raise ValueError(blocker)
    from .dynamic import eligibility
    blockers,validated=eligibility(store,config,dict(fresh),at)
    if fresh['status']!='READY' or blockers or not fresh['created_at']<=at<fresh['expires_at']:
@@ -102,11 +106,11 @@ def submit(store,config,case,side,q,at,reason,sell_qty=None,exposure_order=None)
    if not a['valuation_complete']:raise ValueError('共用底池持仓估值不完整')
    limit=min(high,(q['price_cents']*(10000+config['paper_slippage_bps'])+9999)//10000)
    own=a['positions'].get(sym,{}).get('qty',0)+a.get('dynamic_positions',{}).get(sym,{}).get('qty',0)
-   stock_cap=a['equity_cents']*config['paper_max_stock_pct']//100-own*q['price_cents']
+   stock_cap=a['equity_cents']*symbol_cap_pct(store,config,at)//100-own*q['price_cents']
    from .exposure import gross_cap_pct
    gross_cap=a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-a['reserved_cents']
    if ps.enabled(config) and store.db.execute("SELECT 1 FROM dynamic_orders o JOIN dynamic_fills f ON f.order_id=o.id WHERE o.case_id=? AND f.side='BUY' LIMIT 1",(cid,)).fetchone():raise ValueError('该事件已执行入场')
-   budget=min(a['available_cents'],stock_cap,gross_cap,a['equity_cents']*plan.get('max_position_pct',5)//100,ps.buy_budget(store,config,'dynamic',cid,at,a))
+   budget=int(min(a['available_cents'],stock_cap,gross_cap,a['equity_cents']*plan.get('max_position_pct',5)//100,ps.buy_budget(store,config,'dynamic',cid,at,a)))
    qty=max(0,budget//limit//100*100)
    while qty and qty*limit+fee(config,'BUY',qty*limit)>budget:qty-=100
    if not qty:raise ValueError('共用底池额度不足或已达到仓位上限')
@@ -172,7 +176,7 @@ def settle(store,config,at):
     # Partial fills retain the case's remaining entry intent, not permanent
     # permission to ignore new news, failed announcement checks or a hard exit.
     risk_exit=quote_ok(q,config,at) and exit_reason(case,case_position(store,o['case_id'],at),q,at)
-    if blockers or risk_exit:
+    if blockers or risk_exit or buy_blocker(store,config,at,json.loads(case['plan_json'])):
      store.db.execute("UPDATE dynamic_orders SET status='CANCELLED',reserved_cents=0 WHERE id=?",(o['id'],));continue
    if phase(at)!='CONTINUOUS' or not quote_ok(q,config,at) or q['observed_at']<=o['created_at'] or market_guard(o['symbol'],q,o['side']):continue
    if store.db.execute('SELECT 1 FROM dynamic_fills WHERE order_id=? AND quote_id=?',(o['id'],q['id'])).fetchone():continue
@@ -187,7 +191,7 @@ def settle(store,config,at):
    prev=store.db.execute('SELECT coalesce(sum(qty*price_cents),0),coalesce(sum(fee_cents),0) FROM dynamic_fills WHERE order_id=?',(o['id'],)).fetchone()
    costs=fee(terms,o['side'],prev[0]+gross)-prev[1];realized=0;fid=digest(o['id']+q['id'])[:24]
    if o['side']=='BUY':
-    if ps.enabled(config):
+    if ps.enabled(config) or risk_caps_active(store,config):
      try:
       if gross+costs>ps.fill_budget(store,config,'dynamic',o['case_id'],at,account_inside_transaction(store,at),o):raise ValueError('组合成交额度不足')
      except ValueError:

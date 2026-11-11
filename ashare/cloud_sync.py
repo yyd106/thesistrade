@@ -158,10 +158,15 @@ def queue_publication(store,config,decision_id):
         if not remote_supports(store,required):raise ValueError('云端尚不支持名单版本，等待云端升级')
         from .universe import publication
         payload['research_membership']=publication(store,config,row['created_at'],row['valid_until'])
-    if remote_supports(store,'exposure_caps_v1'):
+    if remote_supports(store,'exposure_caps_v1') or remote_supports(store,'exposure_caps_v2'):
         from .market_regime import r1
-        on=config.get('exposure_regime')=='R1'
-        payload['exposure_caps']={'mode':'R1' if on else 'OFF','regime':r1(store,row['created_at']) if on else None}
+        from .exposure import make_bundle
+        mode=config.get('exposure_regime') or 'OFF'
+        feature='exposure_caps_v2' if mode=='D14' else 'exposure_caps_v1'
+        if not remote_supports(store,feature):mode='OFF'
+        payload['exposure_caps']=make_bundle(mode,r1(store,row['created_at']) if mode!='OFF' else None)
+    if remote_supports(store,'cost_budget_v1'):
+        payload['cost_budget']={'mode':config.get('cost_budget') or 'OFF'}
     if remote_supports(store,'display_delta'):
         # Send only the parts of the UI summary the cloud does not already hold.
         sections=display_sections(display);hashes=section_hashes(sections);known=value(store,'remote_display_hashes') or {}
@@ -223,6 +228,9 @@ def receive_strategy(store,config,body,at):
         # A research node older than P07 never sends the key; treating the absence as OFF
         # also restores the configured cap when research is rolled back past the feature.
         incoming_bundle = {'mode': 'OFF', 'regime': None, 'source': 'LEGACY_PUBLICATION'}
+    incoming_cost=body.get('cost_budget',{'mode':'OFF'})
+    if not isinstance(incoming_cost,dict) or set(incoming_cost)!={'mode'} or incoming_cost['mode'] not in ('OFF','P06'):
+        raise ValueError('cost_budget结构无效')
     if body.get('protocol')!=1 or body.get('kind')!='strategy':raise ValueError('同步协议不匹配')
     seq=body.get('sequence');bid=body.get('bundle_id');hashed=digest(canonical(body))
     if type(seq) is not int or seq<1 or not isinstance(bid,str):raise ValueError('无效发布序号')
@@ -252,13 +260,21 @@ def receive_strategy(store,config,body,at):
         if d['symbol'] in research_only:raise ValueError('只研究标的不能进入组合交易候选')
         if d['route'] not in ('watchlist','dynamic','global') or d['key']!=d['route']+':'+d['identity']:raise ValueError('交易线路错误')
         if d['route']=='watchlist' and d['symbol'] not in allowed:raise ValueError('未经配置的自选股')
-        cap=min(config['paper_max_stock_pct'],20 if d['route']=='watchlist' else 5)*100
+        from .exposure import symbol_cap_pct
+        cap=min(symbol_cap_pct(store,config,at,bundle=incoming_bundle),20 if d['route']=='watchlist' else 5)*100
         if d['action']=='ALLOW' and d['target_bps']>cap:raise ValueError('买入目标超过硬上限')
     raw={k:payload[k] for k in ('summary','risk_groups')};raw['decisions']=[{k:d[k] for k in ('key','action','target_bps','reason','evidence_ids','related_keys')} for d in items]
     from .portfolio_risk import state as risk_state
     from .exposure import bundle_cap_pct
     incoming_cap = bundle_cap_pct(incoming_bundle, config, at)[0]
-    validate(raw,{'candidates':items,'halted':risk_state(store)['halted'],'valuation_ready':True,'gross_cap_bps':incoming_cap*100,'symbol_cap_bps':config['paper_max_stock_pct']*100})
+    from .portfolio_risk import evaluate_inside
+    risk=evaluate_inside(store,config,at,persist=False)
+    if incoming_cost['mode']=='P06':
+        from .cost_budget import updated
+        if risk.get('valuation_complete'):risk=updated(risk,risk,config,at)
+        incoming_cap=min(incoming_cap,risk.get('cost_cap_bps',0)/100)
+        if risk.get('cost_locked') and any(d['action']=='ALLOW' for d in items):raise ValueError('COST_BUDGET_LOCKED')
+    validate(raw,{'candidates':items,'halted':risk_state(store)['halted'],'valuation_ready':True,'gross_cap_bps':int(incoming_cap*100),'symbol_cap_bps':symbol_cap_pct(store,config,at,bundle=incoming_bundle)*100})
     store.db.execute('PRAGMA defer_foreign_keys=ON')
     for table,records in body['sources'].items():
         if table=='plans':
@@ -268,11 +284,23 @@ def receive_strategy(store,config,body,at):
         ledger.upsert(store,table,records,immutable=table in ('snapshots','studies'))
     for d in items:
         if d['source_token']!=row_token(source(store,d['route'],d['identity'])):raise ValueError('源策略摘要校验失败')
+        if d['action']=='ALLOW':
+            from .exposure import buy_blocker
+            plan=source(store,d['route'],d['identity'])
+            content=json.loads(plan['plan_json'] if d['route']=='dynamic' else plan['payload_json']) if plan else {}
+            # Validate the incoming mode, including R1/D14/OFF transitions, before publication.
+            from .exposure import defensive
+            if defensive(incoming_bundle,at):
+                vol=content.get('vol20_annual_pct')
+                import math
+                if type(vol) not in (int,float) or not math.isfinite(vol) or vol<0:raise ValueError('BEAR_VOLATILITY_MISSING')
+                if vol>37:raise ValueError('BEAR_HIGH_VOLATILITY')
     store.db.execute('DELETE FROM cloud_contracts')
     for k,c in body['contracts'].items():store.db.execute('INSERT INTO cloud_contracts VALUES(?,?,?)',(k,completed,canonical(c).decode()))
     put(store,'active_assets',body['active_assets'])
     if body.get('research_membership'):put(store,'research_membership',body['research_membership'])
     put(store,'exposure_caps',incoming_bundle)
+    put(store,'cost_budget_mode',incoming_cost['mode'])
     display_hashes=receive_display(store,body)
     # Key invalidations older than this decision no longer apply.
     put(store,'invalidated_keys',{k:v for k,v in (value(store,'invalidated_keys') or {}).items() if v>completed})

@@ -107,6 +107,9 @@ def status(config, *, overview=False, page_diagnostics=True):
             'market_regime':market_regime.r1(store,at),
             # A research node delivers its notices to the cloud, where Dean answers them.
             'notices':open_notices(store) if config.get('deployment_role','standalone')=='standalone' else []})
+        from .exposure import view as exposure_view, display_buy_gates
+        result['exposure']=exposure_view(store,config,at)
+        display_buy_gates(result,store,config,at)
         result['trader_view']=trader_view.build(result,config,buy_check=lambda p,q,t: preview_buy(store,config,p,q,t))
         return result
     finally:store.close()
@@ -213,6 +216,18 @@ def make_handler(config_path,token,port):
                         from .privacy import guest_status
                         value=guest_status(value)
                     self.send(200,value)
+                elif path.path=='/api/cost-budget/result':
+                    if user['role']!='ADMIN':raise auth.AuthError('成本基准记录仅管理员可查看',403)
+                    from . import approvals
+                    params=urllib.parse.parse_qs(path.query)
+                    identity=params.get('approval_id',[''])[0]
+                    store=Store(cfg['data_dir'])
+                    try:
+                        result=approvals.request_info(store,identity)
+                        if result['kind']!='COST_BASIS_RESET':raise ValueError('不是成本基准操作')
+                        self.send(200,{'status':result['status'],'request_id':identity,'approval':result,
+                                       'result':result['consumption']['result'] if result['consumption'] else None})
+                    finally:store.close()
                 elif path.path in ('/api/withdrawals','/api/withdrawals/result'):
                     from .withdrawals import status as withdrawal_status
                     if path.path.endswith('/result'):
@@ -374,6 +389,20 @@ def make_handler(config_path,token,port):
                         row=decide(store,body['id'],body['action'],user,expected_hash=body.get('expected_hash'),
                                    authority='CLOUD_ADMIN' if cfg.get('deployment_role')=='cloud' else 'LOCAL_ADMIN')
                         self.send(200,{'id':row['id'],'status':row['status'],'answered_at':row['acked_at']})
+                    finally:store.close()
+                elif self.path in ('/api/cost-budget/request','/api/cost-budget/execute'):
+                    if cfg.get('deployment_role')!='cloud':
+                        self.send(403,{'code':'CLOUD_REQUIRED','error':'成本基准重置须在云端工作台由管理员确认。'});return
+                    from . import cost_budget
+                    preview=self.path.endswith('/request')
+                    fields=set() if preview else {'approval_id','expected_hash'}
+                    if set(body)!=fields or any(not isinstance(body[k],str) for k in fields):
+                        raise ValueError('成本基准请求内容无效。')
+                    store=Store(cfg['data_dir'])
+                    try:
+                        result=(cost_budget.request(store,cfg,now()) if preview else
+                                cost_budget.execute(store,cfg,body['approval_id'],user,body['expected_hash'],now()))
+                        self.send(200,result)
                     finally:store.close()
                 elif self.path in ('/api/withdrawals/request','/api/withdrawals/execute'):
                     if cfg.get('deployment_role')!='cloud':

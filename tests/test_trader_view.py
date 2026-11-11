@@ -437,7 +437,7 @@ class RegimeSectionTests(unittest.TestCase):
     def test_pending_change(self):
         r = self.regime(confirmed_cap_pct=10, raw_cap_pct=50)
         self.assertEqual(r['cap_pct'], 10)
-        self.assertIn('50', r['pending_change'])
+        self.assertIn('震荡', r['pending_change'])
 
     def test_grace_window(self):
         # as_of == last_completed(at-6h): fresh for display even though r1 caps at 10.
@@ -468,7 +468,11 @@ class AccountAndFreshnessTests(unittest.TestCase):
         s = status(market_regime={**REGIME, 'confirmed_cap_pct': 50, 'raw_cap_pct': 50},
                    portfolio={'holdings': [], 'stock_weight_pct': 60.0, 'cash_weight_pct': 40.0})
         a = build(s)['account']
-        self.assertEqual(a['suggested_max_pct'], 50)
+        self.assertEqual(a['suggested_max_pct'], 90)
+        self.assertFalse(a['over_cap'])
+        s['exposure']={'mode':'D14','defensive':True,'gross_cap_pct':50}
+        a=build(s)['account']
+        self.assertEqual(a['suggested_max_pct'],50)
         self.assertTrue(a['over_cap'])
         s = status(portfolio={'holdings': [], 'stock_weight_pct': 50.0, 'cash_weight_pct': 50.0})
         a = build(s)['account']

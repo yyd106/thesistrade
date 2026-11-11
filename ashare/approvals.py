@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from .storage import digest, now, normalize_time
 
 VERSION = 'approval-v1'
-KINDS = {'PROPOSAL_DECISION', 'CONFIG', 'WITHDRAWAL'}
+KINDS = {'PROPOSAL_DECISION', 'CONFIG', 'WITHDRAWAL', 'COST_BASIS_RESET'}
 REQUEST_FIELDS = {'id', 'version', 'kind', 'subject_id', 'action', 'snapshot', 'summary',
                   'created_at', 'expires_at', 'notice_id', 'hash'}
 RECEIPT_FIELDS = {'id', 'request_id', 'request_hash', 'decision', 'actor', 'authority', 'issued_at'}
@@ -55,7 +55,8 @@ def _validate(value):
     if not all(isinstance(value[k], str) and 0 < len(value[k]) <= 200 for k in ('subject_id', 'action')):
         raise ValueError('审批对象或动作无效')
     actions = ({'APPROVED', 'ADOPTED', 'RETIRED', 'REJECTED', 'SUPERSEDED'} if value['kind'] == 'PROPOSAL_DECISION'
-               else {'TRANSFER', 'CANCEL'} if value['kind'] == 'WITHDRAWAL' else {'APPLY'})
+               else {'TRANSFER', 'CANCEL'} if value['kind'] == 'WITHDRAWAL'
+               else {'RESET'} if value['kind'] == 'COST_BASIS_RESET' else {'APPLY'})
     if value['action'] not in actions or not isinstance(value['snapshot'], dict) or not isinstance(value['summary'], dict):
         raise ValueError('审批动作或冻结预览无效')
     if len(canonical(value).encode()) > 65536:
