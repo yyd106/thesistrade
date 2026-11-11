@@ -83,5 +83,8 @@ def status(store,config):
     # The signed display cache carries market_regime; a missing section yields MISSING (cap 10).
     from .trader_view import build
     from .paper import preview_buy
+    from .exposure import view as exposure_view, display_buy_gates
+    result['exposure']=exposure_view(store,config,at)
+    display_buy_gates(result,store,config,at)
     result['trader_view']=build(result,config,buy_check=lambda p,q,t: preview_buy(store,config,p,q,t))
     return result

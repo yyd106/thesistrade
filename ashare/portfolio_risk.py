@@ -64,6 +64,9 @@ def evaluate_inside(store, config, at, account=None, *, persist=True):
               'threshold_bps': DRAWDOWN_BPS, 'valuation_complete': complete,
               'checked_at': at, 'basis': 'CASHFLOW_UNITIZED_NAV', 'automatic_resume': False,
               'historical_cashflow_gap': uncertainty}
+    from .cost_budget import active as cost_active, updated as cost_updated
+    if cost_active(store, config) and complete:
+        result = cost_updated(previous, result, config, at)
     if not persist:
         return result
     if breached and not previous.get('halted'):
@@ -78,7 +81,10 @@ def evaluate_inside(store, config, at, account=None, *, persist=True):
                    title='账户回撤触发 25% 风控',
                    body=f'模拟账户回撤 {drawdown/100:.2f}%，达到 25% 阈值。程序已停止新买入、撤销未成交的买单，并在市场允许时逐步减仓。'
                         '恢复买入需要你确认。这条是通知，现在不需要操作。')
-    if result['halted']:
+    if result.get('cost_locked') and not previous.get('cost_locked'):
+        store.db.execute('INSERT INTO portfolio_risk_events VALUES(?,?,?)',
+            (digest('cost-lock:'+at), at, json.dumps({'kind':'COST_BUDGET_LOCKED', **result})))
+    if result['halted'] or (cost_active(store, config) and result.get('cost_locked')):
         for table in ('paper_orders', 'dynamic_orders', 'global_orders'):
             store.db.execute("UPDATE "+table+" SET status='CANCELLED',reserved_cents=0 WHERE side='BUY' AND status IN ('OPEN','PARTIAL')")
     store.db.execute('INSERT OR REPLACE INTO portfolio_risk VALUES(?,?,?)', ('DEMO_PAPER', at, json.dumps(result)))

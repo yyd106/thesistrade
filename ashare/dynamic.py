@@ -170,7 +170,9 @@ def research(store,config,news,catalog,at,model_fn=None,*,direct_only=False):
  for n in rows:
   for instrument in n['candidates']:
    sym=instrument['symbol'];q=data.latest_quote(store,sym,at);m=market(store,sym,at)
-   packet['market'][sym]={'quote':{k:q[k] for k in ('price_cents','prev_close_cents','observed_at')} if q else None,'recent_daily_bars':m.get('bars',[])[-5:],'daily_basis':'未复权，只有完整交易日日线；缺失不推测'}
+   from .exposure import volatility
+   vol20=volatility([b[2] for b in m.get('bars',[]) if isinstance(b,(list,tuple)) and len(b)>2])
+   packet['market'][sym]={'vol20_annual_pct':vol20,'quote':{k:q[k] for k in ('price_cents','prev_close_cents','observed_at')} if q else None,'recent_daily_bars':m.get('bars',[])[-5:],'daily_basis':'未复权，只有完整交易日日线；缺失不推测'}
   for s in n['candidates'][:2]:
    old=store.db.execute('''SELECT c.name,n.title,n.url,n.published_at,o.payload_json,o.basis,o.entry_at,o.exit_at
     FROM dynamic_cases c JOIN dynamic_observations o ON o.case_id=c.id JOIN dynamic_news n ON n.id=c.news_id WHERE c.symbol=? AND o.ready_at<?
@@ -194,7 +196,8 @@ def research(store,config,news,catalog,at,model_fn=None,*,direct_only=False):
   basis='FORWARD' if 0<=age<=7200 else 'RETROSPECTIVE'
   analysis={**item,'name':instrument['name'],'direct_company_evidence':instrument['name'] in n['body'] and any(e['news_id']==n['id'] for e in item['evidence'])}
   q=data.latest_quote(store,item['symbol'],completed)
-  plan={'holding_days':3,'max_position_pct':5,'stop_bps':config['paper_stop_loss_bps'],'take_profit_bps':config['paper_take_profit_bps'],
+  vol20=packet['market'].get(item['symbol'],{}).get('vol20_annual_pct')
+  plan={'vol20_annual_pct':vol20,'holding_days':3,'max_position_pct':5,'stop_bps':config['paper_stop_loss_bps'],'take_profit_bps':config['paper_take_profit_bps'],
         'buy_low_cents':q['price_cents']*99//100 if q else None,'buy_high_cents':q['price_cents']*101//100 if q else None,
         'reference_quote_at':q['observed_at'] if q else None,'strategy_version':'dynamic_events_v1'}
   cid=digest(n['id']+'|'+item['symbol'])[:24];expiry=normalize_time((datetime.fromisoformat(completed)+timedelta(hours=12)).isoformat())

@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -157,6 +157,49 @@ class StorageWorkerTests(unittest.TestCase):
         w = scheduler_mock()
         w.close()
         self.assertTrue(w.storage_cancel.is_set())
+
+    def storage_tick_at(self, w, uptime):
+        with patch.object(scheduler, 'load_config', return_value=self.cfg), \
+             patch.object(scheduler, 'now', return_value=AT), \
+             patch.object(scheduler.time, 'monotonic', return_value=uptime), \
+             patch.object(scheduler, 'schedule_due'), \
+             patch.object(scheduler, 'schedule_dynamic_due'), \
+             patch.object(scheduler, 'schedule_reconnected'):
+            w.tick()
+
+    def test_initial_storage_tick_does_not_depend_on_host_uptime(self):
+        w=scheduler_mock();w.last_storage=None
+        w.storage_pool.shutdown(wait=True);w.storage_pool=Mock()
+        w.storage_pool.submit.return_value=Future()
+        try:
+            self.storage_tick_at(w,100)
+            w.storage_pool.submit.assert_called_once()
+            self.assertEqual(w.last_storage,100)
+            self.storage_tick_at(w,101)
+            w.storage_pool.submit.assert_called_once()
+        finally:w.close()
+
+    def test_completed_error_is_collected_before_next_hour(self):
+        w=scheduler_mock();w.last_storage=90
+        w.storage_future=Future();w.storage_future.set_exception(RuntimeError('failed early'))
+        try:
+            self.storage_tick_at(w,100)
+            row=self.store.db.execute("SELECT value FROM service_state WHERE key='storage_worker_error'").fetchone()
+            self.assertIn('failed early',row[0]);self.assertIn(AT,row[0])
+            self.assertIsNone(w.storage_future)
+        finally:w.close()
+
+    def test_success_clears_old_error_but_partial_result_does_not(self):
+        w=scheduler_mock();w.last_storage=90
+        try:
+            for result,expect_error in [({'errors':[{'day':'d'}]},True),({'cancelled':True},True),
+                                         ({'skipped_locked':True},True),({'errors':[],'cancelled':False},False)]:
+                with self.store.db:self.store.db.execute("INSERT OR REPLACE INTO service_state VALUES('storage_worker_error','old error')")
+                w.storage_future=Future();w.storage_future.set_result(result)
+                self.storage_tick_at(w,100)
+                row=self.store.db.execute("SELECT value FROM service_state WHERE key='storage_worker_error'").fetchone()
+                self.assertEqual(row is not None,expect_error)
+        finally:w.close()
 
     def test_max_days_caps_attempts_not_successes(self):
         hourly(self.store.root, ['20261105T010000Z.sqlite3', '20261106T010000Z.sqlite3'])

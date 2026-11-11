@@ -369,7 +369,9 @@ def price_plan(packet,config,analysis,model_status,regime_on=False):
             lot_cost=levels['buy_high_cents']*size['min_buy_qty']
             if lot_cost+fee(config,'BUY',lot_cost)>size['equity_cents']*min(size['max_stock_pct'],config['paper_max_stock_pct'])//100:
                 gaps.append('LOT_EXCEEDS_CAP')
-    return {'research_membership_token':(member or {}).get('fingerprint'),'research_only':only,'holding_unit':'DAYS','recheck_hours':1,'research_method':'days_cash_v1' if config.get('investment_policy') else 'legacy',
+    from .exposure import volatility
+    vol20 = volatility([b[2] for b in u.get('bars', [])])
+    return {'vol20_annual_pct':vol20, 'research_membership_token':(member or {}).get('fingerprint'),'research_only':only,'holding_unit':'DAYS','recheck_hours':1,'research_method':'days_cash_v1' if config.get('investment_policy') else 'legacy',
         'kind':'RESEARCH_ONLY' if only else 'NO_ENTRY' if gaps else 'PAPER_TRADE','strategy_version':config['strategy_version'],
         'event_reviews':packet.get('event_reviews',[]),'corporate_actions':u.get('corporate_actions',[]),
         'trend_ok':bool(ma>slow and close>=slow) if all(type(x) is int and x>0 for x in (ma,slow,close)) else None,

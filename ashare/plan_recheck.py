@@ -14,6 +14,9 @@ def check(store, config, plan, at, *, extra_blockers=(), persist=True):
     from .paper import quote_ok
     at = normalize_time(at)
     blockers = list(extra_blockers)
+    from .exposure import buy_blocker
+    exposure_blocker=buy_blocker(store,config,at,json.loads(plan['payload_json']))
+    if exposure_blocker:blockers.append(exposure_blocker)
     q = store.latest_quote(plan['symbol'], at)
     if plan['status'] != 'ACTIVE' or not plan['activated_at'] <= at < plan['valid_until']:
         blockers.append('PLAN_EXPIRED')

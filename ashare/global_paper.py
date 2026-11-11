@@ -2,6 +2,8 @@
 
 No broker APIs, borrowing, short selling, derivatives or leveraged ETFs.
 """
+from .exposure import symbol_cap_pct, buy_blocker
+
 import json
 from datetime import datetime, timedelta
 from .storage import now, normalize_time, digest
@@ -109,16 +111,19 @@ def submit(store, config, symbol, side, q, plan, item, at, sell_qty=None, exposu
             if p or not valuation_ready(store,a,at) or a['withdrawal_pending']:
                 raise ValueError('已有持仓、估值缺失或提取处理中')
             content = json.loads(current['payload_json']);levels = content['levels']
+            blocker=buy_blocker(store,config,at,content)
+            if blocker:raise ValueError(blocker)
             if not levels['buy_low_micros'] <= q['price_micros'] <= levels['buy_high_micros']:
                 raise ValueError('报价不在买入区间')
             limit = min(levels['buy_high_micros'], (q['price_micros']*(10000+config['paper_slippage_bps'])+9999)//10000)
             # Include a 1% FX buffer, but settlement still checks actual reserved funds.
             reserve_fx = (q['fx_micros']*101+99)//100
             from .exposure import gross_cap_pct
-            budget = min(a['available_cents'], a['equity_cents']*min(5, config['paper_max_stock_pct'])//100,
+            budget = min(a['available_cents'], a['equity_cents']*min(5, symbol_cap_pct(store,config,at))//100,
                          a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-a['reserved_cents'])
             if ps.enabled(config) and store.db.execute("SELECT 1 FROM global_orders o JOIN global_fills f ON f.order_id=o.id WHERE o.plan_id=? AND f.side='BUY' LIMIT 1",(plan['id'],)).fetchone():raise ValueError('该研究已执行入场')
-            budget=min(budget,ps.buy_budget(store,config,'global',symbol,at,a))
+            budget=int(min(budget,ps.buy_budget(store,config,'global',symbol,at,a)))
+            budget=int(budget)
             step = quantity_step(symbol)
             qty = quantity_for_notional(symbol, budget-config['paper_min_fee_cents'], limit, reserve_fx)
             while qty > 0:
@@ -187,7 +192,7 @@ def settle(store, config, at, selected):
             if o['expires_at'] <= at:
                 cancel('EXPIRED');continue
             plan = store.db.execute('SELECT * FROM global_plans WHERE id=?', (o['plan_id'],)).fetchone()
-            if o['side'] == 'BUY' and (pending(store) or halted(store) or eligibility(store, dict(plan) if plan else None, selected.get(o['symbol']), at)):
+            if o['side'] == 'BUY' and (pending(store) or halted(store) or buy_blocker(store,config,at,json.loads(plan['payload_json']) if plan else {}) or eligibility(store, dict(plan) if plan else None, selected.get(o['symbol']), at)):
                 cancel();continue
             q = latest(store, o['symbol'], at)
             limit_age = FX_SELL_MAX_AGE if o['side'] == 'SELL' else FX_BUY_MAX_AGE
@@ -221,7 +226,7 @@ def settle(store, config, at, selected):
                 available = a['cash_cents']-a['reserved_cents']+o['reserved_cents']-a['withdrawal_reserved_cents']
                 gross_room = a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-(a['reserved_cents']-o['reserved_cents'])
                 own = a['global_positions'].get(o['symbol'], {}).get('market_value_cents', 0)
-                stock_room = a['equity_cents']*min(5, config['paper_max_stock_pct'])//100-own
+                stock_room = a['equity_cents']*min(5, symbol_cap_pct(store,config,at))//100-own
                 portfolio_room=o['reserved_cents']
                 if ps.enabled(config):
                     try:portfolio_room=ps.fill_budget(store,config,'global',o['symbol'],at,a,o)

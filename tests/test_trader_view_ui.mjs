@@ -70,7 +70,7 @@ setRole('ADMIN');
 render({trader_view:view});
 assert.equal(section.hidden,false);
 const text=section.textContent;
-for(const expected of ['今日操作','偏空','建议总仓 ≤ 10%','当前模拟仓位 62%','高于市场状态建议上限',
+for(const expected of ['今日操作','偏空','当前模拟仓位 62%','高于当前有效总仓上限',
   '只做研究和组合都通过的标的','沪深300 收盘 4054.28','60日线 4404.80','截至 2026-11-05',
   '模拟账户总仓位上限仍按现有规则执行','研究更新','组合判断','有效至','价格仅供参考',
   '卖出 1 · 减仓 0 · 买入 1 · 等买点 1 · 持有 1 · 观望 2',

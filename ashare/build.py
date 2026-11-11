@@ -22,7 +22,7 @@ STRATEGY_KEYS = ('strategy_version', 'paper_entry_band_bps', 'paper_stop_loss_bp
                  'investment_policy', 'portfolio_authorization_hours', 'model_name',
                  'model_reasoning_effort', 'max_packet_chars', 'max_news_packet_pct', 'dynamic_enabled',
                  'cloud_stale_policy', 'mode', 'industry_enabled', 'industry_policy', 'global_macro_context_enabled', 'sec_enabled',
-                 'exposure_regime')
+                 'exposure_regime', 'cost_budget')
 
 
 def _sha(value):

@@ -1,5 +1,7 @@
 """Versioned portfolio decisions over existing research; never replaces native entry/risk gates."""
 from .universe import company_targets
+from .exposure import symbol_cap_pct, buy_blocker
+
 import json
 import uuid
 from datetime import datetime, timedelta
@@ -94,6 +96,8 @@ def snapshot(store, config, at):
     from .dynamic_paper import case_position
     from .global_market import targets
     from .portfolio_risk import state, valuation_ready
+    from .cost_budget import active as cost_active, semantic_state
+    cost_state = semantic_state(state(store)) if cost_active(store, config) else None
     a = account_inside_transaction(store, at) if store.db.in_transaction else account(store, at)
     candidates = []; equity = max(1, a['equity_cents'])
     selected = targets(store, config, at)
@@ -126,7 +130,9 @@ def snapshot(store, config, at):
             ready=ready and bool(member and member['buy_eligible']) if symbol not in ('GOLD','SILVER','BTC','ETH') else ready
             if route=='dynamic' and symbol in names:ready=False
             if route=='watchlist' and p.get('research_membership_token')!=(member or {}).get('fingerprint'):ready=False
-        cap = min(config['paper_max_stock_pct'], p.get('max_stock_pct', 20) if route == 'watchlist' else p.get('max_position_pct', 5))*100
+        extra_blocker = buy_blocker(store,config,at,p)
+        ready = ready and not extra_blocker
+        cap = min(symbol_cap_pct(store,config,at), p.get('max_stock_pct', 20) if route == 'watchlist' else p.get('max_position_pct', 5))*100
         key = route+':'+identity
         near_stop = False
         if route == 'watchlist' and qty > 0:
@@ -147,7 +153,7 @@ def snapshot(store, config, at):
             'reference_id': 'research:'+row['id'] if row else 'holding:'+key,
             'research': {'thesis': str(p.get('thesis') or analysis.get('thesis') or analysis.get('reason') or analysis.get('rationale') or '')[:1600],
                          'analysis': encoded(analysis)[:2500], 'counterpoints': p.get('counterpoints', [])[:5],
-                         'blockers': p.get('blockers', [])[:12], 'levels': p.get('levels') or {k:p.get(k) for k in ('buy_low_cents','buy_high_cents')},
+                         'blockers': (p.get('blockers', []) + ([extra_blocker] if extra_blocker else []))[:12], 'vol20_annual_pct':p.get('vol20_annual_pct'), 'levels': p.get('levels') or {k:p.get(k) for k in ('buy_low_cents','buy_high_cents')},
                          'kind': p.get('kind', row.get('direction') if row else 'MISSING')},
             'cost_cents': position.get('cost_cents', 0)})
 
@@ -167,11 +173,12 @@ def snapshot(store, config, at):
     orders = [{k:o.get(k) for k in ('id','symbol','origin','case_id','side','qty','filled_qty','reserved_cents','status')} for o in a['orders']]
     guard = digest(encoded({'sources': [(c['key'],c['source_token'],c.get('membership_token')) for c in candidates],
         'positions': [(c['key'],c['qty'],c['cost_cents']) for c in candidates], 'cash': a['cash_cents'],
-        'orders': orders, 'withdrawals': a['withdrawal_reserved_cents'], 'halted': state(store)['halted']}))
+        'orders': orders, 'withdrawals': a['withdrawal_reserved_cents'], 'halted': state(store)['halted'],
+        **({'cost_state': cost_state} if cost_state is not None else {})}))
     return {'version': VERSION, 'as_of': at, 'guard': guard,
         'account': {k:a[k] for k in ('cash_cents','equity_cents','available_cents','reserved_cents','withdrawal_reserved_cents','market_value_cents')},
-        'valuation_ready': valuation_ready(store,a,at), 'halted': state(store)['halted'], 'orders': orders,
-        'gross_cap_bps': gross_cap_pct(store, config, at)[0]*100, 'symbol_cap_bps': config['paper_max_stock_pct']*100,
+        'valuation_ready': valuation_ready(store,a,at), 'halted': state(store)['halted'], 'cost_state': cost_state, 'orders': orders,
+        'gross_cap_bps': int(gross_cap_pct(store, config, at)[0]*100), 'symbol_cap_bps': symbol_cap_pct(store,config,at)*100,
         'candidates': candidates}
 
 
@@ -245,7 +252,7 @@ def publication_audit(packet, fresh, model_choices, result, published_at, observ
     """Bounded program receipts only; never used as model input or execution authority."""
     account_keys = ('cash_cents','equity_cents','available_cents','reserved_cents',
                     'withdrawal_reserved_cents','market_value_cents')
-    constraint_keys = ('valuation_ready','halted','gross_cap_bps','symbol_cap_bps')
+    constraint_keys = ('valuation_ready','halted','gross_cap_bps','symbol_cap_bps','cost_state')
     basis_keys = ('current_bps','current_value_cents','qty','cost_cents','max_bps',
                   'can_increase','source_id','source_valid_until')
 
@@ -303,8 +310,8 @@ def publication_audit(packet, fresh, model_choices, result, published_at, observ
     return {'version':1,'target_method':'MODEL_DISCRETION_WITH_HARD_CONSTRAINTS',
         'analysis_as_of':packet['as_of'],'published_at':published_at,
         'analysis_account':account_summary(packet),'publication_account':account_summary(fresh),
-        'analysis_constraints':{k:packet[k] for k in constraint_keys},
-        'publication_constraints':{k:fresh[k] for k in constraint_keys},
+        'analysis_constraints':{k:packet.get(k) for k in constraint_keys},
+        'publication_constraints':{k:fresh.get(k) for k in constraint_keys},
         'validation':{'analysis':'PASSED','publication':'PASSED'},'decisions':decisions}
 
 
@@ -345,6 +352,8 @@ def forced_reasons(store, config, at):
     constraints = (payload.get('publication_audit') or {}).get('publication_constraints') or {}
     if 'halted' in constraints and constraints['halted'] != fresh['halted']:
         reasons.append('HALT_CHANGED')
+    if 'cost_state' in constraints and constraints['cost_state'] != fresh.get('cost_state'):
+        reasons.append('COST_STATE_CHANGED')
     return reasons
 
 
@@ -418,6 +427,8 @@ def publication_changes(packet, fresh):
         changes.append('ORDERS_CHANGED')
     if packet.get('halted') != fresh.get('halted'):
         changes.append('HALT_CHANGED')
+    if packet.get('cost_state') != fresh.get('cost_state'):
+        changes.append('COST_STATE_CHANGED')
     return changes
 
 
@@ -751,11 +762,15 @@ def fill_budget(store,config,route,identity,at,a,order):
     if not valuation_ready(store,a,at):
         raise ValueError('组合成交估值缺失')
     from .exposure import gross_cap_pct
+    row=source(store,route,identity)
+    plan=json.loads(row['plan_json'] if route=='dynamic' else row['payload_json']) if row else {}
+    blocker=buy_blocker(store,config,at,plan)
+    if blocker:raise ValueError(blocker)
     room = buy_budget(store,config,route,identity,at,a,order['id'])
     available = a['cash_cents']-a['reserved_cents']+order['reserved_cents']-a['withdrawal_reserved_cents']
     gross_room = a['equity_cents']*gross_cap_pct(store,config,at)[0]//100-a['market_value_cents']-(a['reserved_cents']-order['reserved_cents'])
     symbol = order['symbol']
     held = sum(a[k].get(symbol,{}).get('market_value_cents',0) for k in ('positions','dynamic_positions','global_positions'))
     own_reserved = sum(o['reserved_cents'] for o in a['orders'] if o['side']=='BUY' and o['symbol']==symbol and o['id']!=order['id'])
-    symbol_room = a['equity_cents']*config['paper_max_stock_pct']//100-held-own_reserved
-    return max(0,min(room,available,gross_room,symbol_room,order['reserved_cents']))
+    symbol_room = a['equity_cents']*symbol_cap_pct(store,config,at)//100-held-own_reserved
+    return max(0,int(min(room,available,gross_room,symbol_room,order['reserved_cents'])))

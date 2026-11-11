@@ -53,7 +53,8 @@ def validate_settings(config):
         if type(item.get('research_only', False)) is not bool:
             raise ValueError('research_only必须为布尔值')
     if config.get('deployment_role','standalone') not in ('standalone','cloud','research'):raise ValueError('节点角色无效')
-    if config.get('exposure_regime') not in (None,'R1'):raise ValueError('exposure_regime须为R1或缺省关闭')
+    if config.get('exposure_regime') not in (None,'R1','D14'):raise ValueError('exposure_regime须为R1、D14或缺省关闭')
+    if config.get('cost_budget') not in (None,'P06'):raise ValueError('cost_budget须为P06或缺省关闭')
     if config.get('cloud_stale_policy','reduce_only') not in ('reduce_only','stop_all'):raise ValueError('研究断联策略无效')
     if config.get('investment_policy') not in (None, 'days_cash_v1'):
         raise ValueError('未知投资政策版本')

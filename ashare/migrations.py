@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS fundamental_records(
 CREATE TABLE IF NOT EXISTS comparison_series(
  run_id TEXT NOT NULL REFERENCES runs(id), symbol TEXT NOT NULL,
  ready_at TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(run_id,symbol));
+CREATE INDEX IF NOT EXISTS comparison_series_symbol_ready ON comparison_series(symbol, ready_at);
 """
 
 

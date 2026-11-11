@@ -141,6 +141,10 @@ def _entry_reason(code):
         'STALE_QUOTE': '报价已过期，等待新报价后重新核验。',
         'WITHDRAWAL_PENDING': '待提取资金正在占用账户，暂停新买入。',
         'VALUATION_INCOMPLETE': '账户估值不完整，等待更新后重新核验。',
+        'BEAR_HIGH_VOLATILITY': '偏空时近20日年化波动超过37%，等待波动条件满足。',
+        'BEAR_VOLATILITY_MISSING': '偏空时缺少近20日年化波动，等待数据补齐。',
+        'COST_BUDGET_LOCKED': '成本价回撤锁已触发，等待管理员确认重置。',
+        'COST_VALUATION_INCOMPLETE': '成本预算估值不完整，等待估值更新。',
         'ACCOUNT_DRAWDOWN_HALT': '账户回撤风控暂停新买入。',
     }
     if code.startswith('LOCAL_RESEARCH_ONLY'):
@@ -231,11 +235,15 @@ def build(status, config, *, buy_check=None):
         reason = '持仓正常，未触发退出条件。'
         actionable = False
         suggested = None
-        target_pct = (d.get('target_bps') or 0) / 100 if d else 0
+        target_pct = min((d.get('target_bps') or 0) / 100 if d else 0,
+                         (status.get('exposure') or {}).get('symbol_cap_pct', 20))
         weight = holding.get('weight_pct')
         if d and d.get('action') == 'ALLOW' and weight is not None and target_pct > weight:
             reason = f"持仓正常；组合允许加仓至 {target_pct:.2f}%（价格在买入区间时）。"
             actionable, suggested = True, target_pct
+        if (item or {}).get('current_buy_blocker'):
+            reason = '持仓未触发退出条件；' + item['current_buy_reason']
+            actionable, suggested = False, None
         if not quote or stale:
             reason += ' 报价过期或未更新，止损检查等待新报价。'
         return _row(symbol, name, 'HOLD', 'HELD', reason, zone_actionable=actionable,
@@ -268,6 +276,20 @@ def build(status, config, *, buy_check=None):
         if not _plan_active(plan, at):
             return _row(symbol, name, 'WATCH', 'PLAN_EXPIRED',
                         '研究计划已过期，等待新的研究结论。', **base)
+        extra=item.get('current_buy_blocker')
+        if (status.get('exposure') or {}).get('cost_enabled') and risk.get('cost_locked'):
+            extra='COST_BUDGET_LOCKED'
+        if (status.get('exposure') or {}).get('defensive'):
+            import math
+            vol=payload.get('vol20_annual_pct')
+            if type(vol) not in (int,float) or not math.isfinite(vol) or vol<0:extra=extra or 'BEAR_VOLATILITY_MISSING'
+            elif vol>37:extra=extra or 'BEAR_HIGH_VOLATILITY'
+        if extra:
+            vol=payload.get('vol20_annual_pct')
+            reason=item.get('current_buy_reason') or _entry_reason(extra)+(f' 当前波动 {vol:.2f}%。' if type(vol) in (int,float) else ' 当前波动缺失。')
+            row=_row(symbol,name,'WATCH',extra,reason,vol20_annual_pct=vol,**base)
+            row['headline']='等待'
+            return row
         if item.get('entry_allowed') is False:
             return _row(symbol, name, 'WATCH', 'ENTRY_PAUSED',
                         item.get('entry_reason') or '暂停新增买入。', **base)
@@ -282,7 +304,8 @@ def build(status, config, *, buy_check=None):
             return _row(symbol, name, 'WATCH', 'PORTFOLIO_PAUSE',
                         '组合判断暂不允许新增买入' + (f"：{base['portfolio_reason']}" if base['portfolio_reason'] else '。'),
                         **base)
-        target_pct = (d.get('target_bps') or 0) / 100
+        target_pct = min((d.get('target_bps') or 0) / 100,
+                         (status.get('exposure') or {}).get('symbol_cap_pct', 20))
         base.update(stop_cents=levels.get('stop_cents'), target_cents=levels.get('sell_cents'),
                     suggested_pct=target_pct, zone_actionable=True)
         if not quote:
@@ -326,10 +349,10 @@ def build(status, config, *, buy_check=None):
             continue
         rows.append(held_row(symbol, holding.get('name') or symbol, None, holding))
 
-    regime = _regime(status.get('market_regime'), at)
+    regime = _regime(status.get('market_regime'), at, status.get('exposure'))
     freshness = _freshness(rows, ps, status.get('research_lease'), at)
     gross = portfolio.get('stock_weight_pct')
-    suggested_max = min(regime['cap_pct'], config.get('paper_max_gross_pct', 90))
+    suggested_max = (status.get('exposure') or {}).get('gross_cap_pct',config.get('paper_max_gross_pct',90))
     counts = {a: sum(1 for r in rows if r['action'] == a)
               for a in ('SELL', 'REDUCE', 'BUY', 'WAIT_PRICE', 'HOLD', 'WATCH')}
     return {
@@ -338,7 +361,7 @@ def build(status, config, *, buy_check=None):
                     'cash_pct': portfolio.get('cash_weight_pct'), 'halted': halted,
                     'drawdown_bps': risk.get('drawdown_bps'),
                     'suggested_max_pct': suggested_max,
-                    'over_cap': gross is not None and gross > suggested_max + 5},
+                    'over_cap': regime['enforced'] and gross is not None and gross > suggested_max + 5},
         'freshness': freshness,
         'counts': counts, 'rows': _sort(rows),
         'notice': ('页面价位是模拟策略的机械参考（20日均价买入区间、止损、止盈），'
@@ -364,7 +387,7 @@ def _sort(rows):
     return sorted(rows, key=key)
 
 
-def _regime(regime_in, at):
+def _regime(regime_in, at, exposure=None):
     """Display view of the R1 series with a 6-hour freshness grace for the evening collection."""
     regime_in = regime_in or {}
     as_of = regime_in.get('as_of_day')
@@ -378,13 +401,17 @@ def _regime(regime_in, at):
     stance = {90: 'AGGRESSIVE', 50: 'NEUTRAL', 10: 'DEFENSIVE'}[cap]
     if stale:
         label = '数据过期'
-        summary = '沪深300行情数据缺失或过期，按最保守 10% 处理（只限新买）。'
-    elif cap == 90:
-        summary = '偏多：积极，总仓位不超过 90%，只做研究和组合都通过的标的。'
-    elif cap == 50:
-        summary = '震荡：中性，总仓位不超过 50%，只做研究和组合都通过的标的。'
-    else:
-        summary = '偏空：保守，总仓位不超过 10%，只做研究和组合都通过的标的。'
+    exposure=exposure or {}
+    enforced=exposure.get('mode') in ('R1','D14')
+    summary='市场状态仅供参考；模拟账户目前按总仓 90%、单只 20% 和现有买入条件执行'
+    if exposure.get('mode')=='D14':
+        summary=('新买入要求近 20 日年化波动 ≤ 37%，单只 ≤ 10%，总仓 ≤ 50%'
+                 if exposure.get('defensive') else '当前市场状态下，模拟账户按总仓 90%、单只 20% 和现有买入条件执行')
+        if exposure.get('defensive') and stale:summary+='；数据过期只限制新买，不触发市场状态减仓'
+    elif exposure.get('mode')=='R1':
+        summary=f"R1 已生效：模拟账户总仓 ≤ {exposure.get('gross_cap_pct',90):g}%"
+    if exposure.get('cost_enabled'):
+        summary+=f"；成本预算已启用，当前有效总仓上限 {exposure.get('gross_cap_pct',90):g}%"
     close, ma20, ma60 = regime_in.get('close'), regime_in.get('ma20'), regime_in.get('ma60')
     return {'method': regime_in.get('method'), 'source_status': regime_in.get('status'),
             'as_of_day': as_of, 'close': close, 'ma20': ma20, 'ma60': ma60,
@@ -393,10 +420,10 @@ def _regime(regime_in, at):
             'conditions': {'close_above_ma60': None if close is None or ma60 is None else close > ma60,
                            'ma20_above_ma60': None if ma20 is None or ma60 is None else ma20 > ma60},
             'label': label, 'stance': stance,
-            'pending_change': (f'最新一日信号为 {raw}% 档，需再确认一个交易日。'
+            'pending_change': (f"最新一日信号为 { {90:'偏多',50:'震荡',10:'偏空'}.get(raw,'未知')}，需再确认一个交易日。"
                                if not stale and raw is not None and raw != confirmed else None),
-            'summary': summary, 'enforced': False,
-            'enforced_note': '模拟账户总仓位上限仍按现有规则执行；本页市场状态仅为人工参考，待组合仓位规则上线后才会自动生效。'}
+            'summary': summary, 'enforced': enforced,
+            'enforced_note': '仓位与买入限制以模拟账户当前有效规则为准。'}
 
 
 def _freshness(rows, ps, lease, at):

@@ -217,7 +217,8 @@ def run(store, config, at=None, model_fn=None, fetch_quotes=True):
         levels = {'buy_low_micros': base*99//100, 'buy_high_micros': base*101//100,
                   'stop_micros': base*94//100, 'sell_micros': base*110//100} if base else None
         completed=max(at,normalize_time(now())) if model_fn is run_json else at
-        payload = {'analysis_as_of':at,'analysis_finished_at':completed,'research_contract':asset_contract(symbol),
+        from .exposure import volatility
+        payload = {'vol20_annual_pct':volatility(prices),'analysis_as_of':at,'analysis_finished_at':completed,'research_contract':asset_contract(symbol),
                    'kind': 'PAPER_TRADE' if not blockers else 'WAIT', 'blockers': blockers, 'analysis': analysis,
                    'thesis': analysis['thesis'], 'holding_days': analysis['holding_days'], 'holding_unit': 'DAYS',
                    'recheck_hours': 1, 'method_id': mid, 'event_fingerprint': event_fp, 'levels': levels,

@@ -191,11 +191,11 @@ def _inputs(store, config, at, account, retain):
               'global': {s: global_quote(store, s, at) for s in account['global_positions']}}
     lots = {table: [dict(r) for r in store.db.execute('SELECT * FROM '+table+' WHERE qty>0 ORDER BY id')]
             for table in ('paper_lots', 'dynamic_lots', 'global_lots')}
-    # Exclude only the risk poll timestamp and derived withdrawal reservation:
+    # Exclude only the risk poll timestamps and derived withdrawal reservation:
     # neither is a change to the financial state being approved.
     material = {'account': {k: v for k, v in account.items() if k not in (
                     'available_cents', 'withdrawal_reserved_cents', 'withdrawal_pending')},
-                'quotes': quotes, 'lots': lots, 'risk': {k: v for k, v in risk.items() if k != 'checked_at'},
+                'quotes': quotes, 'lots': lots, 'risk': {k: v for k, v in risk.items() if k not in ('checked_at', 'cost_checked_at')},
                 'limits': limits, 'rules': {k: config.get(k) for k in (
                     'paper_max_stock_pct', 'paper_max_gross_pct', 'investment_policy', 'portfolio_strategy')}}
     material['account']['orders'] = sorted(account['orders'], key=lambda o: (o.get('origin', 'watchlist'), o['id']))

@@ -166,7 +166,7 @@ class Scheduler:
         self.storage_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='storage')
         # SIGTERM sets stop before the HTTP server joins the scheduler thread.
         # Storage must observe that signal immediately, not wait for close().
-        self.storage_future=None;self.storage_cancel=self.stop;self.last_storage=0
+        self.storage_future=None;self.storage_cancel=self.stop;self.last_storage=None
         self.last_withdrawal_check=None
         self.pending_completions={}
         self.sync_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='cloud-sync');self.sync_future=None;self.last_sync=0
@@ -421,16 +421,20 @@ class Scheduler:
                 except Exception as exc:
                     with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('maintenance_error',?)",(stamp+' '+str(exc)[:300],))
                 self.last_maintenance=time.monotonic()
-            if role(config)!='cloud' and time.monotonic()-getattr(self,'last_storage',10**9)>=3600:
+            if role(config)!='cloud':
                 if self.storage_future and self.storage_future.done():
-                    try:self.storage_future.result()
+                    try:
+                        result=self.storage_future.result()
+                        if isinstance(result,dict) and not (result.get('errors') or result.get('cancelled') or result.get('skipped_locked')):
+                            with store.db:store.db.execute("DELETE FROM service_state WHERE key='storage_worker_error'")
                     except Exception as exc:
-                        with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('storage_worker_error',?)",(str(exc)[:200],))
+                        with store.db:store.db.execute("INSERT OR REPLACE INTO service_state VALUES('storage_worker_error',?)",(stamp+' '+str(exc)[:200],))
                     self.storage_future=None
-                if self.storage_future is None:
+                last_storage=getattr(self,'last_storage',None)
+                if self.storage_future is None and (last_storage is None or time.monotonic()-last_storage>=3600):
                     from .maintenance import storage_worker
                     self.storage_future=self.storage_pool.submit(storage_worker,dict(config),stamp,self.storage_cancel)
-                self.last_storage=time.monotonic()
+                    self.last_storage=time.monotonic()
             if role(config)!='cloud' and config.get('reports_sync_enabled'):
                 if self.reports_future and self.reports_future.done():
                     try:self.reports_future.result()
