@@ -451,8 +451,8 @@ def study(store,config,packet,use_model=True,model_fn=None,at=None):
     stamp=normalize_time(at or now())
     if stamp<packet['as_of']:raise ValueError('研究激活早于快照')
     try:
-        from .market_regime import regime_active
-        plan=price_plan(packet,config,result['stocks'][0],model_status,regime_on=regime_active(store,config))
+        from .market_regime import trend_gate_replaced
+        plan=price_plan(packet,config,result['stocks'][0],model_status,regime_on=trend_gate_replaced(store,config))
         store.record_attempt('price_plan',packet['symbol'],'OK',run_id=rid,at=at)
     except Exception as exc:
         store.record_attempt('price_plan',packet['symbol'],'FAILED',str(exc),run_id=rid,at=at)
@@ -548,8 +548,8 @@ def renew(store,config,packet,reuse,at=None):
     current data. No model call, no new study; the renewal is recorded on the plan itself."""
     stamp=normalize_time(at or now())
     prior=reuse['study'];result=json.loads(prior['result_json'])
-    from .market_regime import regime_active
-    plan=price_plan(packet,config,result['stocks'][0],'SUCCEEDED',regime_on=regime_active(store,config))
+    from .market_regime import trend_gate_replaced
+    plan=price_plan(packet,config,result['stocks'][0],'SUCCEEDED',regime_on=trend_gate_replaced(store,config))
     plan.update(model=reuse.get('model'),build=record_build(store,config,stamp),
         research_reuse={'study_id':prior['id'],'study_created_at':prior['created_at'],'previous_plan_id':reuse['plan']['id'],
             'reason':'日线、资料、事项核验、财务底稿、采纳规则与版本均未变化，沿用上次成功研究结论，价位与限制按本轮数据重新计算'})
