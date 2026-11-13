@@ -189,6 +189,66 @@ class ExposureCapTests(unittest.TestCase):
         import ashare.evaluation as ev
         self.assertIn('trend_ok', gated)
 
+    def test_trend_gate_replaced_only_by_paired_r1(self):
+        # research role: unpaired R1 is off; paired R1 replaces the gate
+        cfg = dict(CFG, deployment_role='research', exposure_regime='R1')
+        self.assertFalse(market_regime.trend_gate_replaced(self.store, cfg))
+        put(self.store, 'remote_features', ['exposure_caps_v1'])
+        self.assertTrue(market_regime.trend_gate_replaced(self.store, cfg))
+        # D14 activates the regime predicate but never replaces the trend gate
+        d14 = dict(CFG, deployment_role='research', exposure_regime='D14')
+        put(self.store, 'remote_features', ['exposure_caps_v1', 'exposure_caps_v2'])
+        self.assertTrue(market_regime.regime_active(self.store, d14))
+        self.assertFalse(market_regime.trend_gate_replaced(self.store, d14))
+        # no exposure_regime at all: off
+        self.assertFalse(market_regime.trend_gate_replaced(self.store, dict(CFG, deployment_role='research')))
+        # cloud role: only a stored R1-mode bundle replaces the gate
+        cloud = dict(CFG, deployment_role='cloud')
+        self.assertFalse(market_regime.trend_gate_replaced(self.store, cloud))
+        put(self.store, 'exposure_caps', {'mode': 'R1'})
+        self.assertTrue(market_regime.trend_gate_replaced(self.store, cloud))
+        put(self.store, 'exposure_caps', {'mode': 'D14'})
+        self.assertFalse(market_regime.trend_gate_replaced(self.store, cloud))
+        put(self.store, 'exposure_caps', {'mode': 'OFF'})
+        self.assertFalse(market_regime.trend_gate_replaced(self.store, cloud))
+
+    def test_research_paths_keep_trend_gate_under_d14(self):
+        # End-to-end through research.study with the shared buy-preview fixture:
+        # a downtrend packet stays gated under paired D14 and is waived only under paired R1.
+        import inspect
+        import test_buy_preview as buys
+        from ashare import research
+        from ashare.demo import seed, research_model, SYMBOL
+
+        def study_with(regime, features):
+            t = buys.BuyPreviewTests()
+            t.setUp(); self.addCleanup(t.tearDown)
+            t.cfg.update(watchlist=[{'symbol': SYMBOL, 'name': 'Synthetic'}],
+                         slot_execution_mode='RULES', paper_max_fill_qty=10000,
+                         deployment_role='research', exposure_regime=regime)
+            packet = seed(t.store, t.cfg)
+            # ma20 < ma60 and close < ma60: a downtrend the E3 gate must still catch under D14.
+            packet['stocks'][0]['features']['unadjusted'].update(
+                ma20_cents=900, ma60_cents=1000, close_cents=950)
+            with t.store.db:
+                put(t.store, 'remote_features', features)
+            research.study(t.store, t.cfg, packet, model_fn=research_model(packet),
+                           at='2026-09-15T09:01:00+08:00')
+            row = t.store.db.execute("SELECT payload_json FROM plans WHERE symbol=? AND status='ACTIVE'",
+                                     (SYMBOL,)).fetchone()
+            return json.loads(row[0]), t
+
+        plan, d14 = study_with('D14', ['exposure_caps_v2'])
+        self.assertTrue(market_regime.regime_active(d14.store, d14.cfg))
+        self.assertIn('TREND_NOT_CONFIRMED', plan['blockers'])
+        plan, r1 = study_with('R1', ['exposure_caps_v1'])
+        self.assertTrue(market_regime.regime_active(r1.store, r1.cfg))
+        self.assertNotIn('TREND_NOT_CONFIRMED', plan['blockers'])
+        # renew() is wired through the same predicate; both call sites agree.
+        source = inspect.getsource(research)
+        self.assertEqual(source.count('regime_on=trend_gate_replaced(store,config)'), 2)
+        self.assertNotIn('regime_on=regime_active(', source)
+
 
 if __name__ == '__main__':
     unittest.main()

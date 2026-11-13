@@ -104,3 +104,13 @@ def regime_active(store, config):
         return False
     from .cloud_sync import remote_supports
     return remote_supports(store, 'exposure_caps_v2' if config.get('exposure_regime') == 'D14' else FEATURE)
+
+
+def trend_gate_replaced(store, config):
+    """P08: only a paired R1 cap replaces the per-stock trend gate (Dean 2026-11-07).
+    D14 keeps the gate in every market state: its registered backtests (E5-E7) used the
+    E3 entry rule, which requires MA20 > MA60 and close >= MA60."""
+    if config.get('deployment_role') == 'cloud':
+        from .cloud_runtime import value
+        return (value(store, 'exposure_caps') or {}).get('mode') == 'R1'
+    return config.get('exposure_regime') == 'R1' and regime_active(store, config)
